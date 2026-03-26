@@ -35,7 +35,8 @@ app.use(cors({
     'http://localhost:3000',
     'http://[::1]:8080',
     env.appUrl,
-  ],
+    ...(process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : []),
+  ].filter(Boolean),
   credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));
