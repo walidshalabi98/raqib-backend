@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { generateAutoAssessment } from '../services/ai/assessmentGenerator';
 
 const router = Router();
 
@@ -32,17 +33,26 @@ router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'p
   const { type, scopeDescription, sampleSize, methodsIncluded } = req.body;
   if (!type) throw new AppError(400, 'Assessment type is required');
 
+  const autoGenerate = req.body.autoGenerate !== false; // default: AI generates
+
   const assessment = await prisma.assessment.create({
     data: {
       projectId: req.params.id,
       type,
-      scopeDescription,
+      scopeDescription: scopeDescription || `AI-generated ${type} assessment`,
       sampleSize,
       methodsIncluded: methodsIncluded || [],
     },
   });
 
-  res.status(201).json(assessment);
+  // Trigger AI auto-assessment generation
+  if (autoGenerate) {
+    generateAutoAssessment(assessment.id, req.params.id, type).catch(err => {
+      console.error('Auto-assessment generation failed:', err.message);
+    });
+  }
+
+  res.status(201).json({ ...assessment, autoGenerating: autoGenerate });
 }));
 
 // PATCH /api/assessments/:id — Update status
@@ -70,6 +80,31 @@ router.patch('/assessments/:id', authenticate, authorize('org_admin', 'platform_
   });
 
   res.json(updated);
+}));
+
+// GET /api/assessments/:id/report — Get AI-generated assessment report
+router.get('/assessments/:id/report', authenticate, asyncHandler(async (req: Request, res: Response) => {
+  const assessment = await prisma.assessment.findUnique({
+    where: { id: req.params.id },
+    include: { project: true },
+  });
+
+  if (!assessment || assessment.project.organizationId !== req.user!.organizationId) {
+    throw new AppError(404, 'Assessment not found');
+  }
+
+  let report = null;
+  if (assessment.scopeDescription) {
+    try { report = JSON.parse(assessment.scopeDescription); } catch { report = null; }
+  }
+
+  res.json({
+    assessmentId: assessment.id,
+    status: assessment.status,
+    type: assessment.type,
+    report,
+    deliveredAt: assessment.deliveredAt,
+  });
 }));
 
 // GET /api/assessments/:id/estimate — Price estimate
