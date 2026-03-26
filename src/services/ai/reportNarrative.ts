@@ -70,22 +70,14 @@ export async function generateReportNarrative(reportId: string, projectId: strin
     .map(block => block.type === 'text' ? block.text : '')
     .join('');
 
-  // Generate HTML report
+  // Generate HTML report content (no PDF/Puppeteer needed)
   const html = generateReportHtml(project.name, report.title, narrative, indicatorData);
-
-  // Generate PDF using Puppeteer
-  let pdfUrl: string | undefined;
-  try {
-    pdfUrl = await generatePdf(html, reportId);
-  } catch (error) {
-    console.warn('[ReportNarrative] PDF generation failed, saving narrative only:', error);
-  }
 
   await prisma.report.update({
     where: { id: reportId },
     data: {
-      aiNarrative: narrative,
-      fileUrl: pdfUrl,
+      aiNarrative: html,
+      fileUrl: null,
       status: 'draft',
     },
   });
@@ -166,28 +158,4 @@ function generateReportHtml(
   </div>
 </body>
 </html>`;
-}
-
-async function generatePdf(html: string, reportId: string): Promise<string> {
-  const fs = await import('fs');
-  const path = await import('path');
-  const puppeteer = await import('puppeteer');
-
-  const reportsDir = path.join(process.cwd(), 'uploads', 'reports');
-  if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
-
-  const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
-  const page = await browser.newPage();
-  await page.setContent(html, { waitUntil: 'networkidle0' });
-
-  const pdfPath = path.join(reportsDir, `${reportId}.pdf`);
-  await page.pdf({
-    path: pdfPath,
-    format: 'A4',
-    margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
-    printBackground: true,
-  });
-
-  await browser.close();
-  return `/uploads/reports/${reportId}.pdf`;
 }

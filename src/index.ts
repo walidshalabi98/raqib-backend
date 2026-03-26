@@ -24,6 +24,8 @@ import dashboardRoutes from './routes/dashboard';
 import notificationRoutes from './routes/notifications';
 import templateRoutes from './routes/templates';
 import webhookRoutes from './routes/webhooks';
+import beneficiaryRoutes from './routes/beneficiaries';
+import exportRoutes from './routes/exports';
 
 const app = express();
 
@@ -66,6 +68,8 @@ app.use('/api', reportRoutes);         // /api/projects/:id/reports & /api/repor
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/templates', templateRoutes);
+app.use('/api', beneficiaryRoutes);       // /api/projects/:id/beneficiaries & /api/beneficiaries/:id
+app.use('/api', exportRoutes);            // /api/projects/:id/export/*
 
 // Health check
 app.get('/api/health', (_req, res) => {

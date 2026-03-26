@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
 
 const router = Router();
 
@@ -79,7 +80,10 @@ router.post('/qualitative/:id/code', authenticate, asyncHandler(async (req: Requ
   }
 
   // Thematic coding runs inline (no Redis/BullMQ needed)
-  // TODO: Add AI thematic coding service
+  codeQualitativeEntry(req.params.id, entry.projectId).catch(err => {
+    console.error('Qualitative coding failed:', err.message);
+  });
+
   res.status(202).json({ entryId: req.params.id, status: 'processing' });
 }));
 

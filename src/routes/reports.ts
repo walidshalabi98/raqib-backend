@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { generateReportNarrative } from '../services/ai/reportNarrative';
 
 const router = Router();
 
@@ -40,8 +41,11 @@ router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin
     },
   });
 
-  // Generate report inline (no Redis/BullMQ needed)
-  // TODO: Add AI report generation service
+  // Generate report async inline (no Redis needed)
+  generateReportNarrative(report.id, req.params.id).catch(err => {
+    console.error('Report generation failed:', err.message);
+  });
+
   res.status(202).json({ reportId: report.id, status: 'processing' });
 }));
 

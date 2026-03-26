@@ -242,6 +242,8 @@ model Project {
   dataPoints          DataPoint[]
   qualitativeEntries  QualitativeEntry[]
   reports             Report[]
+  beneficiaries       Beneficiary[]
+  beneficiaryServices BeneficiaryService[]
 }
 
 model Document {
@@ -292,6 +294,7 @@ model Indicator {
   isApproved           Boolean          @default(false)
   createdAt            DateTime         @default(now())
   dataPoints           DataPoint[]
+  beneficiaryServices  BeneficiaryService[]
 }
 
 model Assessment {
@@ -404,4 +407,65 @@ model AuditLog {
   previousValue Json?
   newValue      Json?
   timestamp     DateTime @default(now())
+}
+
+enum Gender {
+  male
+  female
+  other
+}
+
+enum AgeGroup {
+  child_0_5
+  child_6_11
+  adolescent_12_17
+  youth_18_24
+  adult_25_59
+  elderly_60_plus
+}
+
+enum BeneficiaryStatus {
+  active
+  completed
+  dropped_out
+  referred
+}
+
+model Beneficiary {
+  id                String              @id @default(uuid())
+  projectId         String
+  project           Project             @relation(fields: [projectId], references: [id])
+  fullName          String
+  fullNameAr        String?
+  gender            Gender
+  age               Int?
+  ageGroup          AgeGroup?
+  location          String?
+  governorate       String?
+  phoneNumber       String?
+  nationalId        String?
+  householdSize     Int?
+  vulnerabilityTags Json?               // ["disabled", "female_headed_household", etc.]
+  registrationDate  DateTime            @default(now())
+  status            BeneficiaryStatus   @default(active)
+  services          BeneficiaryService[]
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+}
+
+model BeneficiaryService {
+  id              String       @id @default(uuid())
+  beneficiaryId   String
+  beneficiary     Beneficiary  @relation(fields: [beneficiaryId], references: [id])
+  projectId       String
+  project         Project      @relation(fields: [projectId], references: [id])
+  serviceType     String       // e.g., "cash_assistance", "training", "psychosocial_support"
+  description     String?
+  dateProvided    DateTime
+  quantity        Decimal?     @db.Decimal(10, 2)
+  unit            String?      // e.g., "USD", "sessions", "kits"
+  indicatorId     String?
+  indicator       Indicator?   @relation(fields: [indicatorId], references: [id])
+  notes           String?
+  createdAt       DateTime     @default(now())
 }

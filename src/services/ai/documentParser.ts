@@ -42,6 +42,47 @@ export async function parseDocument(documentId: string): Promise<void> {
       },
     });
 
+    // AI analysis of document content
+    if (text && text.length > 50) {
+      try {
+        const Anthropic = (await import('@anthropic-ai/sdk')).default;
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || '' });
+
+        const analysisResponse = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1500,
+          messages: [{
+            role: 'user',
+            content: `Analyze this project document and extract key M&E-relevant information. Return a JSON object with:
+{
+  "documentType": "proposal|logframe|budget|report|guidelines|other",
+  "keyFindings": ["finding1", "finding2"],
+  "indicators_mentioned": ["indicator1", "indicator2"],
+  "targets_mentioned": [{"indicator": "...", "target": "...", "timeline": "..."}],
+  "recommendations": ["rec1", "rec2"],
+  "summary": "2-3 sentence summary"
+}
+
+Document text (first 3000 chars):
+${text.substring(0, 3000)}
+
+Return ONLY valid JSON, no markdown.`
+          }],
+        });
+
+        const aiText = analysisResponse.content[0].type === 'text' ? analysisResponse.content[0].text : '';
+        const cleaned = aiText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+        await prisma.document.update({
+          where: { id: documentId },
+          data: { parsedText: text + '\n\n---AI_ANALYSIS---\n' + cleaned },
+        });
+        console.log(`[DocumentParser] AI analysis complete for ${doc.fileName}`);
+      } catch (aiErr: any) {
+        console.error('[DocumentParser] AI analysis failed:', aiErr.message);
+      }
+    }
+
     console.log(`[DocumentParser] Successfully parsed ${doc.fileName} (${text.length} chars)`);
   } catch (error) {
     console.error(`[DocumentParser] Failed to parse ${doc.fileName}:`, error);

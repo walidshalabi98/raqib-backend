@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { analyzeProjectRisks } from '../services/ai/riskAnalyzer';
 
 const router = Router();
 
@@ -184,6 +185,17 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
       projectName: ind.framework.project.name,
     })),
   });
+}));
+
+// GET /api/dashboard/projects/:id/risks — AI Risk Analysis
+router.get('/projects/:id/risks', authenticate, asyncHandler(async (req: Request, res: Response) => {
+  const project = await prisma.project.findFirst({
+    where: { id: req.params.id, organizationId: req.user!.organizationId },
+  });
+  if (!project) throw new AppError(404, 'Project not found');
+
+  const risks = await analyzeProjectRisks(req.params.id);
+  res.json({ projectId: req.params.id, risks, analyzedAt: new Date().toISOString() });
 }));
 
 export default router;
