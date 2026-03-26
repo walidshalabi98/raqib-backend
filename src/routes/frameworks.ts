@@ -124,6 +124,83 @@ router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'pl
   res.json(updated);
 }));
 
+// POST /api/projects/:id/framework/manual — Create a blank manual framework
+router.post('/projects/:id/framework/manual', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
+  const project = await prisma.project.findFirst({
+    where: { id: req.params.id, organizationId: req.user!.organizationId },
+  });
+  if (!project) throw new AppError(404, 'Project not found');
+
+  // Get current max version
+  const latest = await prisma.framework.findFirst({
+    where: { projectId: req.params.id },
+    orderBy: { version: 'desc' },
+  });
+
+  const framework = await prisma.framework.create({
+    data: {
+      projectId: req.params.id,
+      version: (latest?.version || 0) + 1,
+      status: 'draft',
+      name: req.body.name || `${project.name} - Manual Framework`,
+      aiModelUsed: 'manual',
+    },
+  });
+
+  res.status(201).json(framework);
+}));
+
+// POST /api/frameworks/:id/indicators — Create a single indicator manually
+router.post('/frameworks/:id/indicators', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
+  const framework = await prisma.framework.findUnique({
+    where: { id: req.params.id },
+    include: { project: true },
+  });
+
+  if (!framework || framework.project.organizationId !== req.user!.organizationId) {
+    throw new AppError(404, 'Framework not found');
+  }
+
+  // Get next sort order
+  const lastIndicator = await prisma.indicator.findFirst({
+    where: { frameworkId: req.params.id },
+    orderBy: { sortOrder: 'desc' },
+  });
+
+  const {
+    indicatorText, indicatorTextAr, level, dataCollectionMethod, frequency,
+    baselineValue, targetValue, currentValue, unit, phases, aiRationale,
+    startDate, endDate, actualStartDate, actualEndDate, milestones, responsibility, status,
+  } = req.body;
+
+  const indicator = await prisma.indicator.create({
+    data: {
+      frameworkId: req.params.id,
+      indicatorText: indicatorText || 'New Indicator',
+      indicatorTextAr,
+      level: level || 'output',
+      dataCollectionMethod: dataCollectionMethod || 'hh_survey',
+      frequency: frequency || 'quarterly',
+      baselineValue,
+      targetValue,
+      currentValue,
+      unit,
+      phases: phases || ['baseline', 'midterm', 'endline'],
+      aiRationale,
+      sortOrder: (lastIndicator?.sortOrder ?? -1) + 1,
+      startDate: startDate ? new Date(startDate) : undefined,
+      endDate: endDate ? new Date(endDate) : undefined,
+      actualStartDate: actualStartDate ? new Date(actualStartDate) : undefined,
+      actualEndDate: actualEndDate ? new Date(actualEndDate) : undefined,
+      milestones: milestones || undefined,
+      responsibility,
+      status: status || undefined,
+    },
+  });
+
+  res.status(201).json(indicator);
+}));
+
 // GET /api/frameworks/:id/indicators
 router.get('/frameworks/:id/indicators', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const framework = await prisma.framework.findUnique({

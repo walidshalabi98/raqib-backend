@@ -267,6 +267,7 @@ model Framework {
   project     Project         @relation(fields: [projectId], references: [id])
   version     Int             @default(1)
   status      FrameworkStatus @default(draft)
+  name        String?
   aiModelUsed String?
   generatedAt DateTime        @default(now())
   approvedAt  DateTime?
@@ -290,6 +291,12 @@ model Indicator {
   status               IndicatorStatus  @default(not_started)
   aiRationale          String?
   phases               Json             // ["baseline", "midterm", "endline"]
+  startDate            DateTime?
+  endDate              DateTime?
+  actualStartDate      DateTime?
+  actualEndDate        DateTime?
+  milestones           Json?
+  responsibility       String?
   sortOrder            Int              @default(0)
   isApproved           Boolean          @default(false)
   createdAt            DateTime         @default(now())

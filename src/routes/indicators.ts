@@ -19,6 +19,7 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
   const {
     indicatorText, indicatorTextAr, level, dataCollectionMethod,
     frequency, baselineValue, targetValue, currentValue, unit, status, phases, sortOrder,
+    startDate, endDate, actualStartDate, actualEndDate, milestones, responsibility,
   } = req.body;
 
   const updated = await prisma.indicator.update({
@@ -36,6 +37,12 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
       ...(status !== undefined && { status }),
       ...(phases !== undefined && { phases }),
       ...(sortOrder !== undefined && { sortOrder }),
+      ...(startDate !== undefined && { startDate: startDate ? new Date(startDate) : null }),
+      ...(endDate !== undefined && { endDate: endDate ? new Date(endDate) : null }),
+      ...(actualStartDate !== undefined && { actualStartDate: actualStartDate ? new Date(actualStartDate) : null }),
+      ...(actualEndDate !== undefined && { actualEndDate: actualEndDate ? new Date(actualEndDate) : null }),
+      ...(milestones !== undefined && { milestones }),
+      ...(responsibility !== undefined && { responsibility }),
     },
   });
 

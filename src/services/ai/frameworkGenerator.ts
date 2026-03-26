@@ -111,6 +111,10 @@ export async function generateFramework(frameworkId: string, projectId: string):
     unit?: string;
     phases?: string[];
     aiRationale?: string;
+    startDate?: string;
+    endDate?: string;
+    responsibility?: string;
+    milestones?: Array<{ label: string; date: string; completed: boolean }>;
   }>;
 
   try {
@@ -150,6 +154,10 @@ export async function generateFramework(frameworkId: string, projectId: string):
         phases: ind.phases || ['baseline', 'midterm', 'endline'],
         aiRationale: ind.aiRationale,
         sortOrder: i,
+        startDate: ind.startDate ? new Date(ind.startDate) : undefined,
+        endDate: ind.endDate ? new Date(ind.endDate) : undefined,
+        responsibility: ind.responsibility,
+        milestones: ind.milestones || undefined,
       },
     });
   }

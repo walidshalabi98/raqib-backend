@@ -95,9 +95,22 @@ Return a JSON array of indicators:
     "targetValue": "..." or null,
     "unit": "%" or "number" or "score" etc.,
     "phases": ["baseline", "midterm", "endline"],
-    "aiRationale": "Brief explanation of why this indicator was chosen and how it links to the results chain"
+    "aiRationale": "Brief explanation of why this indicator was chosen and how it links to the results chain",
+    "startDate": "ISO date string (e.g. 2025-01-15) — estimated start date for data collection on this indicator, based on project start/end dates and the indicator's phase",
+    "endDate": "ISO date string (e.g. 2025-12-31) — estimated deadline for achieving the target",
+    "responsibility": "Suggested responsible party, e.g. 'M&E Officer', 'Field Team', 'Project Manager', 'Data Analyst', 'Community Mobilizer'",
+    "milestones": [
+      {"label": "Baseline data collection", "date": "2025-03-01", "completed": false},
+      {"label": "Midterm review", "date": "2025-06-15", "completed": false}
+    ]
   }
 ]
+
+IMPORTANT for timeline fields:
+- Use the project start and end dates from the PROJECT STRUCTURE above to derive realistic startDate and endDate values for each indicator.
+- Impact-level indicators should span the full project period. Output/activity indicators should have shorter, earlier timelines.
+- Milestones should include key data collection events and review points relevant to the indicator.
+- Responsibility should match the indicator level: impact/outcome indicators to senior staff, output/activity to field teams.
 
 Return ONLY valid JSON array, no markdown or explanation.`;
 }
