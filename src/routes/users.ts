@@ -3,13 +3,13 @@ import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { sendInviteEmail } from '../utils/email';
 
 const router = Router();
 
 // GET /api/users — List users in org
-router.get('/', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.get('/', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const users = await prisma.user.findMany({
     where: { organizationId: req.user!.organizationId },
     select: {
@@ -25,10 +25,10 @@ router.get('/', authenticate, authorize('org_admin', 'platform_admin'), async (r
     orderBy: { createdAt: 'desc' },
   });
   res.json(users);
-});
+}));
 
 // POST /api/users/invite
-router.post('/invite', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.post('/invite', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const { email, fullName, fullNameAr, role } = req.body;
   if (!email || !fullName || !role) throw new AppError(400, 'Email, fullName, and role are required');
 
@@ -54,10 +54,10 @@ router.post('/invite', authenticate, authorize('org_admin', 'platform_admin'), a
 
   await sendInviteEmail(email, org!.name, tempPassword);
   res.status(201).json(user);
-});
+}));
 
 // PATCH /api/users/:id
-router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
 
   // Ensure user belongs to same org
@@ -79,10 +79,10 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin'), asy
   });
 
   res.json(updated);
-});
+}));
 
 // DELETE /api/users/:id — Deactivate
-router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const target = await prisma.user.findUnique({ where: { id } });
   if (!target || target.organizationId !== req.user!.organizationId) {
@@ -92,6 +92,6 @@ router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), as
 
   await prisma.user.delete({ where: { id } });
   res.json({ message: 'User deactivated' });
-});
+}));
 
 export default router;

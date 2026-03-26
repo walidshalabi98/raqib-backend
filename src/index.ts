@@ -82,6 +82,16 @@ const server = app.listen(env.port, () => {
   console.log(`   Health check: http://localhost:${env.port}/api/health`);
 });
 
+// Catch unhandled rejections and uncaught exceptions — prevent crashes
+process.on('unhandledRejection', (reason: any) => {
+  console.error('Unhandled Rejection:', reason?.message || reason);
+});
+
+process.on('uncaughtException', (err: Error) => {
+  console.error('Uncaught Exception:', err.message);
+  // Don't exit — let the server keep running
+});
+
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Shutting down...');

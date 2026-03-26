@@ -1,11 +1,11 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // POST /api/webhooks/manasati — Receive data from Manasati panel
-router.post('/manasati', async (req: Request, res: Response) => {
+router.post('/manasati', asyncHandler(async (req: Request, res: Response) => {
   const { projectId, indicators } = req.body;
   if (!projectId || !Array.isArray(indicators)) {
     throw new AppError(400, 'projectId and indicators array are required');
@@ -41,10 +41,10 @@ router.post('/manasati', async (req: Request, res: Response) => {
   }
 
   res.json({ message: `Imported ${imported} data points from Manasati`, count: imported });
-});
+}));
 
 // POST /api/webhooks/kobotoolbox — Receive data from KoboToolbox
-router.post('/kobotoolbox', async (req: Request, res: Response) => {
+router.post('/kobotoolbox', asyncHandler(async (req: Request, res: Response) => {
   const submission = req.body;
 
   // KoboToolbox sends form submissions as flat JSON
@@ -97,6 +97,6 @@ router.post('/kobotoolbox', async (req: Request, res: Response) => {
   }
 
   res.json({ message: `Imported ${imported} data points from KoboToolbox`, count: imported });
-});
+}));
 
 export default router;

@@ -1,12 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // GET /api/organizations/:id
-router.get('/:id', authenticate, async (req: Request, res: Response) => {
+router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   if (id !== req.user!.organizationId) throw new AppError(403, 'Access denied');
 
@@ -17,10 +17,10 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   if (!org) throw new AppError(404, 'Organization not found');
 
   res.json(org);
-});
+}));
 
 // PATCH /api/organizations/:id
-router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   if (id !== req.user!.organizationId && req.user!.role !== 'platform_admin') {
     throw new AppError(403, 'Access denied');
@@ -39,6 +39,6 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin'), asy
   });
 
   res.json(org);
-});
+}));
 
 export default router;

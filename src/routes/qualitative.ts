@@ -1,13 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { getQualitativeQueue } from '../jobs/queues';
 
 const router = Router();
 
 // GET /api/projects/:id/qualitative
-router.get('/projects/:id/qualitative', authenticate, async (req: Request, res: Response) => {
+router.get('/projects/:id/qualitative', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -18,10 +18,10 @@ router.get('/projects/:id/qualitative', authenticate, async (req: Request, res: 
     orderBy: { createdAt: 'desc' },
   });
   res.json(entries);
-});
+}));
 
 // POST /api/projects/:id/qualitative — Add entry
-router.post('/projects/:id/qualitative', authenticate, async (req: Request, res: Response) => {
+router.post('/projects/:id/qualitative', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -52,10 +52,10 @@ router.post('/projects/:id/qualitative', authenticate, async (req: Request, res:
   });
 
   res.status(201).json(entry);
-});
+}));
 
 // GET /api/qualitative/:id — Get full entry with themes
-router.get('/qualitative/:id', authenticate, async (req: Request, res: Response) => {
+router.get('/qualitative/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const entry = await prisma.qualitativeEntry.findUnique({
     where: { id: req.params.id },
     include: { project: true, assessment: true },
@@ -66,10 +66,10 @@ router.get('/qualitative/:id', authenticate, async (req: Request, res: Response)
   }
 
   res.json(entry);
-});
+}));
 
 // POST /api/qualitative/:id/code — Trigger AI thematic coding
-router.post('/qualitative/:id/code', authenticate, async (req: Request, res: Response) => {
+router.post('/qualitative/:id/code', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const entry = await prisma.qualitativeEntry.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -86,6 +86,6 @@ router.post('/qualitative/:id/code', authenticate, async (req: Request, res: Res
   });
 
   res.status(202).json({ jobId: job.id, status: 'processing' });
-});
+}));
 
 export default router;

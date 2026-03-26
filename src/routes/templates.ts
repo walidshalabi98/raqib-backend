@@ -1,12 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // GET /api/templates
-router.get('/', authenticate, async (req: Request, res: Response) => {
+router.get('/', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const { sector, level, method } = req.query;
 
   const templates = await prisma.mETemplate.findMany({
@@ -18,10 +18,10 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     orderBy: { createdAt: 'desc' },
   });
   res.json(templates);
-});
+}));
 
 // POST /api/templates
-router.post('/', authenticate, authorize('platform_admin'), async (req: Request, res: Response) => {
+router.post('/', authenticate, authorize('platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const {
     sector, indicatorText, indicatorTextAr, level,
     recommendedMethod, recommendedFrequency, typicalTarget,
@@ -48,10 +48,10 @@ router.post('/', authenticate, authorize('platform_admin'), async (req: Request,
   });
 
   res.status(201).json(template);
-});
+}));
 
 // POST /api/templates/bulk-import
-router.post('/bulk-import', authenticate, authorize('platform_admin'), async (req: Request, res: Response) => {
+router.post('/bulk-import', authenticate, authorize('platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const { templates } = req.body;
   if (!Array.isArray(templates) || templates.length === 0) {
     throw new AppError(400, 'templates array is required');
@@ -73,10 +73,10 @@ router.post('/bulk-import', authenticate, authorize('platform_admin'), async (re
   });
 
   res.status(201).json({ count: created.count });
-});
+}));
 
 // PATCH /api/templates/:id
-router.patch('/:id', authenticate, authorize('platform_admin'), async (req: Request, res: Response) => {
+router.patch('/:id', authenticate, authorize('platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const template = await prisma.mETemplate.findUnique({ where: { id: req.params.id } });
   if (!template) throw new AppError(404, 'Template not found');
 
@@ -85,15 +85,15 @@ router.patch('/:id', authenticate, authorize('platform_admin'), async (req: Requ
     data: req.body,
   });
   res.json(updated);
-});
+}));
 
 // DELETE /api/templates/:id
-router.delete('/:id', authenticate, authorize('platform_admin'), async (req: Request, res: Response) => {
+router.delete('/:id', authenticate, authorize('platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const template = await prisma.mETemplate.findUnique({ where: { id: req.params.id } });
   if (!template) throw new AppError(404, 'Template not found');
 
   await prisma.mETemplate.delete({ where: { id: req.params.id } });
   res.json({ message: 'Template deleted' });
-});
+}));
 
 export default router;

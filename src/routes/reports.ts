@@ -1,13 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { getReportQueue } from '../jobs/queues';
 
 const router = Router();
 
 // GET /api/projects/:id/reports
-router.get('/projects/:id/reports', authenticate, async (req: Request, res: Response) => {
+router.get('/projects/:id/reports', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -18,10 +18,10 @@ router.get('/projects/:id/reports', authenticate, async (req: Request, res: Resp
     orderBy: { generatedAt: 'desc' },
   });
   res.json(reports);
-});
+}));
 
 // POST /api/projects/:id/reports/generate — Generate report (async)
-router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), async (req: Request, res: Response) => {
+router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -48,10 +48,10 @@ router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin
   });
 
   res.status(202).json({ jobId: job.id, reportId: report.id, status: 'processing' });
-});
+}));
 
 // GET /api/reports/:id
-router.get('/reports/:id', authenticate, async (req: Request, res: Response) => {
+router.get('/reports/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const report = await prisma.report.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -62,10 +62,10 @@ router.get('/reports/:id', authenticate, async (req: Request, res: Response) => 
   }
 
   res.json(report);
-});
+}));
 
 // GET /api/reports/:id/status
-router.get('/reports/:id/status', authenticate, async (req: Request, res: Response) => {
+router.get('/reports/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const report = await prisma.report.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -80,6 +80,6 @@ router.get('/reports/:id/status', authenticate, async (req: Request, res: Respon
     status: report.fileUrl ? 'completed' : 'processing',
     fileUrl: report.fileUrl,
   });
-});
+}));
 
 export default router;

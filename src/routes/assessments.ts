@@ -1,12 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // GET /api/projects/:id/assessments
-router.get('/projects/:id/assessments', authenticate, async (req: Request, res: Response) => {
+router.get('/projects/:id/assessments', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -20,10 +20,10 @@ router.get('/projects/:id/assessments', authenticate, async (req: Request, res: 
     orderBy: { requestedAt: 'desc' },
   });
   res.json(assessments);
-});
+}));
 
 // POST /api/projects/:id/assessments — Request new assessment
-router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), async (req: Request, res: Response) => {
+router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -43,10 +43,10 @@ router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'p
   });
 
   res.status(201).json(assessment);
-});
+}));
 
 // PATCH /api/assessments/:id — Update status
-router.patch('/assessments/:id', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.patch('/assessments/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const assessment = await prisma.assessment.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -70,10 +70,10 @@ router.patch('/assessments/:id', authenticate, authorize('org_admin', 'platform_
   });
 
   res.json(updated);
-});
+}));
 
 // GET /api/assessments/:id/estimate — Price estimate
-router.get('/assessments/:id/estimate', authenticate, async (req: Request, res: Response) => {
+router.get('/assessments/:id/estimate', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const assessment = await prisma.assessment.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -109,6 +109,6 @@ router.get('/assessments/:id/estimate', authenticate, async (req: Request, res: 
       sampleMultiplier: sampleMultiplier.toFixed(2),
     },
   });
-});
+}));
 
 export default router;

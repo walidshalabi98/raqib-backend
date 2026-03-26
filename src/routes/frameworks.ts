@@ -1,13 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { generateFramework } from '../services/ai/frameworkGenerator';
 
 const router = Router();
 
 // GET /api/projects/:id/framework — Get active framework with indicators
-router.get('/projects/:id/framework', authenticate, async (req: Request, res: Response) => {
+router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -29,10 +29,10 @@ router.get('/projects/:id/framework', authenticate, async (req: Request, res: Re
     return;
   }
   res.json(framework);
-});
+}));
 
 // POST /api/projects/:id/framework/generate — Trigger AI generation (runs inline, no Redis needed)
-router.post('/projects/:id/framework/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), async (req: Request, res: Response) => {
+router.post('/projects/:id/framework/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -67,10 +67,10 @@ router.post('/projects/:id/framework/generate', authenticate, authorize('org_adm
     frameworkId: framework.id,
     status: 'processing',
   });
-});
+}));
 
 // GET /api/frameworks/:id/status — Check generation status
-router.get('/frameworks/:id/status', authenticate, async (req: Request, res: Response) => {
+router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const framework = await prisma.framework.findUnique({
     where: { id: req.params.id },
     include: {
@@ -92,10 +92,10 @@ router.get('/frameworks/:id/status', authenticate, async (req: Request, res: Res
     progress: hasIndicators ? 'Framework generated successfully' : 'AI is analyzing project data...',
     framework: hasIndicators ? framework : undefined,
   });
-});
+}));
 
 // PATCH /api/frameworks/:id/approve
-router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const framework = await prisma.framework.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -122,10 +122,10 @@ router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'pl
   });
 
   res.json(updated);
-});
+}));
 
 // GET /api/frameworks/:id/indicators
-router.get('/frameworks/:id/indicators', authenticate, async (req: Request, res: Response) => {
+router.get('/frameworks/:id/indicators', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const framework = await prisma.framework.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -142,6 +142,6 @@ router.get('/frameworks/:id/indicators', authenticate, async (req: Request, res:
   });
 
   res.json(indicators);
-});
+}));
 
 export default router;

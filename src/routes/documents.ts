@@ -4,7 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { parseDocument } from '../services/ai/documentParser';
 
 const uploadDir = path.join(process.cwd(), 'uploads');
@@ -29,7 +29,7 @@ const upload = multer({
 const router = Router();
 
 // GET /api/projects/:id/documents
-router.get('/projects/:id/documents', authenticate, async (req: Request, res: Response) => {
+router.get('/projects/:id/documents', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -41,10 +41,10 @@ router.get('/projects/:id/documents', authenticate, async (req: Request, res: Re
     orderBy: { uploadedAt: 'desc' },
   });
   res.json(documents);
-});
+}));
 
 // POST /api/projects/:id/documents — Upload document
-router.post('/projects/:id/documents', authenticate, upload.single('file'), async (req: Request, res: Response) => {
+router.post('/projects/:id/documents', authenticate, upload.single('file'), asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -70,10 +70,10 @@ router.post('/projects/:id/documents', authenticate, upload.single('file'), asyn
   });
 
   res.status(201).json(document);
-});
+}));
 
 // DELETE /api/documents/:id
-router.delete('/documents/:id', authenticate, async (req: Request, res: Response) => {
+router.delete('/documents/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const doc = await prisma.document.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -88,10 +88,10 @@ router.delete('/documents/:id', authenticate, async (req: Request, res: Response
 
   await prisma.document.delete({ where: { id: req.params.id } });
   res.json({ message: 'Document deleted' });
-});
+}));
 
 // GET /api/documents/:id/status
-router.get('/documents/:id/status', authenticate, async (req: Request, res: Response) => {
+router.get('/documents/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const doc = await prisma.document.findUnique({
     where: { id: req.params.id },
     include: { project: true },
@@ -101,6 +101,6 @@ router.get('/documents/:id/status', authenticate, async (req: Request, res: Resp
   }
 
   res.json({ id: doc.id, parsingStatus: doc.parsingStatus });
-});
+}));
 
 export default router;

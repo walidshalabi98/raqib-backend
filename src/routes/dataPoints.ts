@@ -1,12 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // GET /api/indicators/:id/data — Get data points for indicator (with trend)
-router.get('/indicators/:id/data', authenticate, async (req: Request, res: Response) => {
+router.get('/indicators/:id/data', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const indicator = await prisma.indicator.findUnique({
     where: { id: req.params.id },
     include: { framework: { include: { project: true } } },
@@ -49,10 +49,10 @@ router.get('/indicators/:id/data', authenticate, async (req: Request, res: Respo
     trend,
     count: dataPoints.length,
   });
-});
+}));
 
 // POST /api/indicators/:id/data — Add data point
-router.post('/indicators/:id/data', authenticate, async (req: Request, res: Response) => {
+router.post('/indicators/:id/data', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const indicator = await prisma.indicator.findUnique({
     where: { id: req.params.id },
     include: { framework: { include: { project: true } } },
@@ -90,10 +90,10 @@ router.post('/indicators/:id/data', authenticate, async (req: Request, res: Resp
   });
 
   res.status(201).json(dataPoint);
-});
+}));
 
 // POST /api/projects/:id/data/bulk — Bulk import data
-router.post('/projects/:id/data/bulk', authenticate, async (req: Request, res: Response) => {
+router.post('/projects/:id/data/bulk', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -129,6 +129,6 @@ router.post('/projects/:id/data/bulk', authenticate, async (req: Request, res: R
   });
 
   res.status(201).json({ count: created.count });
-});
+}));
 
 export default router;

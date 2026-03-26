@@ -1,12 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError, asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // GET /api/projects
-router.get('/', authenticate, async (req: Request, res: Response) => {
+router.get('/', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const projects = await prisma.project.findMany({
     where: { organizationId: req.user!.organizationId },
     include: {
@@ -17,10 +17,10 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     orderBy: { createdAt: 'desc' },
   });
   res.json(projects);
-});
+}));
 
 // POST /api/projects
-router.post('/', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.post('/', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const {
     name, nameAr, description, sector, donor, donorType,
     budgetUsd, startDate, endDate, targetBeneficiaries, geographicScope,
@@ -39,19 +39,19 @@ router.post('/', authenticate, authorize('org_admin', 'platform_admin'), async (
       sector,
       donor,
       donorType,
-      budgetUsd,
+      budgetUsd: budgetUsd ? parseFloat(budgetUsd) : undefined,
       startDate: new Date(startDate),
       endDate: new Date(endDate),
-      targetBeneficiaries,
+      targetBeneficiaries: targetBeneficiaries ? parseInt(targetBeneficiaries) : undefined,
       geographicScope,
     },
   });
 
   res.status(201).json(project);
-});
+}));
 
 // GET /api/projects/:id
-router.get('/:id', authenticate, async (req: Request, res: Response) => {
+router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
@@ -69,10 +69,10 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 
   if (!project) throw new AppError(404, 'Project not found');
   res.json(project);
-});
+}));
 
 // PATCH /api/projects/:id
-router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), async (req: Request, res: Response) => {
+router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -102,10 +102,10 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
   });
 
   res.json(updated);
-});
+}));
 
 // DELETE /api/projects/:id — Archive
-router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
   });
@@ -117,6 +117,6 @@ router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), as
   });
 
   res.json({ message: 'Project archived' });
-});
+}));
 
 export default router;

@@ -1,13 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { getIndicatorQueue } from '../jobs/queues';
 
 const router = Router();
 
 // PATCH /api/indicators/:id
-router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), async (req: Request, res: Response) => {
+router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const indicator = await prisma.indicator.findUnique({
     where: { id: req.params.id },
     include: { framework: { include: { project: true } } },
@@ -41,10 +41,10 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
   });
 
   res.json(updated);
-});
+}));
 
 // POST /api/indicators/:id/alternative — Request AI alternative
-router.post('/:id/alternative', authenticate, async (req: Request, res: Response) => {
+router.post('/:id/alternative', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const indicator = await prisma.indicator.findUnique({
     where: { id: req.params.id },
     include: { framework: { include: { project: true } } },
@@ -61,10 +61,10 @@ router.post('/:id/alternative', authenticate, async (req: Request, res: Response
   });
 
   res.status(202).json({ jobId: job.id, status: 'processing' });
-});
+}));
 
 // PATCH /api/indicators/:id/approve
-router.patch('/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), async (req: Request, res: Response) => {
+router.patch('/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const indicator = await prisma.indicator.findUnique({
     where: { id: req.params.id },
     include: { framework: { include: { project: true } } },
@@ -80,10 +80,10 @@ router.patch('/:id/approve', authenticate, authorize('org_admin', 'platform_admi
   });
 
   res.json(updated);
-});
+}));
 
 // DELETE /api/indicators/:id
-router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), async (req: Request, res: Response) => {
+router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const indicator = await prisma.indicator.findUnique({
     where: { id: req.params.id },
     include: { framework: { include: { project: true } } },
@@ -95,6 +95,6 @@ router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me
 
   await prisma.indicator.delete({ where: { id: req.params.id } });
   res.json({ message: 'Indicator deleted' });
-});
+}));
 
 export default router;

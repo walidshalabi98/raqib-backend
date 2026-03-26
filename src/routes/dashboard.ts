@@ -1,12 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
-import { AppError } from '../middleware/errorHandler';
+import { AppError , asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // GET /api/projects/:id/dashboard — Aggregated dashboard data
-router.get('/projects/:id/dashboard', authenticate, async (req: Request, res: Response) => {
+router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
@@ -116,10 +116,10 @@ router.get('/projects/:id/dashboard', authenticate, async (req: Request, res: Re
       requestedAt: a.requestedAt,
     })),
   });
-});
+}));
 
 // GET /api/dashboard/overview — Org-level overview
-router.get('/overview', authenticate, async (req: Request, res: Response) => {
+router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
 
   const projects = await prisma.project.findMany({
@@ -184,6 +184,6 @@ router.get('/overview', authenticate, async (req: Request, res: Response) => {
       projectName: ind.framework.project.name,
     })),
   });
-});
+}));
 
 export default router;

@@ -3,12 +3,12 @@ import bcrypt from 'bcrypt';
 import { prisma } from '../config/prisma';
 import { generateAccessToken, generateRefreshToken, verifyRefreshToken, generateResetToken, verifyResetToken } from '../utils/tokens';
 import { sendPasswordResetEmail } from '../utils/email';
-import { AppError } from '../middleware/errorHandler';
+import { AppError, asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // POST /api/auth/login
-router.post('/login', async (req: Request, res: Response) => {
+router.post('/login', asyncHandler(async (req: Request, res: Response) => {
   const { email, password } = req.body;
   if (!email || !password) throw new AppError(400, 'Email and password are required');
 
@@ -51,10 +51,10 @@ router.post('/login', async (req: Request, res: Response) => {
       },
     },
   });
-});
+}));
 
 // POST /api/auth/refresh
-router.post('/refresh', async (req: Request, res: Response) => {
+router.post('/refresh', asyncHandler(async (req: Request, res: Response) => {
   const { refreshToken } = req.body;
   if (!refreshToken) throw new AppError(400, 'Refresh token is required');
 
@@ -74,10 +74,10 @@ router.post('/refresh', async (req: Request, res: Response) => {
   const newRefreshToken = generateRefreshToken(user.id);
 
   res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
-});
+}));
 
 // POST /api/auth/forgot-password
-router.post('/forgot-password', async (req: Request, res: Response) => {
+router.post('/forgot-password', asyncHandler(async (req: Request, res: Response) => {
   const { email } = req.body;
   if (!email) throw new AppError(400, 'Email is required');
 
@@ -89,10 +89,10 @@ router.post('/forgot-password', async (req: Request, res: Response) => {
 
   // Always return success to prevent email enumeration
   res.json({ message: 'If an account exists with that email, a reset link has been sent.' });
-});
+}));
 
 // POST /api/auth/reset-password
-router.post('/reset-password', async (req: Request, res: Response) => {
+router.post('/reset-password', asyncHandler(async (req: Request, res: Response) => {
   const { token, newPassword } = req.body;
   if (!token || !newPassword) throw new AppError(400, 'Token and new password are required');
   if (newPassword.length < 8) throw new AppError(400, 'Password must be at least 8 characters');
@@ -102,6 +102,6 @@ router.post('/reset-password', async (req: Request, res: Response) => {
 
   await prisma.user.update({ where: { id }, data: { passwordHash } });
   res.json({ message: 'Password has been reset successfully.' });
-});
+}));
 
 export default router;
