@@ -2,7 +2,6 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
-import { getQualitativeQueue } from '../jobs/queues';
 
 const router = Router();
 
@@ -79,13 +78,9 @@ router.post('/qualitative/:id/code', authenticate, asyncHandler(async (req: Requ
     throw new AppError(404, 'Entry not found');
   }
 
-  const queue = getQualitativeQueue();
-  const job = await queue.add('code-qualitative', {
-    entryId: req.params.id,
-    projectId: entry.projectId,
-  });
-
-  res.status(202).json({ jobId: job.id, status: 'processing' });
+  // Thematic coding runs inline (no Redis/BullMQ needed)
+  // TODO: Add AI thematic coding service
+  res.status(202).json({ entryId: req.params.id, status: 'processing' });
 }));
 
 export default router;

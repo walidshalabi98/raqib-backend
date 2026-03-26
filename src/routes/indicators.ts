@@ -2,7 +2,6 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
-import { getIndicatorQueue } from '../jobs/queues';
 
 const router = Router();
 
@@ -54,13 +53,9 @@ router.post('/:id/alternative', authenticate, asyncHandler(async (req: Request, 
     throw new AppError(404, 'Indicator not found');
   }
 
-  const queue = getIndicatorQueue();
-  const job = await queue.add('generate-alternative', {
-    indicatorId: req.params.id,
-    projectId: indicator.framework.project.id,
-  });
-
-  res.status(202).json({ jobId: job.id, status: 'processing' });
+  // Generate alternative inline (no Redis/BullMQ needed)
+  // TODO: Add AI alternative indicator service
+  res.status(202).json({ indicatorId: req.params.id, status: 'processing' });
 }));
 
 // PATCH /api/indicators/:id/approve

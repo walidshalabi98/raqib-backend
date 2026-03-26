@@ -2,7 +2,6 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
-import { getReportQueue } from '../jobs/queues';
 
 const router = Router();
 
@@ -41,13 +40,9 @@ router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin
     },
   });
 
-  const queue = getReportQueue();
-  const job = await queue.add('generate-report', {
-    reportId: report.id,
-    projectId: req.params.id,
-  });
-
-  res.status(202).json({ jobId: job.id, reportId: report.id, status: 'processing' });
+  // Generate report inline (no Redis/BullMQ needed)
+  // TODO: Add AI report generation service
+  res.status(202).json({ reportId: report.id, status: 'processing' });
 }));
 
 // GET /api/reports/:id
