@@ -1,0 +1,407 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = [vector]
+}
+
+enum OrgType {
+  local_ngo
+  ingo
+  donor
+  government
+  other
+}
+
+enum SubscriptionStatus {
+  trial
+  active
+  suspended
+  expired
+}
+
+enum UserRole {
+  platform_admin
+  org_admin
+  me_officer
+  donor_viewer
+}
+
+enum Language {
+  en
+  ar
+}
+
+enum Sector {
+  education
+  livelihoods
+  health
+  wash
+  protection
+  food_security
+  governance
+  agriculture
+  gender
+  youth
+  other
+}
+
+enum DonorType {
+  usaid
+  eu
+  giz
+  undp
+  unicef
+  sida
+  other
+}
+
+enum ProjectStatus {
+  setup
+  framework_review
+  active
+  completed
+  archived
+}
+
+enum DocumentType {
+  proposal
+  logframe
+  theory_of_change
+  baseline_report
+  donor_guidelines
+  budget
+  other
+}
+
+enum ParsingStatus {
+  pending
+  processing
+  completed
+  failed
+}
+
+enum FrameworkStatus {
+  draft
+  expert_review
+  client_review
+  approved
+  active
+}
+
+enum IndicatorLevel {
+  impact
+  outcome
+  output
+  activity
+}
+
+enum CollectionMethod {
+  hh_survey
+  fgd
+  kii
+  observation
+  document_review
+  participatory
+  secondary_data
+}
+
+enum Frequency {
+  monthly
+  quarterly
+  biannual
+  annual
+  per_cohort
+  baseline_endline
+}
+
+enum IndicatorStatus {
+  on_track
+  at_risk
+  off_track
+  not_started
+  completed
+}
+
+enum AssessmentType {
+  baseline
+  midterm
+  endline
+  fgd_round
+  kii_round
+  observation_round
+  survey_round
+}
+
+enum AssessmentStatus {
+  requested
+  scoping
+  in_field
+  data_cleaning
+  analysis
+  reporting
+  delivered
+}
+
+enum QualitativeType {
+  fgd_transcript
+  kii_notes
+  observation_checklist
+  community_scorecard
+  msc_story
+  field_notes
+}
+
+enum Sentiment {
+  positive
+  neutral
+  negative
+  mixed
+}
+
+enum ReportType {
+  monthly_progress
+  quarterly_summary
+  assessment_report
+  donor_export
+  annual_review
+}
+
+enum ReportStatus {
+  draft
+  published
+}
+
+enum NotificationType {
+  off_track_alert
+  assessment_ready
+  report_generated
+  framework_approved
+  deadline_reminder
+  new_data
+}
+
+model Organization {
+  id                 String             @id @default(uuid())
+  name               String
+  nameAr             String?
+  type               OrgType
+  logoUrl            String?
+  country            String
+  city               String
+  contactEmail       String
+  contactPhone       String?
+  subscriptionStatus SubscriptionStatus @default(trial)
+  createdAt          DateTime           @default(now())
+  users              User[]
+  projects           Project[]
+}
+
+model User {
+  id             String         @id @default(uuid())
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id])
+  email          String         @unique
+  passwordHash   String
+  fullName       String
+  fullNameAr     String?
+  role           UserRole
+  languagePref   Language       @default(en)
+  createdAt      DateTime       @default(now())
+  lastLogin      DateTime?
+  documents      Document[]
+  dataPoints     DataPoint[]
+  notifications  Notification[]
+}
+
+model Project {
+  id                  String             @id @default(uuid())
+  organizationId      String
+  organization        Organization       @relation(fields: [organizationId], references: [id])
+  name                String
+  nameAr              String?
+  description         String?
+  sector              Sector
+  donor               String
+  donorType           DonorType
+  budgetUsd           Decimal?           @db.Decimal(12, 2)
+  startDate           DateTime           @db.Date
+  endDate             DateTime           @db.Date
+  targetBeneficiaries Int?
+  geographicScope     String?
+  status              ProjectStatus      @default(setup)
+  createdAt           DateTime           @default(now())
+  documents           Document[]
+  frameworks          Framework[]
+  assessments         Assessment[]
+  dataPoints          DataPoint[]
+  qualitativeEntries  QualitativeEntry[]
+  reports             Report[]
+}
+
+model Document {
+  id            String        @id @default(uuid())
+  projectId     String
+  project       Project       @relation(fields: [projectId], references: [id])
+  uploadedBy    String
+  uploader      User          @relation(fields: [uploadedBy], references: [id])
+  fileName      String
+  fileUrl       String
+  fileType      DocumentType
+  fileSizeBytes BigInt?
+  parsedText    String?
+  parsingStatus ParsingStatus @default(pending)
+  uploadedAt    DateTime      @default(now())
+}
+
+model Framework {
+  id          String          @id @default(uuid())
+  projectId   String
+  project     Project         @relation(fields: [projectId], references: [id])
+  version     Int             @default(1)
+  status      FrameworkStatus @default(draft)
+  aiModelUsed String?
+  generatedAt DateTime        @default(now())
+  approvedAt  DateTime?
+  approvedBy  String?
+  indicators  Indicator[]
+}
+
+model Indicator {
+  id                   String           @id @default(uuid())
+  frameworkId           String
+  framework            Framework        @relation(fields: [frameworkId], references: [id])
+  indicatorText        String
+  indicatorTextAr      String?
+  level                IndicatorLevel
+  dataCollectionMethod CollectionMethod
+  frequency            Frequency
+  baselineValue        String?
+  targetValue          String?
+  currentValue         String?
+  unit                 String?
+  status               IndicatorStatus  @default(not_started)
+  aiRationale          String?
+  phases               Json             // ["baseline", "midterm", "endline"]
+  sortOrder            Int              @default(0)
+  isApproved           Boolean          @default(false)
+  createdAt            DateTime         @default(now())
+  dataPoints           DataPoint[]
+}
+
+model Assessment {
+  id                 String             @id @default(uuid())
+  projectId          String
+  project            Project            @relation(fields: [projectId], references: [id])
+  type               AssessmentType
+  status             AssessmentStatus   @default(requested)
+  scopeDescription   String?
+  sampleSize         Int?
+  methodsIncluded    Json               // ["hh_survey", "fgd", "kii"]
+  priceUsd           Decimal?           @db.Decimal(10, 2)
+  requestedAt        DateTime           @default(now())
+  startedAt          DateTime?
+  deliveredAt        DateTime?
+  reportUrl          String?
+  dataPoints         DataPoint[]
+  qualitativeEntries QualitativeEntry[]
+}
+
+model DataPoint {
+  id               String           @id @default(uuid())
+  indicatorId      String
+  indicator        Indicator        @relation(fields: [indicatorId], references: [id])
+  assessmentId     String?
+  assessment       Assessment?      @relation(fields: [assessmentId], references: [id])
+  projectId        String
+  project          Project          @relation(fields: [projectId], references: [id])
+  value            String
+  collectionDate   DateTime         @db.Date
+  collectionMethod CollectionMethod
+  dataSource       String?
+  geographicArea   String?
+  notes            String?
+  attachments      Json?
+  createdAt        DateTime         @default(now())
+  createdBy        String
+  creator          User             @relation(fields: [createdBy], references: [id])
+}
+
+model QualitativeEntry {
+  id               String          @id @default(uuid())
+  assessmentId     String?
+  assessment       Assessment?     @relation(fields: [assessmentId], references: [id])
+  projectId        String
+  project          Project         @relation(fields: [projectId], references: [id])
+  entryType        QualitativeType
+  title            String
+  content          String
+  participants     Int?
+  location         String?
+  dateConducted    DateTime?       @db.Date
+  facilitator      String?
+  themes           Json?           // ["theme1", "theme2"]
+  sentiment        Sentiment?
+  linkedIndicators Json?           // ["indicator-id-1", "indicator-id-2"]
+  attachments      Json?
+  createdAt        DateTime        @default(now())
+}
+
+model Report {
+  id          String       @id @default(uuid())
+  projectId   String
+  project     Project      @relation(fields: [projectId], references: [id])
+  type        ReportType
+  title       String
+  donorFormat DonorType?
+  fileUrl     String?
+  generatedAt DateTime     @default(now())
+  periodStart DateTime?    @db.Date
+  periodEnd   DateTime?    @db.Date
+  aiNarrative String?
+  status      ReportStatus @default(draft)
+}
+
+model METemplate {
+  id                   String                       @id @default(uuid())
+  sector               Sector
+  indicatorText        String
+  indicatorTextAr      String?
+  level                IndicatorLevel
+  recommendedMethod    CollectionMethod
+  recommendedFrequency Frequency
+  typicalTarget        String?
+  benchmarkPalestine   String?
+  donorRelevance       Json?                        // ["usaid", "eu"]
+  tags                 Json?
+  embedding            Unsupported("vector(1536)")?
+  createdAt            DateTime                     @default(now())
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id])
+  type      NotificationType
+  title     String
+  message   String
+  link      String?
+  isRead    Boolean          @default(false)
+  createdAt DateTime         @default(now())
+}
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  userId        String
+  action        String
+  entity        String
+  entityId      String
+  previousValue Json?
+  newValue      Json?
+  timestamp     DateTime @default(now())
+}
