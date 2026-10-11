@@ -17,7 +17,8 @@
     "storage:migrate": "tsx scripts/migrate-uploads.ts",
     "typecheck": "tsc -p tsconfig.check.json",
     "lint": "eslint .",
-    "seed:library": "tsx scripts/seed-library.ts"
+    "seed:library": "tsx scripts/seed-library.ts",
+    "verify:migration": "scripts/verify-phase2-migration.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
