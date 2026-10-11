@@ -191,7 +191,7 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
 
 // GET /api/dashboard/projects/:id/risks — AI Risk Analysis
 router.get('/projects/:id/risks', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const risks = await analyzeProjectRisks(req.params.id);
   res.json({ projectId: req.params.id, risks, analyzedAt: new Date().toISOString() });

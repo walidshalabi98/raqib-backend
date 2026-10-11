@@ -5,20 +5,18 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "prisma generate && tsc || true",
+    "build": "prisma generate && tsc",
     "start": "node dist/index.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:seed": "tsx prisma/seed.ts",
     "worker": "tsx src/jobs/worker.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "seed": "tsx prisma/seed.ts",
     "storage:setup": "tsx scripts/storage-setup.ts",
-    "storage:migrate": "tsx scripts/migrate-uploads.ts"
-  },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
+    "storage:migrate": "tsx scripts/migrate-uploads.ts",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "lint": "eslint ."
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
@@ -26,12 +24,14 @@
     "@react-pdf/renderer": "^4.3.0",
     "@supabase/supabase-js": "^2.117.3",
     "bcrypt": "^6.0.0",
+    "bullmq": "^6.3.12",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "exceljs": "^4.4.0",
     "express": "^4.21.2",
     "express-rate-limit": "^8.7.1",
     "helmet": "^8.3.0",
+    "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.2",
     "mammoth": "^1.8.0",
     "multer": "^1.4.5-lts.1",
@@ -43,6 +43,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/bcrypt": "^6.0.0",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.25",
@@ -52,9 +53,12 @@
     "@types/pdf-parse": "^1.1.4",
     "@types/supertest": "^7.2.1",
     "@types/uuid": "^10.0.0",
+    "eslint": "^9.39.5",
+    "globals": "^17.13.0",
     "supertest": "^7.3.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
+    "typescript-eslint": "^8.71.1",
     "vitest": "^5.0.3"
   },
   "overrides": {

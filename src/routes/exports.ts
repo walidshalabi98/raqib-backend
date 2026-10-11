@@ -41,7 +41,7 @@ router.get('/projects/:id/export/indicators', authenticate, asyncHandler(async (
       value: dp.value,
       date: dp.collectionDate.toISOString().split('T')[0],
       method: dp.collectionMethod,
-      source: dp.source,
+      source: dp.dataSource,
       area: dp.geographicArea,
     })),
   })) || [];

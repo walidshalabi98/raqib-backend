@@ -74,7 +74,7 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
 
 // PATCH /api/projects/:id
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const {
     name, nameAr, description, sector, donor, donorType,
@@ -212,7 +212,7 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
 
 // DELETE /api/projects/:id — Archive
 router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   await prisma.project.update({
     where: { id: req.params.id },

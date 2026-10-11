@@ -1,14 +1,14 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertBeneficiaryAccess, assertIndicatorsInProject, assertProjectAccess } from '../middleware/access';
-import { authenticate, authorize } from '../middleware/auth';
+import { authenticate } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
 // GET /api/projects/:id/beneficiaries - List with filters
 router.get('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const { gender, ageGroup, status, governorate, search } = req.query;
 
@@ -49,7 +49,7 @@ router.get('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req:
 
 // POST /api/projects/:id/beneficiaries - Register new
 router.post('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const { fullName, fullNameAr, gender, age, ageGroup, location, governorate, phoneNumber, nationalId, householdSize, vulnerabilityTags } = req.body;
   if (!fullName || !gender) throw new AppError(400, 'fullName and gender are required');
@@ -92,7 +92,7 @@ router.get('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request,
 
 // PATCH /api/beneficiaries/:id - Update
 router.patch('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const beneficiary = await assertBeneficiaryAccess(req, req.params.id);
+  await assertBeneficiaryAccess(req, req.params.id);
 
   const { fullName, fullNameAr, gender, age, ageGroup, location, governorate, phoneNumber, nationalId, householdSize, vulnerabilityTags, status } = req.body;
 
@@ -144,7 +144,7 @@ router.post('/beneficiaries/:id/services', authenticate, asyncHandler(async (req
 
 // GET /api/projects/:id/beneficiaries/stats - Aggregated stats for dashboard
 router.get('/projects/:id/beneficiaries/stats', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const [total, byGender, byAgeGroup, byGovernorate, byStatus, serviceCount] = await Promise.all([
     prisma.beneficiary.count({ where: { projectId: req.params.id } }),

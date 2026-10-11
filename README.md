@@ -1,0 +1,97 @@
+# Raqib — backend
+
+API, background worker and AI engine for Raqib (رقيب), an M&E platform for NGOs, INGOs and consultancies in Palestine and the region. The web app lives in [raqib-frontend](https://github.com/walidshalabi98/raqib-frontend).
+
+Stack: Node 22 · TypeScript · Express 4 · Prisma 6 (PostgreSQL + pgvector, hosted on Supabase) · BullMQ + Redis · Anthropic SDK · Supabase Storage · Resend.
+
+## Quick start
+
+Requirements: Node 22, PostgreSQL 16 with the `vector` extension (or a Supabase project), and Redis if you run the worker.
+
+```bash
+npm ci
+cp .env.example .env          # then fill in the values (see below)
+npx prisma db push            # create the schema in your local database
+npm run seed                  # demo organisation, users and projects (local only)
+npm run dev                   # API on http://localhost:3001
+```
+
+Check it is running: `curl http://localhost:3001/api/health`.
+
+Demo sign-in after seeding: `admin@momentumlabs.ps`, `me@momentumlabs.ps` or `donor@momentumlabs.ps`, password `admin123` (development only; set `SEED_PASSWORD` elsewhere).
+
+### Local database with Docker
+
+```bash
+docker run -d --name raqib-db -p 5432:5432 \
+  -e POSTGRES_USER=raqib -e POSTGRES_PASSWORD=raqib -e POSTGRES_DB=raqib \
+  pgvector/pgvector:pg16
+# DATABASE_URL=postgresql://raqib:raqib@localhost:5432/raqib
+# DIRECT_URL=postgresql://raqib:raqib@localhost:5432/raqib
+```
+
+### Environment
+
+The server refuses to start if a required value is missing and lists what is wrong. Required:
+
+| Variable | Notes |
+|---|---|
+| `DATABASE_URL`, `DIRECT_URL` | Postgres connection (Supabase: pooled URL and direct URL) |
+| `JWT_SECRET`, `JWT_REFRESH_SECRET` | at least 32 characters each — `openssl rand -hex 32` |
+| `ANTHROPIC_API_KEY` | Claude API key |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | required in production for private document storage |
+
+Everything else is optional and documented in `.env.example`. Security-related setup (storage bucket, webhook tokens, migrating old uploads) is in [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md).
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `npm run dev` | API with auto-reload |
+| `npm run worker` | BullMQ worker for background jobs (needs Redis) |
+| `npm run build` | `prisma generate` + TypeScript compile; fails on any type error |
+| `npm start` | run the compiled API from `dist/` |
+| `npm run lint` | ESLint |
+| `npm run typecheck` | type-check source, tests, scripts and seed |
+| `npm test` | Vitest unit and integration tests (see below) |
+| `npm run seed` | reset and seed demo data — **deletes all data**, refuses to run in production |
+| `npm run storage:setup` | create the private Supabase Storage bucket |
+| `npm run storage:migrate` | move pre-Phase-0 files from `uploads/` to private storage (dry run; add `-- --apply`) |
+
+## Tests
+
+Unit tests run anywhere. Integration tests need a **disposable** Postgres database whose name contains `test` — every table in it is emptied.
+
+```bash
+export TEST_DATABASE_URL=postgresql://raqib:raqib@localhost:5432/raqib_test
+DATABASE_URL=$TEST_DATABASE_URL DIRECT_URL=$TEST_DATABASE_URL npx prisma db push --skip-generate
+npm test
+```
+
+Without `TEST_DATABASE_URL` the integration tests are skipped. AI calls are always mocked in tests.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and on `main`: install, Prisma generate, lint, typecheck, tests against a pgvector Postgres service, build and `npm audit --audit-level=high`.
+
+## Project layout
+
+```
+src/
+  app.ts            Express app (middleware, routes)
+  index.ts          starts the HTTP server
+  config/           env validation, Prisma, Redis
+  middleware/       auth, organisation access checks, rate limits, uploads, webhooks, errors
+  routes/           REST endpoints
+  services/ai/      AI features (framework generator, report narrative, …)
+  services/storage  private file storage (Supabase / local)
+  jobs/             BullMQ queues and worker
+prisma/             schema, seed, reviewed SQL for shared databases
+knowledge/          M&E rules, indicator library, KPI Assistant spec and eval cases
+docs/               build guide and setup notes
+tests/              Vitest + Supertest
+```
+
+## Working on Raqib
+
+Read [`CLAUDE.md`](CLAUDE.md) and [`docs/BUILD_GUIDE.md`](docs/BUILD_GUIDE.md) first: they hold the rules (organisation isolation, no personal data to AI, reviewed migrations) and the phased plan.
