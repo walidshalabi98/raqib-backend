@@ -1,17 +1,16 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { assertProjectAccess, assertReportAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { aiLimiter } from '../middleware/rateLimit';
 import { generateReportNarrative } from '../services/ai/reportNarrative';
 
 const router = Router();
 
 // GET /api/projects/:id/reports
 router.get('/projects/:id/reports', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   const reports = await prisma.report.findMany({
     where: { projectId: req.params.id },
@@ -21,11 +20,8 @@ router.get('/projects/:id/reports', authenticate, asyncHandler(async (req: Reque
 }));
 
 // POST /api/projects/:id/reports/generate — Generate report (async)
-router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+  const project = await assertProjectAccess(req, req.params.id);
 
   const { type, title, donorFormat, periodStart, periodEnd } = req.body;
   if (!type || !title) throw new AppError(400, 'type and title are required');
@@ -51,28 +47,14 @@ router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin
 
 // GET /api/reports/:id
 router.get('/reports/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const report = await prisma.report.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!report || report.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Report not found');
-  }
+  const report = await assertReportAccess(req, req.params.id);
 
   res.json(report);
 }));
 
 // GET /api/reports/:id/status
 router.get('/reports/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const report = await prisma.report.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!report || report.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Report not found');
-  }
+  const report = await assertReportAccess(req, req.params.id);
 
   res.json({
     reportId: report.id,

@@ -1,32 +1,19 @@
 import { Router, Request, Response } from 'express';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { assertAssessmentInProject, assertProjectAccess, assertQualitativeAccess } from '../middleware/access';
+import { aiLimiter } from '../middleware/rateLimit';
+import { assertFileContent, documentUpload } from '../middleware/upload';
+import { buildDocumentKey, getStorage } from '../services/storage';
 import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
 import { parseDocument } from '../services/ai/documentParser';
-
-// Multer for qualitative document uploads
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    const dir = path.join(process.cwd(), 'uploads', 'qualitative');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (_req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
-});
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
 const router = Router();
 
 // GET /api/projects/:id/qualitative
 router.get('/projects/:id/qualitative', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  await assertProjectAccess(req, req.params.id);
 
   const entries = await prisma.qualitativeEntry.findMany({
     where: { projectId: req.params.id },
@@ -36,11 +23,8 @@ router.get('/projects/:id/qualitative', authenticate, asyncHandler(async (req: R
 }));
 
 // POST /api/projects/:id/qualitative — Add entry
-router.post('/projects/:id/qualitative', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+router.post('/projects/:id/qualitative', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+  await assertProjectAccess(req, req.params.id);
 
   const {
     entryType, title, content, participants, location,
@@ -50,6 +34,7 @@ router.post('/projects/:id/qualitative', authenticate, asyncHandler(async (req: 
   if (!entryType || !title || !content) {
     throw new AppError(400, 'entryType, title, and content are required');
   }
+  await assertAssessmentInProject(req.params.id, assessmentId);
 
   const entry = await prisma.qualitativeEntry.create({
     data: {
@@ -75,14 +60,15 @@ router.post('/projects/:id/qualitative', authenticate, asyncHandler(async (req: 
 }));
 
 // POST /api/projects/:id/qualitative/upload — Upload document (transcript/notes) and create qualitative entry
-router.post('/projects/:id/qualitative/upload', authenticate, upload.single('file'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documentUpload.single('file'), asyncHandler(async (req: Request, res: Response) => {
+  await assertProjectAccess(req, req.params.id);
 
   const file = req.file;
   if (!file) throw new AppError(400, 'No file uploaded');
+  assertFileContent(file);
+
+  const key = buildDocumentKey(req.params.id, file.originalname);
+  await getStorage().put(key, file.buffer, file.mimetype);
 
   const { entryType, title, participants, location, dateConducted, facilitator } = req.body;
 
@@ -92,7 +78,7 @@ router.post('/projects/:id/qualitative/upload', authenticate, upload.single('fil
       projectId: req.params.id,
       uploadedBy: req.user!.id,
       fileName: file.originalname,
-      fileUrl: `/uploads/qualitative/${file.filename}`,
+      fileUrl: key, // storage key, not a public URL
       fileType: 'other',
       fileSizeBytes: file.size,
       parsingStatus: 'pending',
@@ -142,28 +128,14 @@ router.post('/projects/:id/qualitative/upload', authenticate, upload.single('fil
 
 // GET /api/qualitative/:id — Get full entry with themes
 router.get('/qualitative/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const entry = await prisma.qualitativeEntry.findUnique({
-    where: { id: req.params.id },
-    include: { project: true, assessment: true },
-  });
-
-  if (!entry || entry.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Entry not found');
-  }
+  const entry = await assertQualitativeAccess(req, req.params.id);
 
   res.json(entry);
 }));
 
 // POST /api/qualitative/:id/code — Trigger AI thematic coding
-router.post('/qualitative/:id/code', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const entry = await prisma.qualitativeEntry.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!entry || entry.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Entry not found');
-  }
+router.post('/qualitative/:id/code', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+  const entry = await assertQualitativeAccess(req, req.params.id);
 
   // Thematic coding runs inline (no Redis/BullMQ needed)
   codeQualitativeEntry(req.params.id, entry.projectId).catch(err => {

@@ -1,17 +1,16 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { assertFrameworkAccess, assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { aiLimiter } from '../middleware/rateLimit';
 import { generateFramework } from '../services/ai/frameworkGenerator';
 
 const router = Router();
 
 // GET /api/projects/:id/framework — Get active framework with indicators
 router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   const framework = await prisma.framework.findFirst({
     where: { projectId: req.params.id },
@@ -32,11 +31,8 @@ router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Req
 }));
 
 // POST /api/projects/:id/framework/generate — Trigger AI generation (runs inline, no Redis needed)
-router.post('/projects/:id/framework/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+router.post('/projects/:id/framework/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+  const project = await assertProjectAccess(req, req.params.id);
 
   // Get current max version
   const latest = await prisma.framework.findFirst({
@@ -71,17 +67,11 @@ router.post('/projects/:id/framework/generate', authenticate, authorize('org_adm
 
 // GET /api/frameworks/:id/status — Check generation status
 router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const framework = await prisma.framework.findUnique({
+  await assertFrameworkAccess(req, req.params.id);
+  const framework = await prisma.framework.findUniqueOrThrow({
     where: { id: req.params.id },
-    include: {
-      project: true,
-      indicators: { orderBy: { sortOrder: 'asc' } },
-    },
+    include: { indicators: { orderBy: { sortOrder: 'asc' } } },
   });
-
-  if (!framework || framework.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Framework not found');
-  }
 
   const hasIndicators = framework.indicators.length > 0;
   const isComplete = hasIndicators && framework.status !== 'draft';
@@ -96,14 +86,7 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
 
 // PATCH /api/frameworks/:id/approve
 router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
-  const framework = await prisma.framework.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!framework || framework.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Framework not found');
-  }
+  const framework = await assertFrameworkAccess(req, req.params.id);
 
   const updated = await prisma.framework.update({
     where: { id: req.params.id },
@@ -126,10 +109,7 @@ router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'pl
 
 // POST /api/projects/:id/framework/manual — Create a blank manual framework
 router.post('/projects/:id/framework/manual', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   // Get current max version
   const latest = await prisma.framework.findFirst({
@@ -152,14 +132,7 @@ router.post('/projects/:id/framework/manual', authenticate, authorize('org_admin
 
 // POST /api/frameworks/:id/indicators — Create a single indicator manually
 router.post('/frameworks/:id/indicators', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const framework = await prisma.framework.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!framework || framework.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Framework not found');
-  }
+  const framework = await assertFrameworkAccess(req, req.params.id);
 
   // Get next sort order
   const lastIndicator = await prisma.indicator.findFirst({
@@ -203,14 +176,7 @@ router.post('/frameworks/:id/indicators', authenticate, authorize('org_admin', '
 
 // GET /api/frameworks/:id/indicators
 router.get('/frameworks/:id/indicators', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const framework = await prisma.framework.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!framework || framework.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Framework not found');
-  }
+  const framework = await assertFrameworkAccess(req, req.params.id);
 
   const indicators = await prisma.indicator.findMany({
     where: { frameworkId: req.params.id },

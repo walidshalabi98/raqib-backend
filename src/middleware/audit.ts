@@ -22,9 +22,11 @@ export async function auditLog(
 }
 
 export function auditMiddleware(req: Request, res: Response, next: NextFunction): void {
-  if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method) && req.user) {
+  if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)) {
     const originalJson = res.json.bind(res);
     res.json = function (body: unknown) {
+      // req.user is set by route-level authenticate, after this middleware runs.
+      if (!req.user) return originalJson(body);
       auditLog(
         req.user!.id,
         `${req.method} ${req.path}`,

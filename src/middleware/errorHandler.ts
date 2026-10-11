@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
+import multer from 'multer';
 
 export class AppError extends Error {
   constructor(
@@ -29,6 +30,26 @@ export function errorHandler(err: Error, _req: Request, res: Response, _next: Ne
 
   if (err instanceof AppError) {
     res.status(err.statusCode).json({ message: err.message });
+    return;
+  }
+
+  if (err instanceof multer.MulterError) {
+    const tooLarge = err.code === 'LIMIT_FILE_SIZE';
+    res.status(tooLarge ? 413 : 400).json({
+      message: tooLarge ? 'The file is too large. The maximum size is 25 MB.' : 'The upload could not be processed.',
+    });
+    return;
+  }
+
+  // Invalid or expired refresh / reset tokens
+  if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
+    res.status(401).json({ message: 'Invalid or expired token' });
+    return;
+  }
+
+  // Malformed JSON body
+  if ((err as any).type === 'entity.parse.failed') {
+    res.status(400).json({ message: 'The request body is not valid JSON.' });
     return;
   }
 

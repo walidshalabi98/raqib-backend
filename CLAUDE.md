@@ -9,6 +9,7 @@ Raqib is an M&E (monitoring and evaluation) platform for NGOs, INGOs and consult
 - `knowledge/kpi-assistant-spec.md` — spec for the KPI Assistant and Active Monitoring.
 - `knowledge/indicator-library.json` — seed indicator library (source of truth for `IndicatorLibraryEntry`).
 - `knowledge/kpi-eval-cases.json` — AI evaluation cases.
+- `docs/SECURITY_SETUP.md` — storage, webhook tokens, env rules and how to run the tests.
 
 ## Stack
 
@@ -22,7 +23,7 @@ npm run dev             # API with watch
 npm run worker          # BullMQ worker
 npm run build           # must fail on type errors (never add "|| true")
 npm run lint
-npm test                # Vitest unit + integration
+npm test                # Vitest unit + integration (integration needs TEST_DATABASE_URL, see docs/SECURITY_SETUP.md)
 npm run eval:kpi        # KPI Assistant evaluation (uses the real API; costs money)
 npx prisma migrate dev  # local only; never against shared databases without asking
 npm run seed            # dev seed (refuses to run in production)
@@ -31,7 +32,7 @@ npm run seed:library    # idempotent library upsert
 
 ## Rules
 
-1. **Organisation isolation everywhere.** Every query for a project-owned resource must be scoped to `req.user.organizationId` (use `assertProjectAccess`). Add an isolation test for every new route.
+1. **Organisation isolation everywhere.** Every query for a project-owned resource must be scoped to `req.user.organizationId` (use the helpers in `src/middleware/access.ts`). Add every new route with an id to `tests/isolation.test.ts`; the coverage test fails otherwise.
 2. **No public files.** Documents live in a private Supabase Storage bucket; serve them via short-lived signed URLs after an access check.
 3. **No secrets in code, tests, fixtures or logs.** Configuration comes from the zod-validated env in `src/config/env.ts`.
 4. **AI calls go through `src/services/ai/client.ts` only.** Model ids come from `AI_MODEL_MAIN` (default `claude-sonnet-5-5`) and `AI_MODEL_FAST` (default `claude-haiku-5-5`). Use structured outputs (`output_config.format` with a JSON schema), then validate again with zod. Version every prompt (`promptVersion`) and keep prompts in `src/services/ai/prompts/`.

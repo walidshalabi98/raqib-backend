@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { assertAssessmentInProject, assertIndicatorAccess, assertIndicatorsInProject, assertProjectAccess } from '../middleware/access';
 import { authenticate } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 
@@ -7,14 +8,7 @@ const router = Router();
 
 // GET /api/indicators/:id/data — Get data points for indicator (with trend)
 router.get('/indicators/:id/data', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const indicator = await prisma.indicator.findUnique({
-    where: { id: req.params.id },
-    include: { framework: { include: { project: true } } },
-  });
-
-  if (!indicator || indicator.framework.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Indicator not found');
-  }
+  const indicator = await assertIndicatorAccess(req, req.params.id);
 
   const dataPoints = await prisma.dataPoint.findMany({
     where: { indicatorId: req.params.id },
@@ -53,19 +47,13 @@ router.get('/indicators/:id/data', authenticate, asyncHandler(async (req: Reques
 
 // POST /api/indicators/:id/data — Add data point
 router.post('/indicators/:id/data', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const indicator = await prisma.indicator.findUnique({
-    where: { id: req.params.id },
-    include: { framework: { include: { project: true } } },
-  });
-
-  if (!indicator || indicator.framework.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Indicator not found');
-  }
+  const indicator = await assertIndicatorAccess(req, req.params.id);
 
   const { value, collectionDate, collectionMethod, dataSource, geographicArea, notes, assessmentId, attachments } = req.body;
   if (!value || !collectionDate || !collectionMethod) {
     throw new AppError(400, 'value, collectionDate, and collectionMethod are required');
   }
+  await assertAssessmentInProject(indicator.framework.project.id, assessmentId);
 
   const dataPoint = await prisma.dataPoint.create({
     data: {
@@ -94,14 +82,19 @@ router.post('/indicators/:id/data', authenticate, asyncHandler(async (req: Reque
 
 // POST /api/projects/:id/data/bulk — Bulk import data
 router.post('/projects/:id/data/bulk', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  await assertProjectAccess(req, req.params.id);
 
   const { dataPoints } = req.body;
   if (!Array.isArray(dataPoints) || dataPoints.length === 0) {
     throw new AppError(400, 'dataPoints array is required');
+  }
+  if (dataPoints.some((dp: { indicatorId?: string }) => !dp?.indicatorId)) {
+    throw new AppError(400, 'Every data point needs an indicatorId');
+  }
+  // Every referenced indicator and assessment must belong to this project.
+  await assertIndicatorsInProject(req.params.id, dataPoints.map((dp: { indicatorId: string }) => dp.indicatorId));
+  for (const assessmentId of new Set(dataPoints.map((dp: { assessmentId?: string }) => dp.assessmentId).filter(Boolean))) {
+    await assertAssessmentInProject(req.params.id, assessmentId as string);
   }
 
   const created = await prisma.dataPoint.createMany({

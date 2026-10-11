@@ -3,11 +3,30 @@ import bcrypt from 'bcrypt';
 
 const prisma = new PrismaClient();
 
+const nodeEnv = process.env.NODE_ENV || 'development';
+
+// This seed DELETES all data before inserting demo records. Never run it in production.
+if (nodeEnv === 'production') {
+  console.error('Refusing to seed: NODE_ENV is "production". The seed deletes all existing data.');
+  process.exit(1);
+}
+
+// Outside local development the demo password must come from SEED_PASSWORD.
+const seedPassword = process.env.SEED_PASSWORD || (nodeEnv === 'development' ? 'admin123' : '');
+if (!seedPassword || seedPassword.length < 8) {
+  console.error('Refusing to seed: set SEED_PASSWORD (at least 8 characters) when NODE_ENV is not "development".');
+  process.exit(1);
+}
+const shownPassword = process.env.SEED_PASSWORD ? '<SEED_PASSWORD>' : seedPassword;
+
 async function main() {
   console.log('🌱 Seeding RAQIB database...');
 
   // Clean existing data
   await prisma.notification.deleteMany();
+  await prisma.webhookToken.deleteMany();
+  await prisma.beneficiaryService.deleteMany();
+  await prisma.beneficiary.deleteMany();
   await prisma.dataPoint.deleteMany();
   await prisma.qualitativeEntry.deleteMany();
   await prisma.indicator.deleteMany();
@@ -36,7 +55,7 @@ async function main() {
   });
 
   // Users
-  const passwordHash = await bcrypt.hash('admin123', 12);
+  const passwordHash = await bcrypt.hash(seedPassword, 12);
 
   const adminUser = await prisma.user.create({
     data: {
@@ -582,9 +601,9 @@ async function main() {
   console.log('✅ Seed completed successfully!');
   console.log('');
   console.log('Demo accounts:');
-  console.log('  Admin:   admin@momentumlabs.ps / admin123');
-  console.log('  M&E:     me@momentumlabs.ps / admin123');
-  console.log('  Donor:   donor@momentumlabs.ps / admin123');
+  console.log(`  Admin:   admin@momentumlabs.ps / ${shownPassword}`);
+  console.log(`  M&E:     me@momentumlabs.ps / ${shownPassword}`);
+  console.log(`  Donor:   donor@momentumlabs.ps / ${shownPassword}`);
   console.log('');
   console.log(`Projects: ${project1.name}, ${project2.name}, ${project3.name}`);
 }

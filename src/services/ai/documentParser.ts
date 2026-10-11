@@ -1,6 +1,6 @@
-import fs from 'fs';
 import path from 'path';
 import { prisma } from '../../config/prisma';
+import { getStorage } from '../storage';
 
 export async function parseDocument(documentId: string): Promise<void> {
   const doc = await prisma.document.findUnique({ where: { id: documentId } });
@@ -12,18 +12,17 @@ export async function parseDocument(documentId: string): Promise<void> {
   });
 
   try {
-    const filePath = path.join(process.cwd(), doc.fileUrl);
-    if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+    const buffer = await getStorage().get(doc.fileUrl);
 
     const ext = path.extname(doc.fileName).toLowerCase();
     let text = '';
 
     if (ext === '.pdf') {
-      text = await parsePdf(filePath);
+      text = await parsePdf(buffer);
     } else if (ext === '.docx' || ext === '.doc') {
-      text = await parseDocx(filePath);
-    } else if (ext === '.xlsx' || ext === '.xls') {
-      text = await parseExcel(filePath);
+      text = await parseDocx(buffer);
+    } else if (ext === '.xlsx') {
+      text = await parseExcel(buffer);
     } else {
       throw new Error(`Unsupported file type: ${ext}`);
     }
@@ -31,7 +30,7 @@ export async function parseDocument(documentId: string): Promise<void> {
     // If PDF parsing returned very little text, try OCR
     if (ext === '.pdf' && text.trim().length < 100) {
       console.log(`[DocumentParser] Low text content, attempting OCR for ${doc.fileName}`);
-      text = await ocrPdf(filePath);
+      text = await ocrPdf(buffer);
     }
 
     await prisma.document.update({
@@ -94,39 +93,60 @@ Return ONLY valid JSON, no markdown.`
   }
 }
 
-async function parsePdf(filePath: string): Promise<string> {
+async function parsePdf(buffer: Buffer): Promise<string> {
   const pdfParse = (await import('pdf-parse')).default;
-  const buffer = fs.readFileSync(filePath);
   const data = await pdfParse(buffer);
   return data.text;
 }
 
-async function parseDocx(filePath: string): Promise<string> {
+async function parseDocx(buffer: Buffer): Promise<string> {
   const mammoth = await import('mammoth');
-  const result = await mammoth.extractRawText({ path: filePath });
+  const result = await mammoth.extractRawText({ buffer });
   return result.value;
 }
 
-async function parseExcel(filePath: string): Promise<string> {
-  const XLSX = await import('xlsx');
-  const workbook = XLSX.readFile(filePath);
+async function parseExcel(buffer: Buffer): Promise<string> {
+  const ExcelJS = (await import('exceljs')).default;
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer as any);
   const texts: string[] = [];
 
-  for (const sheetName of workbook.SheetNames) {
-    const sheet = workbook.Sheets[sheetName];
-    const csv = XLSX.utils.sheet_to_csv(sheet);
-    texts.push(`--- Sheet: ${sheetName} ---\n${csv}`);
-  }
+  workbook.eachSheet(sheet => {
+    const rows: string[] = [];
+    sheet.eachRow(row => {
+      const cells: string[] = [];
+      row.eachCell({ includeEmpty: true }, cell => cells.push(csvEscape(cellText(cell.value))));
+      rows.push(cells.join(','));
+    });
+    texts.push(`--- Sheet: ${sheet.name} ---\n${rows.join('\n')}`);
+  });
 
   return texts.join('\n\n');
 }
 
-async function ocrPdf(filePath: string): Promise<string> {
+function cellText(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Date) return value.toISOString().split('T')[0];
+  if (typeof value === 'object') {
+    const v = value as { result?: unknown; text?: unknown; richText?: { text: string }[]; error?: string };
+    if (v.richText) return v.richText.map(r => r.text).join('');
+    if (v.text !== undefined) return cellText(v.text);
+    if (v.result !== undefined) return cellText(v.result);
+    if (v.error) return v.error;
+  }
+  return String(value);
+}
+
+function csvEscape(text: string): string {
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+async function ocrPdf(buffer: Buffer): Promise<string> {
   try {
     const Tesseract = await import('tesseract.js');
     // For OCR, we'd typically convert PDF pages to images first.
     // Simplified: attempt Tesseract on the file directly (works for image-based PDFs)
-    const { data } = await Tesseract.recognize(filePath, 'eng+ara');
+    const { data } = await Tesseract.recognize(buffer, 'eng+ara');
     return data.text;
   } catch (error) {
     console.warn('[DocumentParser] OCR failed, returning empty text:', error);

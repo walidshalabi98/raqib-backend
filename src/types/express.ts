@@ -1,4 +1,5 @@
 import { UserRole } from '@prisma/client';
+import type { WebhookContext } from '../middleware/webhookAuth';
 
 export interface AuthUser {
   id: string;
@@ -12,6 +13,8 @@ declare global {
   namespace Express {
     interface Request {
       user?: AuthUser;
+      rawBody?: Buffer;
+      webhook?: WebhookContext;
     }
   }
 }

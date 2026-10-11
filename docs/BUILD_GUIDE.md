@@ -379,7 +379,7 @@ Paste the matching prompt at the start of a session (in the repository named).
 
 | Phase | Status | PR | Notes |
 |---|---|---|---|
-| 0 Safety | Not started | | |
+| 0 Safety | In review | | Frontend `npm audit` still reports high/critical findings in build tooling (Tailwind 3, Vite 5, Vitest 3) that need major upgrades — moved to Phase 1. Schema change not yet applied to Supabase. |
 | 1 Build | Not started | | |
 | 2 Data model | Not started | | |
 | 3 AI foundation | Not started | | |

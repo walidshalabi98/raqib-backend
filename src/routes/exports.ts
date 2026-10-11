@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { assertProjectAccess } from '../middleware/access';
 import { authenticate } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 
@@ -55,10 +56,7 @@ router.get('/projects/:id/export/indicators', authenticate, asyncHandler(async (
 
 // GET /api/projects/:id/export/beneficiaries
 router.get('/projects/:id/export/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   let beneficiaries: any[] = [];
   try {

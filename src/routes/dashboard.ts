@@ -1,7 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { assertProjectAccess } from '../middleware/access';
 import { authenticate } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { aiLimiter } from '../middleware/rateLimit';
 import { analyzeProjectRisks } from '../services/ai/riskAnalyzer';
 
 const router = Router();
@@ -188,11 +190,8 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
 }));
 
 // GET /api/dashboard/projects/:id/risks — AI Risk Analysis
-router.get('/projects/:id/risks', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+router.get('/projects/:id/risks', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+  const project = await assertProjectAccess(req, req.params.id);
 
   const risks = await analyzeProjectRisks(req.params.id);
   res.json({ projectId: req.params.id, risks, analyzedAt: new Date().toISOString() });

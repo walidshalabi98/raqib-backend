@@ -200,6 +200,24 @@ model Organization {
   createdAt          DateTime           @default(now())
   users              User[]
   projects           Project[]
+  webhookTokens      WebhookToken[]
+}
+
+// Per-organisation token for inbound webhooks (KoboToolbox, Manasati).
+// Only the SHA-256 hash is stored; the plain token is shown once when created.
+model WebhookToken {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tokenHash      String       @unique
+  tokenPrefix    String       // first characters, to help admins recognise the token
+  createdById    String       // user that data imported through this token is attributed to
+  createdBy      User         @relation(fields: [createdById], references: [id])
+  createdAt      DateTime     @default(now())
+  lastUsedAt     DateTime?
+  revokedAt      DateTime?
+
+  @@index([organizationId])
 }
 
 model User {
@@ -217,6 +235,7 @@ model User {
   documents      Document[]
   dataPoints     DataPoint[]
   notifications  Notification[]
+  webhookTokens  WebhookToken[]
 }
 
 model Project {
