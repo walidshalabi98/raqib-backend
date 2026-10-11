@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 
@@ -73,10 +74,7 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
 
 // PATCH /api/projects/:id
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   const {
     name, nameAr, description, sector, donor, donorType,
@@ -214,10 +212,7 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
 
 // DELETE /api/projects/:id — Archive
 router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   await prisma.project.update({
     where: { id: req.params.id },

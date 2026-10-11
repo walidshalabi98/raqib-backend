@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { assertBeneficiaryAccess, assertIndicatorsInProject, assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 
@@ -7,10 +8,7 @@ const router = Router();
 
 // GET /api/projects/:id/beneficiaries - List with filters
 router.get('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   const { gender, ageGroup, status, governorate, search } = req.query;
 
@@ -51,10 +49,7 @@ router.get('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req:
 
 // POST /api/projects/:id/beneficiaries - Register new
 router.post('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   const { fullName, fullNameAr, gender, age, ageGroup, location, governorate, phoneNumber, nationalId, householdSize, vulnerabilityTags } = req.body;
   if (!fullName || !gender) throw new AppError(400, 'fullName and gender are required');
@@ -81,7 +76,8 @@ router.post('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req
 
 // GET /api/beneficiaries/:id - Get single with full service history
 router.get('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const beneficiary = await prisma.beneficiary.findUnique({
+  await assertBeneficiaryAccess(req, req.params.id);
+  const beneficiary = await prisma.beneficiary.findUniqueOrThrow({
     where: { id: req.params.id },
     include: {
       project: true,
@@ -91,21 +87,12 @@ router.get('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request,
       }
     },
   });
-  if (!beneficiary || beneficiary.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Beneficiary not found');
-  }
   res.json(beneficiary);
 }));
 
 // PATCH /api/beneficiaries/:id - Update
 router.patch('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const beneficiary = await prisma.beneficiary.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-  if (!beneficiary || beneficiary.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Beneficiary not found');
-  }
+  const beneficiary = await assertBeneficiaryAccess(req, req.params.id);
 
   const { fullName, fullNameAr, gender, age, ageGroup, location, governorate, phoneNumber, nationalId, householdSize, vulnerabilityTags, status } = req.body;
 
@@ -132,16 +119,11 @@ router.patch('/beneficiaries/:id', authenticate, asyncHandler(async (req: Reques
 
 // POST /api/beneficiaries/:id/services - Add service record
 router.post('/beneficiaries/:id/services', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const beneficiary = await prisma.beneficiary.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-  if (!beneficiary || beneficiary.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Beneficiary not found');
-  }
+  const beneficiary = await assertBeneficiaryAccess(req, req.params.id);
 
   const { serviceType, description, dateProvided, quantity, unit, indicatorId, notes } = req.body;
   if (!serviceType || !dateProvided) throw new AppError(400, 'serviceType and dateProvided are required');
+  if (indicatorId) await assertIndicatorsInProject(beneficiary.projectId, [indicatorId]);
 
   const service = await prisma.beneficiaryService.create({
     data: {
@@ -162,10 +144,7 @@ router.post('/beneficiaries/:id/services', authenticate, asyncHandler(async (req
 
 // GET /api/projects/:id/beneficiaries/stats - Aggregated stats for dashboard
 router.get('/projects/:id/beneficiaries/stats', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   const [total, byGender, byAgeGroup, byGovernorate, byStatus, serviceCount] = await Promise.all([
     prisma.beneficiary.count({ where: { projectId: req.params.id } }),

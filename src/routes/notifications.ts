@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { authenticate } from '../middleware/auth';
-import { asyncHandler } from '../middleware/errorHandler';
+import { AppError, asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
 
@@ -17,10 +17,11 @@ router.get('/', authenticate, asyncHandler(async (req: Request, res: Response) =
 
 // PATCH /api/notifications/:id/read
 router.patch('/:id/read', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  await prisma.notification.updateMany({
+  const result = await prisma.notification.updateMany({
     where: { id: req.params.id, userId: req.user!.id },
     data: { isRead: true },
   });
+  if (result.count === 0) throw new AppError(404, 'Notification not found');
   res.json({ message: 'Marked as read' });
 }));
 

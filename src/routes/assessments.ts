@@ -1,17 +1,16 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
+import { assertAssessmentAccess, assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { aiLimiter } from '../middleware/rateLimit';
 import { generateAutoAssessment } from '../services/ai/assessmentGenerator';
 
 const router = Router();
 
 // GET /api/projects/:id/assessments
 router.get('/projects/:id/assessments', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+  const project = await assertProjectAccess(req, req.params.id);
 
   const assessments = await prisma.assessment.findMany({
     where: { projectId: req.params.id },
@@ -24,11 +23,8 @@ router.get('/projects/:id/assessments', authenticate, asyncHandler(async (req: R
 }));
 
 // POST /api/projects/:id/assessments — Request new assessment
-router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const project = await prisma.project.findFirst({
-    where: { id: req.params.id, organizationId: req.user!.organizationId },
-  });
-  if (!project) throw new AppError(404, 'Project not found');
+router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+  const project = await assertProjectAccess(req, req.params.id);
 
   const { type, scopeDescription, sampleSize, methodsIncluded } = req.body;
   if (!type) throw new AppError(400, 'Assessment type is required');
@@ -57,14 +53,7 @@ router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'p
 
 // PATCH /api/assessments/:id — Update status
 router.patch('/assessments/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
-  const assessment = await prisma.assessment.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!assessment || assessment.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Assessment not found');
-  }
+  const assessment = await assertAssessmentAccess(req, req.params.id);
 
   const { status, priceUsd, startedAt, deliveredAt, reportUrl } = req.body;
 
@@ -84,14 +73,7 @@ router.patch('/assessments/:id', authenticate, authorize('org_admin', 'platform_
 
 // GET /api/assessments/:id/report — Get AI-generated assessment report
 router.get('/assessments/:id/report', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const assessment = await prisma.assessment.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!assessment || assessment.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Assessment not found');
-  }
+  const assessment = await assertAssessmentAccess(req, req.params.id);
 
   let report = null;
   if (assessment.scopeDescription) {
@@ -109,14 +91,7 @@ router.get('/assessments/:id/report', authenticate, asyncHandler(async (req: Req
 
 // GET /api/assessments/:id/estimate — Price estimate
 router.get('/assessments/:id/estimate', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const assessment = await prisma.assessment.findUnique({
-    where: { id: req.params.id },
-    include: { project: true },
-  });
-
-  if (!assessment || assessment.project.organizationId !== req.user!.organizationId) {
-    throw new AppError(404, 'Assessment not found');
-  }
+  const assessment = await assertAssessmentAccess(req, req.params.id);
 
   // Simple pricing model based on methods and sample size
   const basePrices: Record<string, number> = {

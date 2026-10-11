@@ -8,6 +8,13 @@ import { sendInviteEmail } from '../utils/email';
 
 const router = Router();
 
+// Only a platform admin may grant the platform_admin role; org admins manage their own organisation's roles.
+function assertAssignableRole(req: Request, role: string): void {
+  if (role === 'platform_admin' && req.user!.role !== 'platform_admin') {
+    throw new AppError(403, 'Only a platform admin can assign the platform admin role');
+  }
+}
+
 // GET /api/users — List users in org
 router.get('/', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const users = await prisma.user.findMany({
@@ -31,6 +38,7 @@ router.get('/', authenticate, authorize('org_admin', 'platform_admin'), asyncHan
 router.post('/invite', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const { email, fullName, fullNameAr, role } = req.body;
   if (!email || !fullName || !role) throw new AppError(400, 'Email, fullName, and role are required');
+  assertAssignableRole(req, role);
 
   const existing = await prisma.user.findUnique({ where: { email } });
   if (existing) throw new AppError(409, 'A user with this email already exists');
@@ -67,6 +75,7 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin'), asy
   }
 
   const { fullName, fullNameAr, role, languagePref } = req.body;
+  if (role !== undefined) assertAssignableRole(req, role);
   const updated = await prisma.user.update({
     where: { id },
     data: {
