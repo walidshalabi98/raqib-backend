@@ -1,0 +1,263 @@
+{
+  "meta": {
+    "description": "Evaluation cases for the KPI Assistant. Each case is a fictional but realistic project. Run with `npm run eval:kpi`. Assertions are checked after validateAndScore().",
+    "version": "1.0.0",
+    "assertionTypes": {
+      "mustIncludeAnyLibraryIds": "At least one suggestion (anywhere in the framework) uses one of these library ids",
+      "mustIncludeLibraryIdForResult": "For the given resultId, at least one suggestion uses one of these library ids",
+      "levelsPresent": "Suggestions include each listed level",
+      "maxPerResult": "No result has more suggestions than this number",
+      "peopleIndicatorsHaveSex": "Every people-level suggestion includes sex or sex_of_household_head in disaggregation",
+      "noTargetsWithoutBasis": "No suggestion has targetBasis 'document' unless the value appears in documentFacts",
+      "noTargetInName": "No suggestion name contains a target value or direction phrase",
+      "hasAccountabilityIndicator": "At least one AC-* library id or an accountability custom indicator is suggested",
+      "arabicNamesPresent": "Every suggestion has a non-empty nameAr containing Arabic characters",
+      "minQualityScoreAverage": "Average quality score across suggestions is at least this number"
+    }
+  },
+  "cases": [
+    {
+      "id": "CASE-01-GAZA-WASH-ECHO",
+      "project": {
+        "name": "Emergency water supply and hygiene for displaced families in Khan Younis",
+        "sectors": ["wash"],
+        "donor": "DG ECHO",
+        "donorType": "echo",
+        "startDate": "2026-11-01",
+        "endDate": "2027-10-31",
+        "geographicScope": "Khan Younis governorate, Gaza Strip",
+        "targetBeneficiaries": 24000,
+        "humanitarian": true,
+        "description": "Water trucking, rehabilitation of community water points, hygiene kit distribution and hygiene promotion for displaced households."
+      },
+      "resultsChain": [
+        {"id": "G", "level": "impact", "text": "Reduced risk of water-borne disease among displaced populations in Khan Younis", "parentId": null},
+        {"id": "O1", "level": "outcome", "text": "Displaced households have access to sufficient safe water for drinking, cooking and hygiene", "parentId": "G"},
+        {"id": "O1.1", "level": "output", "text": "Safe water delivered through trucking and rehabilitated water points", "parentId": "O1"},
+        {"id": "O2", "level": "outcome", "text": "Displaced households practise key hygiene behaviours", "parentId": "G"},
+        {"id": "O2.1", "level": "output", "text": "Hygiene kits distributed and hygiene promotion sessions conducted", "parentId": "O2"}
+      ],
+      "documentFacts": [
+        {"documentId": "doc1", "fileName": "proposal.pdf", "excerpt": "The action will rehabilitate 18 community water points and distribute 4,000 hygiene kits."}
+      ],
+      "assertions": {
+        "mustIncludeLibraryIdForResult": {"O1": ["WA-01", "WA-02", "WA-03"], "O1.1": ["WA-06", "WA-04"]},
+        "maxPerResult": 3,
+        "peopleIndicatorsHaveSex": true,
+        "noTargetsWithoutBasis": true,
+        "noTargetInName": true,
+        "hasAccountabilityIndicator": true,
+        "arabicNamesPresent": true,
+        "minQualityScoreAverage": 80
+      }
+    },
+    {
+      "id": "CASE-02-HEBRON-YOUTH-EU",
+      "project": {
+        "name": "Skills for Work: vocational training and job placement for young people in Hebron",
+        "sectors": ["livelihoods", "youth"],
+        "donor": "European Union",
+        "donorType": "eu",
+        "startDate": "2026-09-01",
+        "endDate": "2028-08-31",
+        "geographicScope": "Hebron governorate, West Bank",
+        "targetBeneficiaries": 900,
+        "humanitarian": false,
+        "description": "Market-driven TVET in partnership with private sector employers, on-the-job training and job matching for youth aged 18–29."
+      },
+      "resultsChain": [
+        {"id": "G", "level": "impact", "text": "Reduced youth unemployment in Hebron governorate", "parentId": null},
+        {"id": "O1", "level": "outcome", "text": "Young women and men trained by the project secure decent employment or self-employment", "parentId": "G"},
+        {"id": "O1.1", "level": "output", "text": "Youth complete market-relevant vocational and on-the-job training", "parentId": "O1"},
+        {"id": "O1.2", "level": "output", "text": "Employers engaged in curriculum design and work placements", "parentId": "O1"}
+      ],
+      "documentFacts": [
+        {"documentId": "doc1", "fileName": "logframe.xlsx", "excerpt": "Target: 900 youth (50% women) complete training; 60% employed within six months."}
+      ],
+      "assertions": {
+        "mustIncludeLibraryIdForResult": {"O1.1": ["LV-02"], "O1": ["LV-01", "YO-02", "LV-03"]},
+        "levelsPresent": ["impact", "outcome", "output"],
+        "peopleIndicatorsHaveSex": true,
+        "noTargetsWithoutBasis": true,
+        "noTargetInName": true,
+        "arabicNamesPresent": true,
+        "minQualityScoreAverage": 80
+      }
+    },
+    {
+      "id": "CASE-03-JENIN-MHPSS-UNICEF",
+      "project": {
+        "name": "Psychosocial support for children and caregivers in Jenin camp",
+        "sectors": ["protection"],
+        "donor": "UNICEF",
+        "donorType": "unicef",
+        "startDate": "2026-10-01",
+        "endDate": "2027-09-30",
+        "geographicScope": "Jenin city and camp, West Bank",
+        "targetBeneficiaries": 3000,
+        "humanitarian": true,
+        "description": "Structured group psychosocial activities for children, focused individual support with referral, and positive parenting sessions for caregivers."
+      },
+      "resultsChain": [
+        {"id": "O1", "level": "outcome", "text": "Children affected by violence show improved psychosocial well-being and functioning", "parentId": null},
+        {"id": "O1.1", "level": "output", "text": "Children receive structured group and focused psychosocial support", "parentId": "O1"},
+        {"id": "O2", "level": "outcome", "text": "Caregivers provide supportive care at home", "parentId": null},
+        {"id": "O2.1", "level": "output", "text": "Caregivers complete positive parenting sessions", "parentId": "O2"}
+      ],
+      "documentFacts": [],
+      "assertions": {
+        "mustIncludeAnyLibraryIds": ["PR-01", "PR-02", "PR-06"],
+        "peopleIndicatorsHaveSex": true,
+        "noTargetsWithoutBasis": true,
+        "noTargetInName": true,
+        "hasAccountabilityIndicator": true,
+        "arabicNamesPresent": true,
+        "minQualityScoreAverage": 80
+      }
+    },
+    {
+      "id": "CASE-04-JORDAN-VALLEY-AGRI-GIZ",
+      "project": {
+        "name": "Climate-resilient farming for smallholders in the Jordan Valley",
+        "sectors": ["agriculture"],
+        "donor": "GIZ",
+        "donorType": "giz",
+        "startDate": "2027-01-01",
+        "endDate": "2029-12-31",
+        "geographicScope": "Jericho and Tubas governorates",
+        "targetBeneficiaries": 1200,
+        "humanitarian": false,
+        "description": "Water-efficient irrigation, climate-smart practices, farmer field schools and market linkages for date and vegetable producers."
+      },
+      "resultsChain": [
+        {"id": "O1", "level": "outcome", "text": "Smallholders adopt climate-smart, water-efficient practices", "parentId": null},
+        {"id": "O1.1", "level": "output", "text": "Smallholders trained through farmer field schools and supported with irrigation equipment", "parentId": "O1"},
+        {"id": "O2", "level": "outcome", "text": "Smallholders increase productivity and sales", "parentId": null}
+      ],
+      "documentFacts": [],
+      "assertions": {
+        "mustIncludeAnyLibraryIds": ["AG-01", "AG-02", "AG-03", "AG-04"],
+        "peopleIndicatorsHaveSex": true,
+        "noTargetsWithoutBasis": true,
+        "noTargetInName": true,
+        "arabicNamesPresent": true,
+        "minQualityScoreAverage": 80
+      }
+    },
+    {
+      "id": "CASE-05-GAZA-FOOD-WFP",
+      "project": {
+        "name": "Multipurpose cash and food assistance for vulnerable households in Gaza City",
+        "sectors": ["food_security"],
+        "donor": "WFP",
+        "donorType": "other",
+        "startDate": "2026-11-15",
+        "endDate": "2027-05-15",
+        "geographicScope": "Gaza City",
+        "targetBeneficiaries": 15000,
+        "humanitarian": true,
+        "description": "Monthly e-vouchers and in-kind food parcels for food-insecure households, with post-distribution monitoring."
+      },
+      "resultsChain": [
+        {"id": "O1", "level": "outcome", "text": "Targeted households maintain adequate food consumption", "parentId": null},
+        {"id": "O1.1", "level": "output", "text": "Food-insecure households receive monthly food assistance", "parentId": "O1"}
+      ],
+      "documentFacts": [],
+      "assertions": {
+        "mustIncludeLibraryIdForResult": {"O1": ["FS-01", "FS-02", "FS-03"], "O1.1": ["FS-04", "FS-06"]},
+        "peopleIndicatorsHaveSex": true,
+        "noTargetsWithoutBasis": true,
+        "noTargetInName": true,
+        "hasAccountabilityIndicator": true,
+        "arabicNamesPresent": true,
+        "minQualityScoreAverage": 80
+      }
+    },
+    {
+      "id": "CASE-06-NABLUS-EDUCATION",
+      "project": {
+        "name": "Catch-up learning and teacher support in Nablus schools",
+        "sectors": ["education"],
+        "donor": "Sida",
+        "donorType": "sida",
+        "startDate": "2026-09-01",
+        "endDate": "2027-08-31",
+        "geographicScope": "Nablus governorate",
+        "targetBeneficiaries": 2500,
+        "humanitarian": false,
+        "description": "Remedial Arabic and mathematics for grades 3–6, teacher training in active learning and classroom-based assessment."
+      },
+      "resultsChain": [
+        {"id": "O1", "level": "outcome", "text": "Children in target schools improve foundational reading and mathematics", "parentId": null},
+        {"id": "O1.1", "level": "output", "text": "Children attend remedial learning sessions", "parentId": "O1"},
+        {"id": "O2", "level": "outcome", "text": "Teachers apply active learning and formative assessment", "parentId": null},
+        {"id": "O2.1", "level": "output", "text": "Teachers complete the training package", "parentId": "O2"}
+      ],
+      "documentFacts": [],
+      "assertions": {
+        "mustIncludeLibraryIdForResult": {"O1": ["ED-02"], "O1.1": ["ED-06", "ED-03"], "O2": ["ED-05"], "O2.1": ["ED-04"]},
+        "peopleIndicatorsHaveSex": true,
+        "noTargetsWithoutBasis": true,
+        "noTargetInName": true,
+        "arabicNamesPresent": true,
+        "minQualityScoreAverage": 80
+      }
+    },
+    {
+      "id": "CASE-07-RAMALLAH-WEE",
+      "project": {
+        "name": "Women-led micro-enterprise growth in Ramallah and Al-Bireh",
+        "sectors": ["gender", "livelihoods"],
+        "donor": "UN Women",
+        "donorType": "other",
+        "startDate": "2027-02-01",
+        "endDate": "2028-07-31",
+        "geographicScope": "Ramallah and Al-Bireh governorate",
+        "targetBeneficiaries": 400,
+        "humanitarian": false,
+        "description": "Business training, small grants, mentoring and access to finance for women entrepreneurs."
+      },
+      "resultsChain": [
+        {"id": "O1", "level": "outcome", "text": "Women-led micro-enterprises grow their sales and sustain operations", "parentId": null},
+        {"id": "O1.1", "level": "output", "text": "Women entrepreneurs receive training, grants and mentoring", "parentId": "O1"},
+        {"id": "O2", "level": "outcome", "text": "Women participants have greater say in household economic decisions", "parentId": null}
+      ],
+      "documentFacts": [],
+      "assertions": {
+        "mustIncludeAnyLibraryIds": ["GE-01", "GE-03", "LV-07", "LV-05"],
+        "noTargetsWithoutBasis": true,
+        "noTargetInName": true,
+        "arabicNamesPresent": true,
+        "minQualityScoreAverage": 80
+      }
+    },
+    {
+      "id": "CASE-08-MUNICIPAL-GOVERNANCE",
+      "project": {
+        "name": "Citizen participation in local government planning in Bethlehem governorate",
+        "sectors": ["governance"],
+        "donor": "European Union",
+        "donorType": "eu",
+        "startDate": "2027-01-01",
+        "endDate": "2028-12-31",
+        "geographicScope": "Bethlehem governorate",
+        "targetBeneficiaries": null,
+        "humanitarian": false,
+        "description": "Support to grassroots CSOs and municipalities for participatory budgeting and community scorecards."
+      },
+      "resultsChain": [
+        {"id": "O1", "level": "outcome", "text": "Municipal plans and budgets reflect citizen priorities", "parentId": null},
+        {"id": "O1.1", "level": "output", "text": "Grassroots CSOs trained and engaged in participatory planning", "parentId": "O1"},
+        {"id": "O2", "level": "outcome", "text": "Residents are more satisfied with municipal services", "parentId": null}
+      ],
+      "documentFacts": [],
+      "assertions": {
+        "mustIncludeLibraryIdForResult": {"O1.1": ["GV-01"], "O1": ["GV-02"], "O2": ["GV-03"]},
+        "noTargetsWithoutBasis": true,
+        "noTargetInName": true,
+        "arabicNamesPresent": true,
+        "minQualityScoreAverage": 80
+      }
+    }
+  ]
+}

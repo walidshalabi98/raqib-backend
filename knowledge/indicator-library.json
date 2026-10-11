@@ -1,0 +1,2256 @@
+{
+  "meta": {
+    "name": "Raqib Indicator Library (seed)",
+    "version": "1.0.0",
+    "date": "2026-10-11",
+    "description": "Seed library for Raqib's indicator table and the KPI assistant's retrieval step. Entries marked isStandard=true are aligned with a published framework (names and definitions are paraphrased; for donor submissions use the official wording from the referenced source). Entries with isStandard=false are common-practice indicators written to Raqib's quality checklist and must be adapted to each project.",
+    "enums": {
+      "sector": [
+        "education",
+        "livelihoods",
+        "health",
+        "wash",
+        "protection",
+        "food_security",
+        "governance",
+        "agriculture",
+        "gender",
+        "youth",
+        "other"
+      ],
+      "level": [
+        "impact",
+        "outcome",
+        "output"
+      ],
+      "unit": [
+        "number",
+        "percent",
+        "score",
+        "litres_per_person_per_day",
+        "hectares",
+        "dunums",
+        "megawatts",
+        "tonnes_co2eq",
+        "currency_ils",
+        "kg_per_dunum",
+        "yes_no"
+      ],
+      "direction": [
+        "increase",
+        "decrease",
+        "maintain"
+      ],
+      "methods": [
+        "hh_survey",
+        "fgd",
+        "kii",
+        "observation",
+        "document_review",
+        "participatory",
+        "secondary_data"
+      ],
+      "frequency": [
+        "monthly",
+        "quarterly",
+        "biannual",
+        "annual",
+        "per_cohort",
+        "baseline_endline"
+      ]
+    },
+    "translationNote": "Arabic names are drafts for review by a native-speaking M&E specialist before release."
+  },
+  "indicators": [
+    {
+      "id": "FS-01",
+      "sector": "food_security",
+      "tags": [
+        "fcs",
+        "food_consumption",
+        "humanitarian",
+        "cash",
+        "in_kind"
+      ],
+      "level": "outcome",
+      "name": "% of target households with an acceptable Food Consumption Score",
+      "nameAr": "نسبة الأسر المستهدفة التي لديها درجة استهلاك غذائي مقبولة",
+      "definition": "Share of surveyed target households whose Food Consumption Score (7-day recall, eight weighted food groups) falls in the acceptable category.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Target households with FCS > 35 (or > 42 where the adjusted high oil/sugar thresholds apply)",
+        "denominator": "All surveyed target households"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex_of_household_head",
+        "location",
+        "displacement_status",
+        "transfer_modality"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Household survey with the WFP FCS module; representative sample of target households; cover lean and harvest seasons where relevant.",
+      "standardReference": {
+        "framework": "WFP",
+        "code": "Food Consumption Score",
+        "url": "https://monitoringhandbook.manuals.wfp.org/wfp-indicator-compendium/docs/1-food-consumption-score"
+      },
+      "isStandard": true,
+      "notes": "Confirm with the WFP country office or Food Security Sector which thresholds apply in Palestine."
+    },
+    {
+      "id": "FS-02",
+      "sector": "food_security",
+      "tags": [
+        "rcsi",
+        "coping",
+        "humanitarian"
+      ],
+      "level": "outcome",
+      "name": "Mean reduced Coping Strategies Index (rCSI) score of target households",
+      "nameAr": "متوسط درجة مؤشر استراتيجيات التكيّف المخفّض للأسر المستهدفة",
+      "definition": "Average rCSI score, reflecting how often and how severely households used consumption-based coping strategies in the past 7 days.",
+      "unit": "score",
+      "calculation": {
+        "formula": "Mean of household rCSI scores among surveyed target households"
+      },
+      "direction": "decrease",
+      "disaggregation": [
+        "sex_of_household_head",
+        "location",
+        "displacement_status"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Household survey with the standard rCSI module.",
+      "standardReference": {
+        "framework": "WFP CARI",
+        "code": "rCSI",
+        "url": "https://vamresources.manuals.wfp.org/docs/the-consolidated-approach-for-reporting-indicators-of-food-security-cari"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "FS-03",
+      "sector": "food_security",
+      "tags": [
+        "lcs",
+        "livelihood_coping",
+        "humanitarian"
+      ],
+      "level": "outcome",
+      "name": "% of target households using crisis or emergency livelihood coping strategies",
+      "nameAr": "نسبة الأسر المستهدفة التي تلجأ إلى استراتيجيات تكيّف معيشية من مستوى الأزمة أو الطوارئ",
+      "definition": "Share of target households that applied at least one crisis- or emergency-level livelihood coping strategy (LCS-FS module) to meet food needs in the recall period.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Households whose most severe strategy used is crisis or emergency level",
+        "denominator": "All surveyed target households"
+      },
+      "direction": "decrease",
+      "disaggregation": [
+        "sex_of_household_head",
+        "location",
+        "displacement_status"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Household survey with the LCS-FS module adapted to the local context.",
+      "standardReference": {
+        "framework": "WFP CARI",
+        "code": "LCS-FS",
+        "url": "https://vamresources.manuals.wfp.org/docs/the-consolidated-approach-for-reporting-indicators-of-food-security-cari"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "FS-04",
+      "sector": "food_security",
+      "tags": [
+        "reach",
+        "assistance",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of food-insecure people receiving food or cash assistance",
+      "nameAr": "عدد الأشخاص الذين يعانون من انعدام الأمن الغذائي ويتلقون مساعدات غذائية أو نقدية",
+      "definition": "Unique individuals in food-insecure households who received food, voucher or cash-for-food assistance from the project during the period.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Count of unique individuals (household members of assisted households), de-duplicated across distributions"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "monthly",
+      "meansOfVerification": "Distribution lists and beneficiary database, de-duplicated by household ID.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.32",
+        "url": "https://capacity4dev.europa.eu/system/files/documents/2026-03/GERF%202.32%20Food%20insecure%20people%20-%20FINAL%20260226.pdf"
+      },
+      "isStandard": true,
+      "notes": "For EU-funded projects use the GERF 2.32 methodological note wording; sex/gender disaggregation is mandatory."
+    },
+    {
+      "id": "FS-05",
+      "sector": "food_security",
+      "tags": [
+        "fes",
+        "expenditure",
+        "economic_vulnerability"
+      ],
+      "level": "outcome",
+      "name": "Average share of household expenditure spent on food among target households",
+      "nameAr": "متوسط حصة الإنفاق على الغذاء من إجمالي إنفاق الأسر المستهدفة",
+      "definition": "Mean proportion of total household expenditure (cash, credit and in-kind value) used for food over the recall period.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Household food expenditure",
+        "denominator": "Total household expenditure",
+        "aggregation": "Mean across surveyed households"
+      },
+      "direction": "decrease",
+      "disaggregation": [
+        "sex_of_household_head",
+        "location"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Household expenditure module (food 7–30 day recall, non-food 30 days–6 months).",
+      "standardReference": {
+        "framework": "WFP CARI",
+        "code": "Food Expenditure Share",
+        "url": "https://vamresources.manuals.wfp.org/docs/the-consolidated-approach-for-reporting-indicators-of-food-security-cari"
+      },
+      "isStandard": true,
+      "notes": "Used in CARI when ECMEN is not available."
+    },
+    {
+      "id": "FS-06",
+      "sector": "food_security",
+      "tags": [
+        "pdm",
+        "post_distribution_monitoring",
+        "accountability"
+      ],
+      "level": "output",
+      "name": "% of assisted households reporting they received their full entitlement",
+      "nameAr": "نسبة الأسر المستفيدة التي أفادت بحصولها على كامل استحقاقها",
+      "definition": "Share of sampled assisted households confirming they received the full planned quantity or value of assistance in the last distribution cycle.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Sampled households reporting full entitlement received",
+        "denominator": "Sampled assisted households"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex_of_household_head",
+        "location",
+        "transfer_modality"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "per_cohort",
+      "meansOfVerification": "Post-distribution monitoring phone or in-person survey after each cycle.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Common post-distribution monitoring practice."
+    },
+    {
+      "id": "WA-01",
+      "sector": "wash",
+      "tags": [
+        "water_quantity",
+        "sphere",
+        "humanitarian"
+      ],
+      "level": "outcome",
+      "name": "Average volume of water available per person per day in target households",
+      "nameAr": "متوسط كمية المياه المتاحة للفرد يومياً في الأسر المستهدفة",
+      "definition": "Mean litres of water per person per day available at household level for drinking, cooking and personal hygiene.",
+      "unit": "litres_per_person_per_day",
+      "calculation": {
+        "formula": "Total household water available per day ÷ household size, averaged across surveyed households"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "location",
+        "displacement_status"
+      ],
+      "methods": [
+        "hh_survey",
+        "observation"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Household survey with container/storage measurement; water trucking or network records for cross-check.",
+      "standardReference": {
+        "framework": "Sphere",
+        "code": "Water supply standard — minimum 15 l/p/d (aim for 20)",
+        "url": "https://interactive.spherestandards.org/"
+      },
+      "isStandard": true,
+      "notes": "The Sphere minimum is a standard threshold the AI may cite as a reference target."
+    },
+    {
+      "id": "WA-02",
+      "sector": "wash",
+      "tags": [
+        "jmp",
+        "water_access",
+        "service_ladder"
+      ],
+      "level": "outcome",
+      "name": "% of target households using at least a basic drinking water service",
+      "nameAr": "نسبة الأسر المستهدفة التي تستخدم خدمة مياه شرب أساسية على الأقل",
+      "definition": "Share of target households whose main drinking water comes from an improved source with a round-trip collection time of 30 minutes or less (JMP 'basic' or 'safely managed').",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Households on the basic or safely managed rung",
+        "denominator": "All surveyed target households"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex_of_household_head",
+        "location",
+        "displacement_status"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "baseline_endline",
+      "meansOfVerification": "Household survey using JMP core questions on source and collection time.",
+      "standardReference": {
+        "framework": "WHO/UNICEF JMP",
+        "code": "Drinking water service ladder",
+        "url": "https://washdata.org/node/19"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "WA-03",
+      "sector": "wash",
+      "tags": [
+        "water_quality",
+        "sphere",
+        "testing"
+      ],
+      "level": "outcome",
+      "name": "% of water samples at point of delivery free of faecal coliforms",
+      "nameAr": "نسبة عينات المياه عند نقطة التوزيع الخالية من البكتيريا القولونية البرازية",
+      "definition": "Share of water samples tested at the point of delivery with 0 faecal coliform colonies per 100 ml.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Samples with 0 CFU/100 ml",
+        "denominator": "All samples tested"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "location",
+        "water_source_type"
+      ],
+      "methods": [
+        "observation"
+      ],
+      "frequency": "monthly",
+      "meansOfVerification": "Laboratory or field test kit results logged per sampling round.",
+      "standardReference": {
+        "framework": "Sphere",
+        "code": "Water quality — 0 CFU/100 ml at point of delivery",
+        "url": "https://interactive.spherestandards.org/"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "WA-04",
+      "sector": "wash",
+      "tags": [
+        "reach",
+        "eu",
+        "gerf",
+        "infrastructure"
+      ],
+      "level": "output",
+      "name": "Number of people with access to improved drinking water and/or sanitation as a result of the project",
+      "nameAr": "عدد الأشخاص الذين حصلوا على مياه شرب و/أو خدمات صرف صحي محسّنة بفضل المشروع",
+      "definition": "Individuals who gained access to an improved drinking water source and/or improved sanitation facility through project-supported infrastructure or services.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Population served by supported facilities, de-duplicated between water and sanitation"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "location"
+      ],
+      "methods": [
+        "document_review",
+        "secondary_data"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Engineering completion reports, service-area population from the utility or municipality.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.38",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": "Use the GERF 2.38 methodological note for EU-funded projects."
+    },
+    {
+      "id": "WA-05",
+      "sector": "wash",
+      "tags": [
+        "hygiene",
+        "behaviour_change"
+      ],
+      "level": "outcome",
+      "name": "% of target households with a handwashing facility with soap and water observed",
+      "nameAr": "نسبة الأسر المستهدفة التي لديها مرفق لغسل اليدين يتوفر فيه الماء والصابون (بالملاحظة)",
+      "definition": "Share of visited target households where enumerators observe a handwashing place with both water and soap present.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Households with observed facility with water and soap",
+        "denominator": "Households visited"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex_of_household_head",
+        "location"
+      ],
+      "methods": [
+        "observation",
+        "hh_survey"
+      ],
+      "frequency": "baseline_endline",
+      "meansOfVerification": "Observation module within the household survey.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Observation is preferred over self-reported handwashing, which tends to over-report."
+    },
+    {
+      "id": "WA-06",
+      "sector": "wash",
+      "tags": [
+        "infrastructure",
+        "functionality"
+      ],
+      "level": "output",
+      "name": "Number of water points constructed or rehabilitated and functional at handover",
+      "nameAr": "عدد نقاط المياه التي تم إنشاؤها أو تأهيلها وتعمل عند التسليم",
+      "definition": "Water points (taps, wells, tanks, network connections) built or rehabilitated by the project and verified functional at handover.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Count of water points with signed handover and functionality check"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "location",
+        "water_point_type"
+      ],
+      "methods": [
+        "document_review",
+        "observation"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Handover certificates and field functionality checklist.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Pair with a later functionality-rate outcome indicator if sustainability matters to the donor."
+    },
+    {
+      "id": "HE-01",
+      "sector": "health",
+      "tags": [
+        "immunisation",
+        "eu",
+        "gerf",
+        "child_health"
+      ],
+      "level": "output",
+      "name": "Number of one-year-old children fully immunised in supported areas",
+      "nameAr": "عدد الأطفال بعمر سنة واحدة الذين أكملوا التطعيم في المناطق المدعومة",
+      "definition": "Children aged 12–23 months who received all vaccines in the national schedule for their age through supported services.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Count from facility immunisation registers in supported facilities"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "location"
+      ],
+      "methods": [
+        "document_review",
+        "secondary_data"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Ministry of Health / facility immunisation registers.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.35",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "HE-02",
+      "sector": "health",
+      "tags": [
+        "maternal_health",
+        "anc"
+      ],
+      "level": "outcome",
+      "name": "% of pregnant women in target areas receiving at least four antenatal care visits",
+      "nameAr": "نسبة النساء الحوامل في المناطق المستهدفة اللواتي تلقين أربع زيارات رعاية ما قبل الولادة على الأقل",
+      "definition": "Share of women who gave birth in the reference period who attended at least four antenatal care visits during the pregnancy.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Women with ≥4 ANC visits",
+        "denominator": "Women who gave birth in the period in target areas"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "age",
+        "location",
+        "disability"
+      ],
+      "methods": [
+        "document_review",
+        "hh_survey"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Facility ANC registers or household survey; align definition with the Ministry of Health.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Widely used global coverage indicator; confirm the national definition with the Ministry of Health."
+    },
+    {
+      "id": "HE-03",
+      "sector": "health",
+      "tags": [
+        "primary_health_care",
+        "service_volume"
+      ],
+      "level": "output",
+      "name": "Number of consultations provided at supported primary health care facilities",
+      "nameAr": "عدد الاستشارات الطبية المقدّمة في مرافق الرعاية الصحية الأولية المدعومة",
+      "definition": "Outpatient consultations recorded at facilities receiving project support (staff, supplies or rehabilitation) during the period.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Sum of consultations from facility registers"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "monthly",
+      "meansOfVerification": "Facility HMIS or paper registers.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Counts consultations, not unique patients — say so in reports."
+    },
+    {
+      "id": "HE-04",
+      "sector": "health",
+      "tags": [
+        "quality_of_care",
+        "satisfaction",
+        "accountability"
+      ],
+      "level": "outcome",
+      "name": "% of patients reporting satisfaction with services at supported facilities",
+      "nameAr": "نسبة المرضى الذين أفادوا برضاهم عن الخدمات في المرافق الصحية المدعومة",
+      "definition": "Share of interviewed patients who rate overall service as satisfactory or very satisfactory on a standard exit-interview scale.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Patients rating satisfactory or very satisfactory",
+        "denominator": "Patients interviewed"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Exit interviews with a random sample of patients, conducted by staff not providing care.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "HE-05",
+      "sector": "health",
+      "tags": [
+        "nutrition",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of women of reproductive age, adolescent girls and children under five reached by nutrition interventions",
+      "nameAr": "عدد النساء في سن الإنجاب والمراهقات والأطفال دون الخامسة الذين وصلتهم تدخلات تغذوية",
+      "definition": "Individuals in these groups reached by nutrition-specific services (screening, counselling, supplementation, treatment) supported by the project.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique individuals reached, from service registers"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Nutrition service registers.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.33",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "ED-01",
+      "sector": "education",
+      "tags": [
+        "enrolment",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of students enrolled in supported primary, secondary or tertiary education",
+      "nameAr": "عدد الطلبة الملتحقين بالتعليم الأساسي أو الثانوي أو العالي المدعوم",
+      "definition": "Students enrolled in schools, programmes or institutions receiving project support in the academic year.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Enrolment count from school or institution records"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "education_level",
+        "location"
+      ],
+      "methods": [
+        "document_review",
+        "secondary_data"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "School/institution enrolment records; Ministry of Education data.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.36",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "ED-02",
+      "sector": "education",
+      "tags": [
+        "learning_outcomes",
+        "literacy",
+        "sdg4"
+      ],
+      "level": "outcome",
+      "name": "% of children in supported schools achieving at least minimum proficiency in reading",
+      "nameAr": "نسبة الأطفال في المدارس المدعومة الذين بلغوا مستوى الحد الأدنى من الكفاءة في القراءة على الأقل",
+      "definition": "Share of assessed children in the target grade who reach the minimum proficiency level in reading (Arabic) on a standardised learning assessment.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Assessed children at or above minimum proficiency",
+        "denominator": "Children assessed in the target grade"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "disability",
+        "grade",
+        "location"
+      ],
+      "methods": [
+        "observation",
+        "secondary_data"
+      ],
+      "frequency": "baseline_endline",
+      "meansOfVerification": "Standardised reading assessment administered to a sample of pupils.",
+      "standardReference": {
+        "framework": "SDG",
+        "code": "4.1.1 (aligned)",
+        "url": "https://sdg.iisd.org/news/iaeg-sdgs-updates-on-2025-review-of-global-indicator-framework/"
+      },
+      "isStandard": true,
+      "notes": "Specify the grade and the assessment tool; a parallel numeracy indicator is common."
+    },
+    {
+      "id": "ED-03",
+      "sector": "education",
+      "tags": [
+        "attendance",
+        "retention"
+      ],
+      "level": "outcome",
+      "name": "Average attendance rate of targeted students",
+      "nameAr": "متوسط نسبة حضور الطلبة المستهدفين",
+      "definition": "Mean share of school days attended by targeted students over the reporting period.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Days attended",
+        "denominator": "School days in the period",
+        "aggregation": "Mean across targeted students"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "grade",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "School attendance registers.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Adjust the denominator for school closures caused by emergencies."
+    },
+    {
+      "id": "ED-04",
+      "sector": "education",
+      "tags": [
+        "teacher_training",
+        "capacity"
+      ],
+      "level": "output",
+      "name": "Number of teachers trained in the project's pedagogical or psychosocial support package",
+      "nameAr": "عدد المعلمين الذين تم تدريبهم على الحزمة التربوية أو حزمة الدعم النفسي الاجتماعي للمشروع",
+      "definition": "Teachers who completed at least the minimum required hours of the project training package.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Count of teachers meeting the completion threshold"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "location",
+        "school_type"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Training attendance sheets and completion records.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Define 'completed' (e.g., ≥80% of sessions)."
+    },
+    {
+      "id": "ED-05",
+      "sector": "education",
+      "tags": [
+        "teaching_practice",
+        "application_of_learning"
+      ],
+      "level": "outcome",
+      "name": "% of trained teachers observed applying new teaching practices",
+      "nameAr": "نسبة المعلمين المدرَّبين الذين لوحظ تطبيقهم لممارسات تدريس جديدة",
+      "definition": "Share of trained teachers scoring at or above the agreed threshold on a structured classroom observation tool.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Observed teachers at or above threshold",
+        "denominator": "Trained teachers observed"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "location"
+      ],
+      "methods": [
+        "observation"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Classroom observation checklist administered by trained observers.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "ED-06",
+      "sector": "education",
+      "tags": [
+        "catch_up",
+        "remedial",
+        "education_in_emergencies"
+      ],
+      "level": "output",
+      "name": "Number of children accessing remedial or catch-up learning",
+      "nameAr": "عدد الأطفال الذين يتلقّون تعليماً علاجياً أو تعويضياً",
+      "definition": "Unique children who attended at least the minimum number of sessions in project remedial or catch-up learning programmes.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique children meeting the attendance threshold"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "displacement_status",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Learning-space registers.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "LV-01",
+      "sector": "livelihoods",
+      "tags": [
+        "employment",
+        "tvet",
+        "job_placement"
+      ],
+      "level": "outcome",
+      "name": "% of trainees employed or self-employed six months after completing training",
+      "nameAr": "نسبة المتدربين الذين يعملون بأجر أو لحسابهم الخاص بعد ستة أشهر من إنهاء التدريب",
+      "definition": "Share of training graduates who report paid employment or self-employment (minimum hours per week defined by the project) six months after completion.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Graduates employed or self-employed at 6 months",
+        "denominator": "Graduates reached by the tracer survey"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location",
+        "training_track"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "per_cohort",
+      "meansOfVerification": "Tracer survey (phone) of each cohort at six months; report response rate.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Define the minimum hours/earnings threshold that counts as employment."
+    },
+    {
+      "id": "LV-02",
+      "sector": "livelihoods",
+      "tags": [
+        "tvet",
+        "skills",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of people benefiting from institution- or workplace-based vocational training and skills development",
+      "nameAr": "عدد الأشخاص المستفيدين من التدريب المهني وتنمية المهارات في المؤسسات أو أماكن العمل",
+      "definition": "Individuals who completed project-supported TVET or skills development delivered by an institution or in the workplace.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique individuals completing the programme"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Training provider completion records.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.14",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "LV-03",
+      "sector": "livelihoods",
+      "tags": [
+        "jobs",
+        "green_jobs",
+        "eu",
+        "gerf"
+      ],
+      "level": "outcome",
+      "name": "Number of jobs supported or sustained by the project",
+      "nameAr": "عدد فرص العمل التي دعمها المشروع أو حافظ عليها",
+      "definition": "Full-time equivalent jobs created or maintained in supported enterprises or through project interventions, including green jobs.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Sum of FTE jobs created plus jobs sustained, per the donor's counting rules"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "green_job"
+      ],
+      "methods": [
+        "hh_survey",
+        "document_review"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Enterprise survey and payroll records of supported businesses.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.13",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": "Counting jobs 'sustained' needs a clear counterfactual rule — use the GERF note."
+    },
+    {
+      "id": "LV-04",
+      "sector": "livelihoods",
+      "tags": [
+        "income",
+        "household_economy"
+      ],
+      "level": "outcome",
+      "name": "Average monthly household income of target households",
+      "nameAr": "متوسط الدخل الشهري للأسر المستهدفة",
+      "definition": "Mean total monthly income (all sources, in ILS) reported by target households, compared with baseline.",
+      "unit": "currency_ils",
+      "calculation": {
+        "formula": "Mean of reported monthly household income; report median as well"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex_of_household_head",
+        "location"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "baseline_endline",
+      "meansOfVerification": "Household income module; adjust for inflation when comparing periods.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Self-reported income is noisy; consider a consumption or asset proxy alongside."
+    },
+    {
+      "id": "LV-05",
+      "sector": "livelihoods",
+      "tags": [
+        "financial_inclusion",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of beneficiaries with access to financial services through the project",
+      "nameAr": "عدد المستفيدين الذين حصلوا على خدمات مالية من خلال المشروع",
+      "definition": "Individuals or MSMEs who opened accounts, received loans, grants with financial linkage, or other formal financial services as a result of the project.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique individuals or enterprises newly accessing a financial service"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "enterprise_size"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Partner financial institution records.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.17",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "LV-06",
+      "sector": "livelihoods",
+      "tags": [
+        "msme",
+        "green_economy",
+        "eu",
+        "gerf"
+      ],
+      "level": "outcome",
+      "name": "Number of MSMEs applying sustainable consumption and production practices",
+      "nameAr": "عدد المنشآت متناهية الصغر والصغيرة والمتوسطة التي تطبّق ممارسات الاستهلاك والإنتاج المستدامين",
+      "definition": "Supported micro, small and medium enterprises verified as applying at least one sustainable consumption and production practice (resource efficiency, waste reduction, renewable energy).",
+      "unit": "number",
+      "calculation": {
+        "formula": "Count of supported MSMEs with verified practice adoption"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "enterprise_size",
+        "sex_of_owner",
+        "sector_of_activity"
+      ],
+      "methods": [
+        "observation",
+        "kii"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Enterprise follow-up visits with verification checklist.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.6",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "LV-07",
+      "sector": "livelihoods",
+      "tags": [
+        "msme",
+        "sales",
+        "business_performance"
+      ],
+      "level": "outcome",
+      "name": "% of supported MSMEs reporting increased sales 12 months after support",
+      "nameAr": "نسبة المنشآت المدعومة التي أفادت بزيادة مبيعاتها بعد 12 شهراً من الدعم",
+      "definition": "Share of supported enterprises whose reported annual sales are higher than at baseline, 12 months after receiving support.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Enterprises with higher sales than baseline",
+        "denominator": "Supported enterprises surveyed"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "enterprise_size",
+        "sex_of_owner",
+        "location"
+      ],
+      "methods": [
+        "hh_survey",
+        "document_review"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Enterprise survey cross-checked with sales records where available.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "AG-01",
+      "sector": "agriculture",
+      "tags": [
+        "smallholders",
+        "markets",
+        "land",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of smallholders reached with interventions to increase sustainable production, access to markets and/or security of land",
+      "nameAr": "عدد صغار المزارعين الذين وصلتهم تدخلات لزيادة الإنتاج المستدام و/أو الوصول إلى الأسواق و/أو أمن حيازة الأراضي",
+      "definition": "Smallholder farmers and herders who directly received project support aimed at sustainable production, market access or land tenure security.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique smallholders reached"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Beneficiary registration and service records.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.1",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "AG-02",
+      "sector": "agriculture",
+      "tags": [
+        "land_management",
+        "environment",
+        "eu",
+        "gerf"
+      ],
+      "level": "outcome",
+      "name": "Agricultural and pastoral land area under sustainable management practices",
+      "nameAr": "مساحة الأراضي الزراعية والرعوية المُدارة بممارسات مستدامة",
+      "definition": "Area of cropland, orchards or rangeland where supported producers apply sustainable management practices.",
+      "unit": "hectares",
+      "calculation": {
+        "formula": "Sum of verified areas; convert dunums to hectares (1 ha = 10 dunums) for EU reporting"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "location",
+        "land_use_type"
+      ],
+      "methods": [
+        "observation",
+        "document_review"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Field verification visits and GPS-mapped plots.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.2",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "AG-03",
+      "sector": "agriculture",
+      "tags": [
+        "adoption",
+        "climate_smart",
+        "practices"
+      ],
+      "level": "outcome",
+      "name": "% of supported farmers applying at least two promoted agricultural practices",
+      "nameAr": "نسبة المزارعين المدعومين الذين يطبّقون ممارستين زراعيتين مُروَّج لهما على الأقل",
+      "definition": "Share of supported farmers verified as applying at least two of the practices promoted by the project in the most recent season.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Farmers applying ≥2 promoted practices",
+        "denominator": "Supported farmers surveyed"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "location"
+      ],
+      "methods": [
+        "hh_survey",
+        "observation"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Farmer survey with field verification of a sub-sample.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "List the promoted practices in the indicator definition."
+    },
+    {
+      "id": "AG-04",
+      "sector": "agriculture",
+      "tags": [
+        "yield",
+        "productivity"
+      ],
+      "level": "outcome",
+      "name": "Average yield of the target crop among supported farmers",
+      "nameAr": "متوسط إنتاجية المحصول المستهدف لدى المزارعين المدعومين",
+      "definition": "Mean harvested quantity of the target crop per dunum among supported farmers in the reference season.",
+      "unit": "kg_per_dunum",
+      "calculation": {
+        "formula": "Mean of (harvest kg ÷ cultivated dunums) across surveyed farmers"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "location",
+        "irrigation_type"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Post-harvest farmer survey; crop-cut sample where feasible.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Yields vary with rainfall; record seasonal conditions as an assumption."
+    },
+    {
+      "id": "PR-01",
+      "sector": "protection",
+      "tags": [
+        "mhpss",
+        "focused_care",
+        "iasc"
+      ],
+      "level": "output",
+      "name": "Number of people receiving focused psychosocial or psychological care",
+      "nameAr": "عدد الأشخاص الذين يتلقّون رعاية نفسية اجتماعية أو نفسية مركّزة",
+      "definition": "Individuals who received at least the minimum number of sessions of a focused (individual, family or group) psychosocial or psychological intervention.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique clients meeting the session threshold"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "monthly",
+      "meansOfVerification": "Case management records (aggregated; never export personal data).",
+      "standardReference": {
+        "framework": "IASC MHPSS M&E Framework",
+        "code": "O5.4",
+        "url": "https://globalprotectioncluster.org/sites/default/files/2022-05/iasc_common_monitoring_and_evaluation_framework_for_mhpss_programmes_in_emergency_settings_0.pdf"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "PR-02",
+      "sector": "protection",
+      "tags": [
+        "mhpss",
+        "functioning",
+        "iasc",
+        "wellbeing"
+      ],
+      "level": "outcome",
+      "name": "% of supported individuals with improved functioning score",
+      "nameAr": "نسبة الأفراد المدعومين الذين تحسّنت لديهم درجة الأداء الوظيفي",
+      "definition": "Share of clients whose score on a validated functioning measure improved between intake and follow-up.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Clients with improved functioning score at follow-up",
+        "denominator": "Clients with intake and follow-up scores"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "per_cohort",
+      "meansOfVerification": "Validated tool (e.g., WHO-DAS, as cited in the IASC framework) administered by trained staff at intake and follow-up.",
+      "standardReference": {
+        "framework": "IASC MHPSS M&E Framework",
+        "code": "Gi.1",
+        "url": "https://globalprotectioncluster.org/sites/default/files/2022-05/iasc_common_monitoring_and_evaluation_framework_for_mhpss_programmes_in_emergency_settings_0.pdf"
+      },
+      "isStandard": true,
+      "notes": "Goal-level in the IASC framework; used as an outcome indicator at project level."
+    },
+    {
+      "id": "PR-03",
+      "sector": "protection",
+      "tags": [
+        "safety",
+        "perception",
+        "iasc"
+      ],
+      "level": "outcome",
+      "name": "% of target group members who report feeling safe in their community",
+      "nameAr": "نسبة أفراد الفئة المستهدفة الذين يفيدون بشعورهم بالأمان في مجتمعهم",
+      "definition": "Share of surveyed target group members who report feeling safe or very safe in specified places (home, route to school/work, community spaces).",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Respondents reporting safe or very safe",
+        "denominator": "Respondents surveyed"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "hh_survey",
+        "fgd"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Community survey with protection-trained enumerators; FGDs to explain changes.",
+      "standardReference": {
+        "framework": "IASC MHPSS M&E Framework",
+        "code": "O2.6",
+        "url": "https://globalprotectioncluster.org/sites/default/files/2022-05/iasc_common_monitoring_and_evaluation_framework_for_mhpss_programmes_in_emergency_settings_0.pdf"
+      },
+      "isStandard": true,
+      "notes": "Safety perceptions can fall because of events outside project control — record context."
+    },
+    {
+      "id": "PR-04",
+      "sector": "protection",
+      "tags": [
+        "legal_aid",
+        "access_to_justice",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of people benefiting from legal aid",
+      "nameAr": "عدد الأشخاص المستفيدين من المساعدة القانونية",
+      "definition": "Individuals who received legal counselling, representation or assistance through project-supported legal aid services.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique clients served"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "case_type",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Legal aid case registers (aggregated).",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.25",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "PR-05",
+      "sector": "protection",
+      "tags": [
+        "gbv",
+        "sgbv",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of people benefiting from interventions countering sexual and gender-based violence",
+      "nameAr": "عدد الأشخاص المستفيدين من التدخلات الرامية إلى مكافحة العنف الجنسي والعنف القائم على النوع الاجتماعي",
+      "definition": "Individuals reached by prevention, response or survivor-support services addressing SGBV.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique individuals reached; report prevention and response separately"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "service_type"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Service records held by specialised GBV actors; only aggregated, anonymised figures in Raqib.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.37",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": "Follow GBV data protection protocols; never store survivor-level data in Raqib."
+    },
+    {
+      "id": "PR-06",
+      "sector": "protection",
+      "tags": [
+        "parenting",
+        "child_protection",
+        "iasc"
+      ],
+      "level": "outcome",
+      "name": "% of participating caregivers demonstrating improved knowledge and skills in positive parenting",
+      "nameAr": "نسبة مقدّمي الرعاية المشاركين الذين أظهروا تحسناً في معارف ومهارات التربية الإيجابية",
+      "definition": "Share of caregivers whose post-programme score on a parenting knowledge and skills tool exceeds their pre-programme score by the agreed margin.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Caregivers meeting the improvement threshold",
+        "denominator": "Caregivers with pre and post scores"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "location"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "per_cohort",
+      "meansOfVerification": "Pre/post questionnaire.",
+      "standardReference": {
+        "framework": "IASC MHPSS M&E Framework",
+        "code": "O3.2",
+        "url": "https://globalprotectioncluster.org/sites/default/files/2022-05/iasc_common_monitoring_and_evaluation_framework_for_mhpss_programmes_in_emergency_settings_0.pdf"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "PR-07",
+      "sector": "protection",
+      "tags": [
+        "displacement",
+        "idps",
+        "host_community",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of displaced people and host community members protected or assisted",
+      "nameAr": "عدد النازحين وأفراد المجتمعات المضيفة الذين تمّت حمايتهم أو مساعدتهم",
+      "definition": "Refugees, internally displaced persons, returnees and host community members who received protection or assistance from the project.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique individuals assisted, by status"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "displacement_status",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Beneficiary database de-duplicated across services.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.20",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "GE-01",
+      "sector": "gender",
+      "tags": [
+        "decision_making",
+        "empowerment",
+        "household"
+      ],
+      "level": "outcome",
+      "name": "% of women participants reporting a joint or sole role in household economic decisions",
+      "nameAr": "نسبة المشاركات اللواتي يفدن بأن لهن دوراً منفرداً أو مشتركاً في القرارات الاقتصادية للأسرة",
+      "definition": "Share of women participants who report making, alone or jointly, decisions on major household purchases and use of income.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Women reporting sole or joint decision-making on the defined decisions",
+        "denominator": "Women participants surveyed"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "age",
+        "disability",
+        "location",
+        "marital_status"
+      ],
+      "methods": [
+        "hh_survey",
+        "fgd"
+      ],
+      "frequency": "baseline_endline",
+      "meansOfVerification": "Survey module on decision-making, interviewed privately by female enumerators.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Interview women privately; consider do-no-harm risks."
+    },
+    {
+      "id": "GE-02",
+      "sector": "gender",
+      "tags": [
+        "leadership",
+        "representation",
+        "community_committees"
+      ],
+      "level": "outcome",
+      "name": "% of positions in supported community committees held by women",
+      "nameAr": "نسبة المقاعد التي تشغلها نساء في اللجان المجتمعية المدعومة",
+      "definition": "Share of members (and separately, leadership roles) in project-supported committees who are women.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Committee positions held by women",
+        "denominator": "All committee positions"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "committee_type",
+        "role",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Committee membership records.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Pair with a qualitative measure of meaningful participation."
+    },
+    {
+      "id": "GE-03",
+      "sector": "gender",
+      "tags": [
+        "womens_economic_empowerment",
+        "entrepreneurship"
+      ],
+      "level": "output",
+      "name": "Number of women supported to start or grow a business",
+      "nameAr": "عدد النساء اللواتي تم دعمهن لبدء مشروع تجاري أو تنميته",
+      "definition": "Women entrepreneurs who received a complete support package (training plus grant, mentoring or market linkage) from the project.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique women completing the package"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "age",
+        "disability",
+        "location",
+        "business_stage"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Programme records and grant agreements.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "GV-01",
+      "sector": "governance",
+      "tags": [
+        "civil_society",
+        "csos",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of grassroots civil society organisations benefiting from or reached by project support",
+      "nameAr": "عدد منظمات المجتمع المدني القاعدية التي استفادت من دعم المشروع أو وصلها",
+      "definition": "Community-based and grassroots CSOs that received grants, capacity development or other direct support.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique organisations supported"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "organisation_type",
+        "location",
+        "women_led"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Grant and training records.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.28",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "GV-02",
+      "sector": "governance",
+      "tags": [
+        "policy",
+        "participation",
+        "eu",
+        "gerf"
+      ],
+      "level": "outcome",
+      "name": "Number of government policies developed or revised with civil society participation",
+      "nameAr": "عدد السياسات الحكومية التي تم إعدادها أو مراجعتها بمشاركة المجتمع المدني",
+      "definition": "Policies, strategies or regulations formally adopted or revised where documented civil society participation took place with project support.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Count of policies with evidence of adoption and CSO participation"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "policy_area",
+        "level_of_government"
+      ],
+      "methods": [
+        "document_review",
+        "kii"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Official publications, consultation records, KIIs with officials.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.29",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "GV-03",
+      "sector": "governance",
+      "tags": [
+        "municipal_services",
+        "social_accountability",
+        "scorecard"
+      ],
+      "level": "outcome",
+      "name": "% of residents in target localities satisfied with local government services",
+      "nameAr": "نسبة السكان في المناطق المستهدفة الراضين عن خدمات الهيئات المحلية",
+      "definition": "Share of surveyed residents who rate the quality of selected local government services as good or very good.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Residents rating services good or very good",
+        "denominator": "Residents surveyed"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "hh_survey",
+        "participatory"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Citizen satisfaction survey or community scorecard.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "GV-04",
+      "sector": "governance",
+      "tags": [
+        "institutional_capacity",
+        "oca"
+      ],
+      "level": "outcome",
+      "name": "Number of supported institutions with an improved organisational capacity score",
+      "nameAr": "عدد المؤسسات المدعومة التي تحسّنت درجة قدرتها المؤسسية",
+      "definition": "Supported institutions whose score on the project's organisational capacity assessment improved by the agreed margin between baseline and follow-up.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Count of institutions meeting the improvement threshold"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "organisation_type",
+        "location"
+      ],
+      "methods": [
+        "participatory",
+        "document_review"
+      ],
+      "frequency": "baseline_endline",
+      "meansOfVerification": "Organisational capacity assessment tool applied at baseline and endline with evidence review.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Self-assessment scores tend to drop as awareness grows — triangulate with evidence."
+    },
+    {
+      "id": "YO-01",
+      "sector": "youth",
+      "tags": [
+        "employability",
+        "life_skills"
+      ],
+      "level": "output",
+      "name": "Number of young people completing life-skills or employability training",
+      "nameAr": "عدد الشباب الذين أتمّوا تدريباً على المهارات الحياتية أو مهارات التوظيف",
+      "definition": "Young people (age band defined by the project, e.g., 15–29) who completed at least the minimum share of training sessions.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique youth meeting the completion threshold"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Attendance and completion records.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "YO-02",
+      "sector": "youth",
+      "tags": [
+        "neet",
+        "transition",
+        "employment",
+        "education"
+      ],
+      "level": "outcome",
+      "name": "% of youth participants in employment, education or training six months after completion",
+      "nameAr": "نسبة الشباب المشاركين الملتحقين بعمل أو تعليم أو تدريب بعد ستة أشهر من إنهاء البرنامج",
+      "definition": "Share of youth graduates who are employed, self-employed, enrolled in education or in training six months after completing the programme.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Graduates in employment, education or training at 6 months",
+        "denominator": "Graduates reached by the tracer survey"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "per_cohort",
+      "meansOfVerification": "Phone tracer survey; report response rate.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "YO-03",
+      "sector": "youth",
+      "tags": [
+        "civic_engagement",
+        "volunteering"
+      ],
+      "level": "outcome",
+      "name": "% of youth participants who took part in a community or civic initiative in the past three months",
+      "nameAr": "نسبة الشباب المشاركين الذين شاركوا في مبادرة مجتمعية أو مدنية خلال الأشهر الثلاثة الماضية",
+      "definition": "Share of youth participants who report taking part in at least one organised community, volunteer or civic activity in the past three months.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Youth reporting participation",
+        "denominator": "Youth participants surveyed"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "location"
+      ],
+      "methods": [
+        "hh_survey",
+        "fgd"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Participant survey; FGDs on quality of engagement.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": ""
+    },
+    {
+      "id": "AC-01",
+      "sector": "other",
+      "tags": [
+        "accountability",
+        "aap",
+        "chs",
+        "feedback",
+        "cross_cutting"
+      ],
+      "level": "outcome",
+      "name": "% of assisted people who know how to give feedback or make a complaint",
+      "nameAr": "نسبة المستفيدين الذين يعرفون كيفية تقديم ملاحظة أو شكوى",
+      "definition": "Share of sampled assisted people who can name at least one project feedback or complaint channel.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Respondents naming at least one channel",
+        "denominator": "Respondents sampled"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Post-distribution or beneficiary feedback survey.",
+      "standardReference": {
+        "framework": "Core Humanitarian Standard (2024)",
+        "code": "Commitment 5 (aligned)",
+        "url": "https://inee.org/sites/default/files/resources/ENG_CHS_2024_RGB.pdf"
+      },
+      "isStandard": true,
+      "notes": "Offer in every humanitarian framework."
+    },
+    {
+      "id": "AC-02",
+      "sector": "other",
+      "tags": [
+        "accountability",
+        "complaints",
+        "chs",
+        "cross_cutting"
+      ],
+      "level": "output",
+      "name": "% of complaints and feedback responded to within the agreed timeframe",
+      "nameAr": "نسبة الشكاوى والملاحظات التي تمّ الرد عليها ضمن الإطار الزمني المتفق عليه",
+      "definition": "Share of logged complaints and feedback items that received a response or resolution within the timeframe set in the feedback mechanism SOP.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Items responded to within the timeframe",
+        "denominator": "Items logged in the period"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "channel",
+        "category",
+        "sex"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "monthly",
+      "meansOfVerification": "Complaint and feedback log.",
+      "standardReference": {
+        "framework": "Core Humanitarian Standard (2024)",
+        "code": "Commitment 5 (aligned)",
+        "url": "https://inee.org/sites/default/files/resources/ENG_CHS_2024_RGB.pdf"
+      },
+      "isStandard": true,
+      "notes": "Sensitive complaints (e.g., misconduct) follow a separate confidential procedure."
+    },
+    {
+      "id": "AC-03",
+      "sector": "other",
+      "tags": [
+        "accountability",
+        "relevance",
+        "chs",
+        "iasc",
+        "cross_cutting"
+      ],
+      "level": "outcome",
+      "name": "% of assisted people who report that the assistance met their priority needs",
+      "nameAr": "نسبة المستفيدين الذين يفيدون بأن المساعدة لبّت احتياجاتهم ذات الأولوية",
+      "definition": "Share of sampled assisted people who report the assistance addressed their most important needs completely or mostly.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Respondents answering completely or mostly",
+        "denominator": "Respondents sampled"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Beneficiary perception survey.",
+      "standardReference": {
+        "framework": "Core Humanitarian Standard (2024) / IASC MHPSS",
+        "code": "CHS Commitment 2; IASC O1.8 (aligned)",
+        "url": "https://inee.org/sites/default/files/resources/ENG_CHS_2024_RGB.pdf"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "AC-04",
+      "sector": "other",
+      "tags": [
+        "accountability",
+        "respect",
+        "chs",
+        "cross_cutting"
+      ],
+      "level": "outcome",
+      "name": "% of assisted people who report being treated with respect by staff and volunteers",
+      "nameAr": "نسبة المستفيدين الذين يفيدون بأنهم عوملوا باحترام من قبل الموظفين والمتطوعين",
+      "definition": "Share of sampled assisted people who report always or mostly being treated with respect during their interactions with the project.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Respondents answering always or mostly",
+        "denominator": "Respondents sampled"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "hh_survey"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Beneficiary perception survey administered by people not delivering the assistance.",
+      "standardReference": {
+        "framework": "Core Humanitarian Standard (2024)",
+        "code": "Commitment 8 (aligned)",
+        "url": "https://inee.org/sites/default/files/resources/ENG_CHS_2024_RGB.pdf"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "AC-05",
+      "sector": "other",
+      "tags": [
+        "accountability",
+        "participation",
+        "chs",
+        "iasc",
+        "cross_cutting"
+      ],
+      "level": "outcome",
+      "name": "% of assisted people who report being consulted on the design or adjustment of assistance",
+      "nameAr": "نسبة المستفيدين الذين يفيدون بأنه تمت استشارتهم في تصميم المساعدة أو تعديلها",
+      "definition": "Share of sampled assisted people who report having been asked for their views on what assistance they need or how it is delivered.",
+      "unit": "percent",
+      "calculation": {
+        "numerator": "Respondents reporting consultation",
+        "denominator": "Respondents sampled"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "location"
+      ],
+      "methods": [
+        "hh_survey",
+        "fgd"
+      ],
+      "frequency": "biannual",
+      "meansOfVerification": "Beneficiary perception survey and FGDs.",
+      "standardReference": {
+        "framework": "Core Humanitarian Standard (2024) / IASC MHPSS",
+        "code": "CHS Commitment 1; IASC O1.2 (aligned)",
+        "url": "https://inee.org/sites/default/files/resources/ENG_CHS_2024_RGB.pdf"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "AC-06",
+      "sector": "other",
+      "tags": [
+        "reach",
+        "unique_beneficiaries",
+        "cross_cutting"
+      ],
+      "level": "output",
+      "name": "Number of unique people directly reached by the project",
+      "nameAr": "عدد الأشخاص الفريدين الذين وصلهم المشروع بشكل مباشر",
+      "definition": "Individuals who directly received at least one project service or good, counted once regardless of how many services they received.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Count of unique beneficiary IDs with at least one service record"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "disability",
+        "displacement_status",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "monthly",
+      "meansOfVerification": "Raqib beneficiary and service records (computed automatically).",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Raqib can compute this directly from the Beneficiary and BeneficiaryService tables."
+    },
+    {
+      "id": "EN-01",
+      "sector": "other",
+      "tags": [
+        "energy",
+        "electricity_access",
+        "solar",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of people gaining access to electricity through the project",
+      "nameAr": "عدد الأشخاص الذين حصلوا على الكهرباء بفضل المشروع",
+      "definition": "People in households or served by facilities that gained new or improved electricity access (grid or off-grid, including solar) through project support.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Household members of connected households plus users of served facilities, per GERF counting rules"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Installation and connection records.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.3",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "EN-02",
+      "sector": "other",
+      "tags": [
+        "energy",
+        "renewable",
+        "solar",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Renewable energy generation capacity installed",
+      "nameAr": "القدرة المركّبة لتوليد الطاقة المتجددة",
+      "definition": "Rated capacity of renewable energy systems (e.g., solar PV) installed with project support.",
+      "unit": "megawatts",
+      "calculation": {
+        "formula": "Sum of rated capacity of commissioned systems (convert kW to MW for EU reporting)"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "technology",
+        "location",
+        "user_type"
+      ],
+      "methods": [
+        "document_review",
+        "observation"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Commissioning certificates.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.4",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "EN-03",
+      "sector": "other",
+      "tags": [
+        "climate",
+        "emissions",
+        "eu",
+        "gerf"
+      ],
+      "level": "outcome",
+      "name": "Greenhouse gas emissions avoided",
+      "nameAr": "انبعاثات غازات الدفيئة التي تمّ تجنّبها",
+      "definition": "Estimated annual tonnes of CO2 equivalent avoided as a result of project-supported renewable energy or efficiency measures.",
+      "unit": "tonnes_co2eq",
+      "calculation": {
+        "formula": "Energy generated or saved × grid emission factor, using the donor's stated methodology"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "technology"
+      ],
+      "methods": [
+        "document_review",
+        "secondary_data"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Metered generation data and a documented emission factor.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.7",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "DG-01",
+      "sector": "other",
+      "tags": [
+        "digital",
+        "internet_access",
+        "eu",
+        "gerf"
+      ],
+      "level": "output",
+      "name": "Number of people gaining internet access through the project",
+      "nameAr": "عدد الأشخاص الذين حصلوا على الإنترنت بفضل المشروع",
+      "definition": "Individuals who gained new access to internet connectivity (household, community centre, school) through project support.",
+      "unit": "number",
+      "calculation": {
+        "formula": "Unique users of newly connected points, per GERF counting rules"
+      },
+      "direction": "increase",
+      "disaggregation": [
+        "sex",
+        "age",
+        "location"
+      ],
+      "methods": [
+        "document_review"
+      ],
+      "frequency": "quarterly",
+      "meansOfVerification": "Connection and user registration records.",
+      "standardReference": {
+        "framework": "EU GERF",
+        "code": "2.11",
+        "url": "https://capacity4dev.europa.eu/resources/results-indicators/global-europe-results-framework_en"
+      },
+      "isStandard": true,
+      "notes": ""
+    },
+    {
+      "id": "IM-01",
+      "sector": "youth",
+      "tags": [
+        "impact",
+        "unemployment",
+        "secondary_data",
+        "pcbs"
+      ],
+      "level": "impact",
+      "name": "Unemployment rate among young people in target governorates",
+      "nameAr": "معدل البطالة بين الشباب في المحافظات المستهدفة",
+      "definition": "Share of the youth labour force (age band as published by PCBS) in the target governorates that is unemployed, as reported in official labour force statistics.",
+      "unit": "percent",
+      "calculation": {
+        "formula": "As published by PCBS for the relevant governorates and period"
+      },
+      "direction": "decrease",
+      "disaggregation": [
+        "sex",
+        "age",
+        "location"
+      ],
+      "methods": [
+        "secondary_data"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "PCBS Labour Force Survey publications.",
+      "standardReference": {
+        "framework": "PCBS Labour Force Survey",
+        "code": "Youth unemployment rate",
+        "url": "https://www.pcbs.gov.ps"
+      },
+      "isStandard": true,
+      "notes": "Impact-level context indicator; the project contributes but cannot attribute changes."
+    },
+    {
+      "id": "IM-02",
+      "sector": "food_security",
+      "tags": [
+        "impact",
+        "food_insecurity",
+        "secondary_data"
+      ],
+      "level": "impact",
+      "name": "Prevalence of food insecurity in target governorates",
+      "nameAr": "نسبة انتشار انعدام الأمن الغذائي في المحافظات المستهدفة",
+      "definition": "Share of households classified as food insecure in the target governorates according to the most recent official or sector-wide food security assessment.",
+      "unit": "percent",
+      "calculation": {
+        "formula": "As published by the food security assessment used (e.g., PCBS/Food Security Sector)"
+      },
+      "direction": "decrease",
+      "disaggregation": [
+        "location",
+        "sex_of_household_head"
+      ],
+      "methods": [
+        "secondary_data"
+      ],
+      "frequency": "annual",
+      "meansOfVerification": "Most recent official or Food Security Sector assessment; cite publication and year.",
+      "standardReference": null,
+      "isStandard": false,
+      "notes": "Impact-level context indicator; confirm which assessment is current before use."
+    }
+  ]
+}
