@@ -3,7 +3,7 @@ dist/
 .env
 *.log
 .DS_Store
-storage/
-eval-results/
-coverage/
-uploads/
+/storage/
+/eval-results/
+/coverage/
+/uploads/
