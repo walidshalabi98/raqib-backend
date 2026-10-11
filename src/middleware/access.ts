@@ -104,3 +104,12 @@ export async function assertAssessmentInProject(projectId: string, assessmentId:
   const assessment = await prisma.assessment.findFirst({ where: { id: assessmentId, projectId } });
   if (!assessment) throw new AppError(400, 'Assessment does not belong to this project');
 }
+
+export async function assertResultAccess(req: Request, resultId: string) {
+  const result = await prisma.resultNode.findFirst({
+    where: { id: resultId, framework: { project: { organizationId: orgId(req) } } },
+    include: { framework: { include: { project: true } } },
+  });
+  if (!result) throw new AppError(404, 'Result not found');
+  return result;
+}

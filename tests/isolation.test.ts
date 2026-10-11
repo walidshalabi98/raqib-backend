@@ -106,7 +106,7 @@ const ROUTES: RouteCase[] = [
 ];
 
 // Routes with an id that are not organisation-owned: the global indicator template library.
-const NOT_ORG_OWNED = new Set(['patch /api/templates/:id', 'delete /api/templates/:id']);
+const NOT_ORG_OWNED = new Set(['patch /api/templates/:id', 'delete /api/templates/:id', 'get /api/indicator-library/:id']);
 
 /** Lists every route registered on the app as "method path". */
 function registeredRoutes(): string[] {

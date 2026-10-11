@@ -26,6 +26,8 @@ import webhookRoutes from './routes/webhooks';
 import beneficiaryRoutes from './routes/beneficiaries';
 import exportRoutes from './routes/exports';
 import fileRoutes from './routes/files';
+import resultRoutes from './routes/results';
+import libraryRoutes from './routes/library';
 
 const app = express();
 
@@ -81,6 +83,8 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api', beneficiaryRoutes);       // /api/projects/:id/beneficiaries & /api/beneficiaries/:id
 app.use('/api', exportRoutes);            // /api/projects/:id/export/*
+app.use('/api', resultRoutes);            // /api/frameworks/:id/results & /api/results/:id
+app.use('/api/indicator-library', libraryRoutes);
 
 // Error handler
 app.use(errorHandler);

@@ -16,7 +16,8 @@
     "storage:setup": "tsx scripts/storage-setup.ts",
     "storage:migrate": "tsx scripts/migrate-uploads.ts",
     "typecheck": "tsc -p tsconfig.check.json",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "seed:library": "tsx scripts/seed-library.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

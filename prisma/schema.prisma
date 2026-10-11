@@ -49,16 +49,25 @@ enum Sector {
   gender
   youth
   other
+  mhpss
+  cash
+  shelter
+  climate_energy
 }
 
 enum DonorType {
-  usaid
+  usaid // legacy: USAID stopped administering awards on 1 July 2025
   eu
   giz
   undp
   unicef
   sida
   other
+  echo
+  wfp
+  unfpa
+  fcdo
+  un_women
 }
 
 enum ProjectStatus {
@@ -118,6 +127,21 @@ enum Frequency {
   annual
   per_cohort
   baseline_endline
+}
+
+enum IndicatorDirection {
+  increase
+  decrease
+  maintain
+}
+
+// Where an indicator came from (knowledge/me-foundations.md §3).
+enum IndicatorProvenance {
+  library
+  ai_suggested
+  ai_generated
+  imported
+  manual
 }
 
 enum IndicatorStatus {
@@ -210,8 +234,8 @@ model WebhookToken {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   tokenHash      String       @unique
-  tokenPrefix    String       // first characters, to help admins recognise the token
-  createdById    String       // user that data imported through this token is attributed to
+  tokenPrefix    String // first characters, to help admins recognise the token
+  createdById    String // user that data imported through this token is attributed to
   createdBy      User         @relation(fields: [createdById], references: [id])
   createdAt      DateTime     @default(now())
   lastUsedAt     DateTime?
@@ -239,22 +263,24 @@ model User {
 }
 
 model Project {
-  id                  String             @id @default(uuid())
+  id                  String               @id @default(uuid())
   organizationId      String
-  organization        Organization       @relation(fields: [organizationId], references: [id])
+  organization        Organization         @relation(fields: [organizationId], references: [id])
   name                String
   nameAr              String?
   description         String?
   sector              Sector
   donor               String
   donorType           DonorType
-  budgetUsd           Decimal?           @db.Decimal(12, 2)
-  startDate           DateTime           @db.Date
-  endDate             DateTime           @db.Date
+  budgetUsd           Decimal?             @db.Decimal(12, 2)
+  startDate           DateTime             @db.Date
+  endDate             DateTime             @db.Date
   targetBeneficiaries Int?
   geographicScope     String?
-  status              ProjectStatus      @default(setup)
-  createdAt           DateTime           @default(now())
+  sectors             Sector[]             @default([]) // all sectors; `sector` stays the primary one
+  humanitarian        Boolean              @default(false) // drives accountability rules and ECHO behaviour
+  status              ProjectStatus        @default(setup)
+  createdAt           DateTime             @default(now())
   documents           Document[]
   frameworks          Framework[]
   assessments         Assessment[]
@@ -292,11 +318,32 @@ model Framework {
   approvedAt  DateTime?
   approvedBy  String?
   indicators  Indicator[]
+  resultNodes ResultNode[]
+}
+
+// Results chain node: goal/impact → outcome → output (→ activity).
+model ResultNode {
+  id          String         @id @default(uuid())
+  frameworkId String
+  framework   Framework      @relation(fields: [frameworkId], references: [id], onDelete: Cascade)
+  parentId    String?
+  parent      ResultNode?    @relation("ResultTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children    ResultNode[]   @relation("ResultTree")
+  level       IndicatorLevel
+  code        String // "Goal", "O1", "O1.1"
+  text        String
+  textAr      String?
+  sortOrder   Int            @default(0)
+  createdAt   DateTime       @default(now())
+  indicators  Indicator[]
+
+  @@index([frameworkId])
+  @@index([parentId])
 }
 
 model Indicator {
   id                   String           @id @default(uuid())
-  frameworkId           String
+  frameworkId          String
   framework            Framework        @relation(fields: [frameworkId], references: [id])
   indicatorText        String
   indicatorTextAr      String?
@@ -309,7 +356,7 @@ model Indicator {
   unit                 String?
   status               IndicatorStatus  @default(not_started)
   aiRationale          String?
-  phases               Json             // ["baseline", "midterm", "endline"]
+  phases               Json // ["baseline", "midterm", "endline"]
   startDate            DateTime?
   endDate              DateTime?
   actualStartDate      DateTime?
@@ -319,8 +366,31 @@ model Indicator {
   sortOrder            Int              @default(0)
   isApproved           Boolean          @default(false)
   createdAt            DateTime         @default(now())
-  dataPoints           DataPoint[]
-  beneficiaryServices  BeneficiaryService[]
+
+  // Indicator reference sheet (knowledge/me-foundations.md §3)
+  resultId              String?
+  result                ResultNode?            @relation(fields: [resultId], references: [id], onDelete: SetNull)
+  definition            String?
+  calculation           Json? // { numerator, denominator, formula, rounding }
+  direction             IndicatorDirection?
+  disaggregation        Json? // ["sex", "age", "disability", ...]
+  meansOfVerification   String?
+  baselineDate          DateTime?              @db.Date
+  baselineMethod        String?
+  targetJustification   String?
+  intermediateTargets   Json? // [{ date: "YYYY-MM-DD", value: "..." }]
+  assumptions           String?
+  libraryId             String?
+  library               IndicatorLibraryEntry? @relation(fields: [libraryId], references: [id], onDelete: SetNull)
+  standardReferenceCode String? // e.g. "GERF 2.38", "IASC MHPSS O5.4"
+  provenance            IndicatorProvenance    @default(manual)
+  aiModel               String?
+  promptVersion         String?
+
+  dataPoints          DataPoint[]
+  beneficiaryServices BeneficiaryService[]
+
+  @@index([resultId])
 }
 
 model Assessment {
@@ -331,7 +401,7 @@ model Assessment {
   status             AssessmentStatus   @default(requested)
   scopeDescription   String?
   sampleSize         Int?
-  methodsIncluded    Json               // ["hh_survey", "fgd", "kii"]
+  methodsIncluded    Json // ["hh_survey", "fgd", "kii"]
   priceUsd           Decimal?           @db.Decimal(10, 2)
   requestedAt        DateTime           @default(now())
   startedAt          DateTime?
@@ -356,6 +426,8 @@ model DataPoint {
   geographicArea   String?
   notes            String?
   attachments      Json?
+  // Disaggregated values, e.g. { "sex": { "female": 120, "male": 98 }, "disability": { "yes": 12, "no": 206 } }
+  breakdown        Json?
   createdAt        DateTime         @default(now())
   createdBy        String
   creator          User             @relation(fields: [createdBy], references: [id])
@@ -374,9 +446,9 @@ model QualitativeEntry {
   location         String?
   dateConducted    DateTime?       @db.Date
   facilitator      String?
-  themes           Json?           // ["theme1", "theme2"]
+  themes           Json? // ["theme1", "theme2"]
   sentiment        Sentiment?
-  linkedIndicators Json?           // ["indicator-id-1", "indicator-id-2"]
+  linkedIndicators Json? // ["indicator-id-1", "indicator-id-2"]
   attachments      Json?
   createdAt        DateTime        @default(now())
 }
@@ -396,6 +468,37 @@ model Report {
   status      ReportStatus @default(draft)
 }
 
+// Seed indicator library (source of truth: knowledge/indicator-library.json; load with `npm run seed:library`).
+model IndicatorLibraryEntry {
+  id                  String                       @id // e.g. "FS-01"
+  sector              Sector
+  tags                String[]
+  level               IndicatorLevel
+  name                String
+  nameAr              String
+  definition          String
+  unit                String // number | percent | score | litres_per_person_per_day | ... (see library meta.enums.unit)
+  calculation         Json? // { numerator, denominator, formula, aggregation }
+  direction           IndicatorDirection
+  disaggregation      String[]
+  methods             CollectionMethod[]
+  frequency           Frequency
+  meansOfVerification String
+  standardReference   Json? // { framework, code, url }
+  standardFramework   String? // copy of standardReference.framework, for filtering
+  isStandard          Boolean
+  notes               String?
+  version             String // library meta.version the entry was loaded from
+  embedding           Unsupported("vector(1024)")? // Voyage voyage-4 (Phase 3)
+  createdAt           DateTime                     @default(now())
+  updatedAt           DateTime                     @updatedAt
+  indicators          Indicator[]
+
+  @@index([sector])
+  @@index([standardFramework])
+}
+
+// Deprecated: replaced by IndicatorLibraryEntry. Kept until its removal is approved (no table drops without approval).
 model METemplate {
   id                   String                       @id @default(uuid())
   sector               Sector
@@ -406,7 +509,7 @@ model METemplate {
   recommendedFrequency Frequency
   typicalTarget        String?
   benchmarkPalestine   String?
-  donorRelevance       Json?                        // ["usaid", "eu"]
+  donorRelevance       Json? // ["usaid", "eu"]
   tags                 Json?
   embedding            Unsupported("vector(1536)")?
   createdAt            DateTime                     @default(now())
@@ -458,9 +561,9 @@ enum BeneficiaryStatus {
 }
 
 model Beneficiary {
-  id                String              @id @default(uuid())
+  id                String               @id @default(uuid())
   projectId         String
-  project           Project             @relation(fields: [projectId], references: [id])
+  project           Project              @relation(fields: [projectId], references: [id])
   fullName          String
   fullNameAr        String?
   gender            Gender
@@ -471,27 +574,27 @@ model Beneficiary {
   phoneNumber       String?
   nationalId        String?
   householdSize     Int?
-  vulnerabilityTags Json?               // ["disabled", "female_headed_household", etc.]
-  registrationDate  DateTime            @default(now())
-  status            BeneficiaryStatus   @default(active)
+  vulnerabilityTags Json? // ["disabled", "female_headed_household", etc.]
+  registrationDate  DateTime             @default(now())
+  status            BeneficiaryStatus    @default(active)
   services          BeneficiaryService[]
-  createdAt         DateTime            @default(now())
-  updatedAt         DateTime            @updatedAt
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
 }
 
 model BeneficiaryService {
-  id              String       @id @default(uuid())
-  beneficiaryId   String
-  beneficiary     Beneficiary  @relation(fields: [beneficiaryId], references: [id])
-  projectId       String
-  project         Project      @relation(fields: [projectId], references: [id])
-  serviceType     String       // e.g., "cash_assistance", "training", "psychosocial_support"
-  description     String?
-  dateProvided    DateTime
-  quantity        Decimal?     @db.Decimal(10, 2)
-  unit            String?      // e.g., "USD", "sessions", "kits"
-  indicatorId     String?
-  indicator       Indicator?   @relation(fields: [indicatorId], references: [id])
-  notes           String?
-  createdAt       DateTime     @default(now())
+  id            String      @id @default(uuid())
+  beneficiaryId String
+  beneficiary   Beneficiary @relation(fields: [beneficiaryId], references: [id])
+  projectId     String
+  project       Project     @relation(fields: [projectId], references: [id])
+  serviceType   String // e.g., "cash_assistance", "training", "psychosocial_support"
+  description   String?
+  dateProvided  DateTime
+  quantity      Decimal?    @db.Decimal(10, 2)
+  unit          String? // e.g., "USD", "sessions", "kits"
+  indicatorId   String?
+  indicator     Indicator?  @relation(fields: [indicatorId], references: [id])
+  notes         String?
+  createdAt     DateTime    @default(now())
 }
