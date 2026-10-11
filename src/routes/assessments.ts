@@ -10,7 +10,7 @@ const router = Router();
 
 // GET /api/projects/:id/assessments
 router.get('/projects/:id/assessments', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const assessments = await prisma.assessment.findMany({
     where: { projectId: req.params.id },
@@ -24,7 +24,7 @@ router.get('/projects/:id/assessments', authenticate, asyncHandler(async (req: R
 
 // POST /api/projects/:id/assessments — Request new assessment
 router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const { type, scopeDescription, sampleSize, methodsIncluded } = req.body;
   if (!type) throw new AppError(400, 'Assessment type is required');
@@ -53,7 +53,7 @@ router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'p
 
 // PATCH /api/assessments/:id — Update status
 router.patch('/assessments/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
-  const assessment = await assertAssessmentAccess(req, req.params.id);
+  await assertAssessmentAccess(req, req.params.id);
 
   const { status, priceUsd, startedAt, deliveredAt, reportUrl } = req.body;
 

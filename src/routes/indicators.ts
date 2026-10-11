@@ -2,14 +2,14 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertIndicatorAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 
 const router = Router();
 
 // PATCH /api/indicators/:id
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const indicator = await assertIndicatorAccess(req, req.params.id);
+  await assertIndicatorAccess(req, req.params.id);
 
   const {
     indicatorText, indicatorTextAr, level, dataCollectionMethod,
@@ -46,7 +46,7 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
 
 // POST /api/indicators/:id/alternative — Request AI alternative
 router.post('/:id/alternative', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
-  const indicator = await assertIndicatorAccess(req, req.params.id);
+  await assertIndicatorAccess(req, req.params.id);
 
   // Generate alternative inline (no Redis/BullMQ needed)
   // TODO: Add AI alternative indicator service
@@ -55,7 +55,7 @@ router.post('/:id/alternative', authenticate, aiLimiter, asyncHandler(async (req
 
 // PATCH /api/indicators/:id/approve
 router.patch('/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
-  const indicator = await assertIndicatorAccess(req, req.params.id);
+  await assertIndicatorAccess(req, req.params.id);
 
   const updated = await prisma.indicator.update({
     where: { id: req.params.id },
@@ -67,7 +67,7 @@ router.patch('/:id/approve', authenticate, authorize('org_admin', 'platform_admi
 
 // DELETE /api/indicators/:id
 router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const indicator = await assertIndicatorAccess(req, req.params.id);
+  await assertIndicatorAccess(req, req.params.id);
 
   await prisma.indicator.delete({ where: { id: req.params.id } });
   res.json({ message: 'Indicator deleted' });

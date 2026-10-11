@@ -97,7 +97,7 @@ export async function generateAutoAssessment(
     const idx = d.parsedText?.indexOf(aiMarker);
     let aiAnalysis = null;
     if (idx && idx > -1) {
-      try { aiAnalysis = JSON.parse(d.parsedText!.substring(idx + aiMarker.length).trim()); } catch {}
+      try { aiAnalysis = JSON.parse(d.parsedText!.substring(idx + aiMarker.length).trim()); } catch { /* analysis is optional; ignore malformed JSON */ }
     }
     return {
       name: d.fileName,
@@ -228,7 +228,7 @@ Return ONLY valid JSON. No markdown. Be specific with data — reference actual 
           type: 'assessment_ready',
           title: `Assessment Complete: ${project.name}`,
           message: `AI ${assessmentType} assessment has been generated with ${indicators.length} indicators analyzed.`,
-          metadata: { assessmentId, projectId },
+          link: `/projects/${projectId}/assessments`,
         },
       });
     }

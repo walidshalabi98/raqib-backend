@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertFrameworkAccess, assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
-import { AppError , asyncHandler } from '../middleware/errorHandler';
+import { asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { generateFramework } from '../services/ai/frameworkGenerator';
 
@@ -10,7 +10,7 @@ const router = Router();
 
 // GET /api/projects/:id/framework — Get active framework with indicators
 router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const framework = await prisma.framework.findFirst({
     where: { projectId: req.params.id },
@@ -32,7 +32,7 @@ router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Req
 
 // POST /api/projects/:id/framework/generate — Trigger AI generation (runs inline, no Redis needed)
 router.post('/projects/:id/framework/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   // Get current max version
   const latest = await prisma.framework.findFirst({
@@ -74,7 +74,6 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
   });
 
   const hasIndicators = framework.indicators.length > 0;
-  const isComplete = hasIndicators && framework.status !== 'draft';
 
   res.json({
     frameworkId: framework.id,
@@ -132,7 +131,7 @@ router.post('/projects/:id/framework/manual', authenticate, authorize('org_admin
 
 // POST /api/frameworks/:id/indicators — Create a single indicator manually
 router.post('/frameworks/:id/indicators', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const framework = await assertFrameworkAccess(req, req.params.id);
+  await assertFrameworkAccess(req, req.params.id);
 
   // Get next sort order
   const lastIndicator = await prisma.indicator.findFirst({
@@ -176,7 +175,7 @@ router.post('/frameworks/:id/indicators', authenticate, authorize('org_admin', '
 
 // GET /api/frameworks/:id/indicators
 router.get('/frameworks/:id/indicators', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const framework = await assertFrameworkAccess(req, req.params.id);
+  await assertFrameworkAccess(req, req.params.id);
 
   const indicators = await prisma.indicator.findMany({
     where: { frameworkId: req.params.id },

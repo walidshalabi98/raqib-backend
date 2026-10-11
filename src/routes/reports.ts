@@ -10,7 +10,7 @@ const router = Router();
 
 // GET /api/projects/:id/reports
 router.get('/projects/:id/reports', authenticate, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const reports = await prisma.report.findMany({
     where: { projectId: req.params.id },
@@ -21,7 +21,7 @@ router.get('/projects/:id/reports', authenticate, asyncHandler(async (req: Reque
 
 // POST /api/projects/:id/reports/generate — Generate report (async)
 router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
-  const project = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
   const { type, title, donorFormat, periodStart, periodEnd } = req.body;
   if (!type || !title) throw new AppError(400, 'type and title are required');

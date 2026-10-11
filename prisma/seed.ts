@@ -81,7 +81,7 @@ async function main() {
     },
   });
 
-  const donorViewer = await prisma.user.create({
+  await prisma.user.create({
     data: {
       organizationId: org.id,
       email: 'donor@momentumlabs.ps',

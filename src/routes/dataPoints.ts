@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { CollectionMethod } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { assertAssessmentInProject, assertIndicatorAccess, assertIndicatorsInProject, assertProjectAccess } from '../middleware/access';
 import { authenticate } from '../middleware/auth';
@@ -102,7 +103,7 @@ router.post('/projects/:id/data/bulk', authenticate, asyncHandler(async (req: Re
       indicatorId: string;
       value: string;
       collectionDate: string;
-      collectionMethod: string;
+      collectionMethod: CollectionMethod;
       dataSource?: string;
       geographicArea?: string;
       notes?: string;
