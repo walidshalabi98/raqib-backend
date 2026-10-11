@@ -36,6 +36,14 @@ const ROUTES: RouteCase[] = [
   { method: 'patch', route: '/api/frameworks/:id/approve', path: b => `/api/frameworks/${b.framework.id}/approve` },
   { method: 'post', route: '/api/frameworks/:id/indicators', path: b => `/api/frameworks/${b.framework.id}/indicators`, body: () => ({ indicatorText: 'Injected' }) },
   { method: 'get', route: '/api/frameworks/:id/indicators', path: b => `/api/frameworks/${b.framework.id}/indicators` },
+  // Results chain
+  { method: 'get', route: '/api/frameworks/:id/results', path: b => `/api/frameworks/${b.framework.id}/results` },
+  {
+    method: 'post', route: '/api/frameworks/:id/results', path: b => `/api/frameworks/${b.framework.id}/results`,
+    body: () => ({ level: 'output', code: 'X1', text: 'Injected' }),
+  },
+  { method: 'patch', route: '/api/results/:id', path: b => `/api/results/${b.result.id}`, body: () => ({ text: 'Hijacked', code: 'X9' }) },
+  { method: 'delete', route: '/api/results/:id', path: b => `/api/results/${b.result.id}` },
   // Indicators and data
   { method: 'patch', route: '/api/indicators/:id', path: b => `/api/indicators/${b.indicator.id}`, body: () => ({ indicatorText: 'Hijacked' }) },
   { method: 'post', route: '/api/indicators/:id/alternative', path: b => `/api/indicators/${b.indicator.id}/alternative` },
@@ -170,7 +178,12 @@ describe.skipIf(!hasTestDatabase)('organisation isolation', () => {
     const project = await prisma.project.findUniqueOrThrow({ where: { id: b.project.id } });
     expect(project.name).toBe('Project b');
     expect(project.status).toBe('setup');
-    expect((await prisma.indicator.findUniqueOrThrow({ where: { id: b.indicator.id } })).indicatorText).toBe('Indicator b');
+    const indicator = await prisma.indicator.findUniqueOrThrow({ where: { id: b.indicator.id } });
+    expect(indicator.indicatorText).toBe('Indicator b');
+    expect(indicator.resultId).toBe(b.result.id);
+    const result = await prisma.resultNode.findUniqueOrThrow({ where: { id: b.result.id } });
+    expect(result).toMatchObject({ code: 'O1', text: 'Outcome b', level: 'outcome', parentId: null });
+    expect(await prisma.resultNode.count({ where: { frameworkId: b.framework.id } })).toBe(1);
     expect((await prisma.framework.findUniqueOrThrow({ where: { id: b.framework.id } })).status).toBe('draft');
     expect(await prisma.document.findUnique({ where: { id: b.document.id } })).not.toBeNull();
     expect((await prisma.beneficiary.findUniqueOrThrow({ where: { id: b.beneficiary.id } })).fullName).toBe('Person b');
@@ -222,6 +235,55 @@ describe.skipIf(!hasTestDatabase)('organisation isolation', () => {
     expect(service.status).toBe(400);
 
     expect(await prisma.dataPoint.count({ where: { indicatorId: b.indicator.id } })).toBe(1);
+  });
+
+  it('rejects result and library ids from another organisation, or unknown ones, inside a request body', async () => {
+    const patchResult = await request(app)
+      .patch(`/api/indicators/${a.indicator.id}`)
+      .set('Authorization', a.adminAuth)
+      .send({ resultId: b.result.id });
+    expect(patchResult.status).toBe(400);
+    expect(patchResult.body.message).toMatch(/resultId/);
+
+    const createWithResult = await request(app)
+      .post(`/api/frameworks/${a.framework.id}/indicators`)
+      .set('Authorization', a.adminAuth)
+      .send({ indicatorText: 'Leak', resultId: b.result.id });
+    expect(createWithResult.status).toBe(400);
+
+    const childOfForeign = await request(app)
+      .post(`/api/frameworks/${a.framework.id}/results`)
+      .set('Authorization', a.adminAuth)
+      .send({ level: 'output', code: 'O1.1', text: 'Leak', parentId: b.result.id });
+    expect(childOfForeign.status).toBe(400);
+    expect(childOfForeign.body.message).toMatch(/parentId/);
+
+    const moveUnderForeign = await request(app)
+      .patch(`/api/results/${a.result.id}`)
+      .set('Authorization', a.adminAuth)
+      .send({ parentId: b.result.id });
+    expect(moveUnderForeign.status).toBe(400);
+
+    const unknownLibrary = await request(app)
+      .patch(`/api/indicators/${a.indicator.id}`)
+      .set('Authorization', a.adminAuth)
+      .send({ libraryId: 'ZZ-99' });
+    expect(unknownLibrary.status).toBe(400);
+    expect(unknownLibrary.body.message).toMatch(/libraryId/);
+
+    const createUnknownLibrary = await request(app)
+      .post(`/api/frameworks/${a.framework.id}/indicators`)
+      .set('Authorization', a.adminAuth)
+      .send({ indicatorText: 'Library leak', libraryId: 'ZZ-99' });
+    expect(createUnknownLibrary.status).toBe(400);
+
+    const indicatorA = await prisma.indicator.findUniqueOrThrow({ where: { id: a.indicator.id } });
+    expect(indicatorA.resultId).toBe(a.result.id);
+    expect(indicatorA.libraryId).toBeNull();
+    expect((await prisma.resultNode.findUniqueOrThrow({ where: { id: a.result.id } })).parentId).toBeNull();
+    expect(await prisma.indicator.count({ where: { frameworkId: a.framework.id } })).toBe(1);
+    expect(await prisma.resultNode.count({ where: { frameworkId: a.framework.id } })).toBe(1);
+    expect(await prisma.resultNode.count({ where: { frameworkId: b.framework.id } })).toBe(1);
   });
 
   it('does not let an org admin grant the platform admin role', async () => {

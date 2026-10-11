@@ -4,41 +4,22 @@ import { assertIndicatorAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
+import { assertIndicatorReferences } from '../services/indicators/references';
+import { INDICATOR_INCLUDE } from '../services/indicators/selects';
+import { parseIndicatorUpdate, toIndicatorUpdateData } from '../services/indicators/validation';
 
 const router = Router();
 
-// PATCH /api/indicators/:id
+// PATCH /api/indicators/:id — any subset of the indicator and reference-sheet fields
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  await assertIndicatorAccess(req, req.params.id);
-
-  const {
-    indicatorText, indicatorTextAr, level, dataCollectionMethod,
-    frequency, baselineValue, targetValue, currentValue, unit, status, phases, sortOrder,
-    startDate, endDate, actualStartDate, actualEndDate, milestones, responsibility,
-  } = req.body;
+  const indicator = await assertIndicatorAccess(req, req.params.id);
+  const input = parseIndicatorUpdate(req.body);
+  await assertIndicatorReferences(indicator.frameworkId, input);
 
   const updated = await prisma.indicator.update({
-    where: { id: req.params.id },
-    data: {
-      ...(indicatorText !== undefined && { indicatorText }),
-      ...(indicatorTextAr !== undefined && { indicatorTextAr }),
-      ...(level !== undefined && { level }),
-      ...(dataCollectionMethod !== undefined && { dataCollectionMethod }),
-      ...(frequency !== undefined && { frequency }),
-      ...(baselineValue !== undefined && { baselineValue }),
-      ...(targetValue !== undefined && { targetValue }),
-      ...(currentValue !== undefined && { currentValue }),
-      ...(unit !== undefined && { unit }),
-      ...(status !== undefined && { status }),
-      ...(phases !== undefined && { phases }),
-      ...(sortOrder !== undefined && { sortOrder }),
-      ...(startDate !== undefined && { startDate: startDate ? new Date(startDate) : null }),
-      ...(endDate !== undefined && { endDate: endDate ? new Date(endDate) : null }),
-      ...(actualStartDate !== undefined && { actualStartDate: actualStartDate ? new Date(actualStartDate) : null }),
-      ...(actualEndDate !== undefined && { actualEndDate: actualEndDate ? new Date(actualEndDate) : null }),
-      ...(milestones !== undefined && { milestones }),
-      ...(responsibility !== undefined && { responsibility }),
-    },
+    where: { id: indicator.id },
+    data: toIndicatorUpdateData(input),
+    include: INDICATOR_INCLUDE,
   });
 
   res.json(updated);
@@ -60,6 +41,7 @@ router.patch('/:id/approve', authenticate, authorize('org_admin', 'platform_admi
   const updated = await prisma.indicator.update({
     where: { id: req.params.id },
     data: { isApproved: true },
+    include: INDICATOR_INCLUDE,
   });
 
   res.json(updated);
