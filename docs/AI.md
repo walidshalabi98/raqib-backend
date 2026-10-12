@@ -16,6 +16,9 @@ How Raqib calls AI models (Phase 3). Rules that every AI feature follows are in 
 | `src/services/ai/embeddings.ts` | Re-exports the providers and adds `getEmbeddingProvider(env)` for the app |
 | `src/services/ai/indicatorFigures.ts` | Figures calculated in code (progress, trend) and `unverifiedFigures()`, the check for numbers in AI text |
 | `src/services/ai/*.ts` (others) | The features: framework generator, document analysis, indicator alternatives, qualitative coding, report narrative, risk analysis, assessment report |
+| `src/services/qualitative/redactEntry.ts` | Redacts a qualitative entry's title, content, location and facilitator when it is saved (§9) |
+| `src/services/maintenance/aiCallRetention.ts` | AiCall retention: the cutoff, the batched delete, the nightly job and `npm run ai-calls:prune` (§7) |
+| `src/services/maintenance/redactStoredText.ts` | The one-off backfill `npm run redact:backfill` for text stored before Phase 3 (§9) |
 
 `tests/aiGuard.test.ts` and ESLint (`no-restricted-imports`, plus `no-restricted-syntax` for `import()` and `require()`) fail the build if code in `src/`, `scripts/` or `prisma/` imports an `@anthropic-ai` package outside `client.ts` and `models.ts` (`outputSchema.ts` may import only the JSON schema transform), names a model id (except the `AI_MODEL_MAIN` / `AI_MODEL_FAST` defaults in `env.ts` and the seed's sample-history constant), cleans JSON by hand, or loads the shared system prompt outside the client and startup.
 
@@ -77,7 +80,7 @@ Haiku 5.5 (the fast tier) has no server-side fallback: a refusal there throws `A
 | Indicator alternatives, report narrative | The error goes to the caller; stored data is unchanged. |
 | Qualitative coding | The entry is unchanged. |
 | Risk analysis | Falls back to the deterministic assessment; an analysis that contains figures not found in the data is replaced by the deterministic text. |
-| Assessment report | Any failure before or during the AI call leaves the assessment in `analysis` with a fixed message ("AI generation failed: …"), never the error text. A received answer is never discarded: the assessment, its Report and the notifications are written in one transaction; if that fails, the assessment alone is saved as delivered. |
+| Assessment report | Any failure before or during the AI call leaves the assessment in `analysis` with a fixed message ("AI generation failed: …"), never the error text; there is no retry yet (Phase 6 adds a backend endpoint and a button, owner decision of 12 October 2026). A received answer is never discarded: the assessment, its Report and the notifications are written in one transaction; if that fails, the assessment alone is saved as delivered. The Report has type `assessment_report` for every assessment type, midterm included (midterms used to get `quarterly_summary`; existing reports keep their type). |
 
 Logs use `safeErrorSummary()`: the AiError message, or only the class name for any other error (database errors can echo stored values).
 
@@ -109,6 +112,8 @@ Change a prompt's version whenever you change its text or schema. Defaults: `AI_
 
 Every `generateStructured` call writes exactly one `AiCall` row, whatever the outcome: feature, requested and served model, prompt version, system prompt version, status (`success`, `refusal`, `max_tokens`, `invalid_output`, `error`), stop reason, error class name, attempts, input/output/cache tokens summed over attempts, latency, estimated cost and the organisation and project ids. It never stores prompt text, document text, model answers, error messages or user ids. This includes calls where the shared system prompt or the answer schema cannot be built (status `error`, 0 attempts, nothing sent). If the project or organisation was deleted while the call ran, the row is written again without the project (or without both), so the cost is kept. If the row still cannot be written, the call succeeds (`aiCallId: null`) and a warning names the error class. One `[ai] …` console line per call carries the same numbers.
 
+**Retention.** AiCall rows are kept for `AI_CALL_RETENTION_MONTHS` calendar months (default 24, owner decision of 12 October 2026; allowed 1–120) and then deleted. The cutoff is counted in UTC, with the day clamped to the end of a shorter month (29 February 2028 minus 24 months is 28 February 2026). The worker registers the job scheduler `prune-ai-calls` on the `maintenance` queue (cron `30 2 * * *`, Asia/Hebron, so every night at 02:30) and deletes older rows oldest first in batches of 5 000, so locks stay short; it logs one line with numbers only. `npm run ai-calls:prune` shows the cutoff and how many rows are older (dry run); `npm run ai-calls:prune -- --apply` deletes them. It needs only `DATABASE_URL` (and `AI_CALL_RETENTION_MONTHS` when not the default). Retention only runs while the worker runs; without a worker, run the script by hand.
+
 The estimate uses the prices in `src/services/ai/models.ts` (USD per million tokens, Anthropic API, October 2026):
 
 | Model | Input | Output | Cache write | Cache read |
@@ -129,7 +134,7 @@ FROM "AiCall" WHERE "createdAt" > now() - interval '30 days'
 GROUP BY 1, 2 ORDER BY usd DESC NULLS LAST;
 ```
 
-`AiCall` has row level security on and no API route reads it yet. More queries are in `docs/DATA_MODEL.md` §7.
+Totals per organisation cover at most the retention period. `AiCall` has row level security on and no API route reads it yet. More queries are in `docs/DATA_MODEL.md` §7.
 
 ## 8. Embeddings
 
@@ -163,9 +168,24 @@ Never sent: beneficiary records, user names and email addresses, passwords and t
 
 Redaction runs in linear time, so long lists of numbers cannot slow the server. PDF text is extracted with a tab between the cells of a table row, so numbers in tables are found too.
 
-It runs on parsed documents before anything is stored (`Document.parsedText` holds only redacted text), on qualitative entries and project descriptions before a prompt is built, and again on model output before it is stored (narrative, assessment, themes, document analysis).
+It runs on parsed documents before anything is stored (`Document.parsedText` holds only redacted text), on qualitative entries when they are saved (owner decision of 12 October 2026, `src/services/qualitative/redactEntry.ts`: the title, content, location and facilitator of typed notes, the typed title, location and facilitator of a transcript upload, and KoboToolbox qualitative submissions), on qualitative entries and project descriptions again before a prompt is built, and again on model output before it is stored (narrative, assessment, themes, document analysis). `POST /api/projects/:id/qualitative` answers with the saved entry plus `redactions: { phone, idNumber, email }` (counts only), and refuses a title, content, location or facilitator that is not text (400); the upload refuses a repeated title, location or facilitator field. The frontend shows a hint under the notes and upload fields and, when something was removed, a message without the counts. Log lines carry the entry id and the counts, never the text. Entries saved before this change are only redacted by the backfill below with `--include-qualitative`.
 
-**Limits.** Names and street addresses cannot be removed reliably by patterns. The prompts forbid the model from writing them, but whatever text staff upload or type is sent as it is. Staff must not paste names, addresses or other identifying details of beneficiaries into documents, transcripts, notes or descriptions that Raqib analyses. Other known trade-offs: a 9-digit amount written without separators or a currency is removed as an ID number; ID numbers written in groups (`401 234 567`) are kept. Documents parsed before Phase 3 keep their unredacted `parsedText` at rest until they are parsed again (a backfill needs the owner's approval); the AI services redact it again before every model call, and no API response returns `parsedText` or `fileUrl` (document responses carry `textLength` instead).
+**Limits.** Names and street addresses cannot be removed reliably by patterns. The prompts forbid the model from writing them, but whatever text staff upload or type is sent as it is. Staff must not paste names, addresses or other identifying details of beneficiaries into documents, transcripts, notes or descriptions that Raqib analyses. Other known trade-offs: a 9-digit amount written without separators or a currency is removed as an ID number; ID numbers written in groups (`401 234 567`) are kept. Documents parsed before Phase 3 keep their unredacted `parsedText` at rest until they are parsed again or the backfill below is applied; the AI services redact it again before every model call, and no API response returns `parsedText` or `fileUrl` (document responses carry `textLength` instead). File names (`Document.fileName`, the `fileName` of qualitative attachments) are kept as uploaded, because downloads use them; a prompt that names a file gets the redacted name.
+
+**Backfill of stored text** (owner decision of 12 October 2026; `scripts/redact-stored-text.ts`, logic in `src/services/maintenance/redactStoredText.ts`). It runs `redactPersonalData` over text stored before Phase 3: `Document.parsedText`, and every string value in `Document.aiAnalysis` (keys, numbers, booleans and null stay exactly as stored, so a figure kept as a JSON number is not changed). Run it once on each shared database, after the Phase 3 SQL and the deploy, with a fresh backup (`docs/DATA_MODEL.md` §9, step "Run the backfill"):
+
+```bash
+npm run redact:backfill                               # dry run: totals only, nothing is written
+npm run redact:backfill -- --apply                    # writes the changes; take a backup first
+npm run redact:backfill -- --include-qualitative      # also existing qualitative entries (title, content, location, facilitator)
+npm run redact:backfill -- --verbose                  # also the ids of the rows that change
+```
+
+- It needs only `DATABASE_URL`, and refuses (exit 1, nothing changed) when `Document.aiAnalysis` is missing: apply `prisma/sql/2026-10-12_phase3_ai_foundation.sql` first.
+- Rows are read in id order, 100 at a time. A row is written only if it still holds what was read; a row edited or parsed again meanwhile is skipped and the summary asks to run the script again. Rows with nothing to remove are never written, and a second `--apply` changes nothing.
+- It prints totals and, with `--verbose`, row ids; never text or file names.
+- `--include-qualitative` is off by default; the owner approved it for the shared database on 12 October 2026, so that run uses it. Entries saved since the October 2026 change are already redacted.
+- A `parsedText` that still holds a legacy `---AI_ANALYSIS---` analysis (written by the old API after the Phase 3 SQL ran) is redacted as plain text. If that analysis has a bare 9-digit JSON number, it becomes `[ID number removed]` and the analysis no longer parses, so readers fall back to the document text; the dry run counts these documents.
 
 **Checks on numbers in AI text** (`me-foundations.md` §6). Document analysis marks each `targetsMentioned` item `verified` only when the target is found in the redacted document text, and lists other figures it could not find in `unverifiedFigures`. Report narratives, assessments and risk analyses are checked with `unverifiedFigures(text, allowed)`: figures not among those sent to the model are shown as "Check these figures: … — not found in the data provided" in the report and assessment HTML, and a risk analysis that contains them is replaced by the deterministic text. Framework baselines, targets and intermediate targets marked as from a document must equal a figure the structure step extracted with the same kind and a quote found word for word in the document.
 

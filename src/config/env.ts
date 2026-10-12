@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import { z } from 'zod';
+import { AI_CALL_RETENTION_DEFAULT_MONTHS, AI_CALL_RETENTION_MONTHS_SCHEMA } from '../services/maintenance/aiCallRetention';
 
 dotenv.config();
 
@@ -47,6 +48,9 @@ const envSchema = z.object({
   AI_MAX_RETRIES: withDefault(wholeNumber.min(0, 'must be between 0 and 10').max(10, 'must be between 0 and 10'), 3),
   // "default": when the model supports it, a refused request is re-run server-side on Anthropic's default fallback model.
   AI_REFUSAL_FALLBACK: withDefault(z.enum(['default', 'off'], { errorMap: () => ({ message: 'must be "default" or "off"' }) }), 'default'),
+  // Months an AiCall row is kept (1-120); the worker deletes older rows every night. The schema is
+  // shared with `npm run ai-calls:prune`, which runs without this file.
+  AI_CALL_RETENTION_MONTHS: withDefault(AI_CALL_RETENTION_MONTHS_SCHEMA, AI_CALL_RETENTION_DEFAULT_MONTHS),
   VOYAGE_API_KEY: optionalString,
   VOYAGE_MODEL: withDefault(z.string(), 'voyage-4'),
 
@@ -105,6 +109,7 @@ export function parseEnv(source: EnvInput) {
     aiRequestTimeoutMs: e.AI_REQUEST_TIMEOUT_MS,
     aiMaxRetries: e.AI_MAX_RETRIES,
     aiRefusalFallback: e.AI_REFUSAL_FALLBACK,
+    aiCallRetentionMonths: e.AI_CALL_RETENTION_MONTHS,
     voyageApiKey: e.VOYAGE_API_KEY,
     voyageModel: e.VOYAGE_MODEL,
     webhookSecret: e.WEBHOOK_SECRET,

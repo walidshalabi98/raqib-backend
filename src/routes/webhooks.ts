@@ -4,6 +4,7 @@ import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { assertIndicatorsInProject } from '../middleware/access';
 import { authenticateWebhook, logWebhookRejection } from '../middleware/webhookAuth';
 import { normaliseValue } from '../services/dataPoints/validation';
+import { describeRedactions, redactQualitativeFields, redactionTotal } from '../services/qualitative/redactEntry';
 
 const router = Router();
 
@@ -77,16 +78,26 @@ router.post('/kobotoolbox', asyncHandler(async (req: Request, res: Response) => 
 
   // Store as qualitative entry if it's a qualitative submission
   if (submission._type === 'qualitative') {
-    await prisma.qualitativeEntry.create({
+    // Stored without phone numbers, ID numbers or email addresses, like typed notes (CLAUDE.md rule 5).
+    // The fallback title is ours (KoboToolbox submission ids can have 9 digits) and is not redacted;
+    // the content is the whole submission as JSON text, redacted as text.
+    const { values: text, counts } = redactQualitativeFields({
+      title: submission.title ? String(submission.title) : undefined,
+      content: JSON.stringify(submission),
+      location: submission._geolocation ? `${submission._geolocation[0]}, ${submission._geolocation[1]}` : undefined,
+    });
+    const entry = await prisma.qualitativeEntry.create({
       data: {
         projectId: project.id,
         entryType: submission.entry_type || 'field_notes',
-        title: submission.title || `KoboToolbox Submission ${submission._id}`,
-        content: JSON.stringify(submission),
-        location: submission._geolocation ? `${submission._geolocation[0]}, ${submission._geolocation[1]}` : undefined,
+        title: text.title ?? `KoboToolbox Submission ${submission._id}`,
+        content: text.content,
+        location: text.location,
         dateConducted: new Date(submission._submission_time || new Date()),
       },
     });
+    // Ids and counts only: never the submission.
+    if (redactionTotal(counts) > 0) console.log(`[Webhook] KoboToolbox qualitative entry ${entry.id}: ${describeRedactions(counts)}`);
 
     res.json({ message: 'Qualitative entry created from KoboToolbox' });
     return;

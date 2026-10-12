@@ -635,12 +635,32 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
 
       const reports = await prisma.report.findMany({ where: { projectId: seed.project.id } });
       expect(reports).toHaveLength(1);
-      expect(reports[0]).toMatchObject({ type: 'quarterly_summary', status: 'draft', title: `AI Midterm Assessment — ${seed.project.name}` });
+      expect(reports[0]).toMatchObject({ type: 'assessment_report', status: 'draft', title: `AI Midterm Assessment — ${seed.project.name}` });
       expect(reports[0].aiNarrative!.match(/<script/g)).toBeNull();
       expect(reports[0].aiNarrative).toContain(`The project is partly on track. ${ESCAPED_SCRIPT}`);
 
       const notifications = await prisma.notification.findMany({ where: { userId: { in: [seed.admin.id, seed.officer.id] } } });
       expect(notifications).toEqual([expect.objectContaining({ userId: seed.admin.id, type: 'assessment_ready', link: `/projects/${seed.project.id}/assessments` })]);
+    });
+
+    it('creates an assessment report for every assessment type and leaves existing reports as they are', async () => {
+      const seed = await seedAssessment();
+      // A midterm report generated before every assessment became an assessment_report.
+      const earlier = await prisma.report.create({ data: { projectId: seed.project.id, type: 'quarterly_summary', title: `AI Midterm Assessment — ${seed.project.name}` } });
+      mocks.generateStructured.mockResolvedValue(structuredResult(ANSWER, ASSESSMENT_PROMPT_VERSION, MAIN_MODEL));
+      vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const types = ['baseline', 'midterm', 'endline', 'fgd_round', 'kii_round', 'observation_round', 'survey_round'] as const;
+
+      for (const type of types) {
+        const assessment = await prisma.assessment.create({ data: { projectId: seed.project.id, type, methodsIncluded: [] } });
+        await generateAutoAssessment(assessment.id, seed.project.id, type);
+      }
+
+      const reports = await prisma.report.findMany({ where: { projectId: seed.project.id, id: { not: earlier.id } } });
+      expect(reports).toHaveLength(types.length);
+      expect(reports.map(r => r.type)).toEqual(types.map(() => 'assessment_report'));
+      expect(reports.map(r => r.title)).toEqual(expect.arrayContaining(['Baseline', 'Midterm', 'Endline'].map(t => `AI ${t} Assessment — ${seed.project.name}`)));
+      expect(await prisma.report.findUniqueOrThrow({ where: { id: earlier.id } })).toMatchObject({ type: 'quarterly_summary', title: earlier.title });
     });
 
     it('keeps the assessment in analysis with a safe message when the AI call fails', async () => {

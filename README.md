@@ -50,6 +50,7 @@ Optional AI settings (defaults in brackets):
 | `AI_REQUEST_TIMEOUT_MS` | timeout per AI request, at least 1000 [`60000`]; framework and report calls use longer ones |
 | `AI_MAX_RETRIES` | retries after rate limits, overloads, server and network errors, 0–10 [`3`] |
 | `AI_REFUSAL_FALLBACK` | `default`: a refused request is re-run on Anthropic's fallback model (Sonnet 5.5, Opus 5, Opus 5.5); `off`: refusals are errors [`default`] |
+| `AI_CALL_RETENTION_MONTHS` | months an AiCall log row is kept, 1–120; the worker deletes older rows every night at 02:30 Asia/Hebron [`24`] |
 | `VOYAGE_API_KEY` | embeddings for the indicator library; without it search uses keywords [empty] |
 | `VOYAGE_MODEL` | Voyage embedding model [`voyage-4`] |
 
@@ -57,7 +58,7 @@ Everything else is optional and documented in `.env.example`. Security-related s
 
 ## AI layer
 
-All model calls go through `src/services/ai/client.ts` (`generateStructured`): services pick a tier (`main` or `fast`), never a model id. Every call uses structured outputs validated again with zod, sends the shared system prompt (role + `knowledge/me-foundations.md` §1–12, prompt-cached), retries rate limits and server errors, retries a cut-off answer once, turns refusals into typed errors, and writes one `AiCall` row (tokens, latency, estimated cost; never prompt or answer text). Document text is redacted (phone numbers, ID numbers, email addresses) before it is stored or sent. Details, prompt versions and privacy limits: [`docs/AI.md`](docs/AI.md).
+All model calls go through `src/services/ai/client.ts` (`generateStructured`): services pick a tier (`main` or `fast`), never a model id. Every call uses structured outputs validated again with zod, sends the shared system prompt (role + `knowledge/me-foundations.md` §1–12, prompt-cached), retries rate limits and server errors, retries a cut-off answer once, turns refusals into typed errors, and writes one `AiCall` row (tokens, latency, estimated cost; never prompt or answer text). Document text and qualitative notes are redacted (phone numbers, ID numbers, email addresses) before they are stored or sent; AiCall rows are deleted after 24 months. Details, prompt versions and privacy limits: [`docs/AI.md`](docs/AI.md).
 
 ## Commands
 
@@ -76,6 +77,8 @@ All model calls go through `src/services/ai/client.ts` (`generateStructured`): s
 | `npm run ai:smoke -- --yes` | **calls the real Anthropic API and costs money** (one or two main-tier calls): generates a framework for the dev seed project (or `--project <id>`) on a development database and prints the indicators, the fields still to be confirmed and the AiCall rows. Needs a real `ANTHROPIC_API_KEY`; refuses in production and unless `DATABASE_URL` is local or names a `dev`/`test` database (`--i-know-this-is-not-shared` overrides); adds a framework version it never deletes. See [`docs/AI.md`](docs/AI.md) §10 |
 | `npm run storage:setup` | create the private Supabase Storage bucket |
 | `npm run storage:migrate` | move pre-Phase-0 files from `uploads/` to private storage (dry run; add `-- --apply`) |
+| `npm run ai-calls:prune` | shows the AiCall retention cutoff and how many rows are older (dry run); `-- --apply` deletes them in batches of 5000. Needs only `DATABASE_URL` (and optionally `AI_CALL_RETENTION_MONTHS`); prints numbers only. The worker does the same every night |
+| `npm run redact:backfill` | one-off: removes phone numbers, ID numbers and email addresses from text stored before Phase 3 (`Document.parsedText`, string values of `Document.aiAnalysis`). Dry run with totals; `-- --apply` writes (take a backup first); `-- --include-qualitative` also existing qualitative entries (approved by the owner for the shared database); `-- --verbose` adds row ids. Needs only `DATABASE_URL` and the Phase 3 SQL; a second run changes nothing; prints totals and ids only. See [`docs/AI.md`](docs/AI.md) §9 |
 
 ## Tests
 
@@ -105,6 +108,8 @@ src/
   services/ai/      AI client, prompts, redaction, embeddings and features (see docs/AI.md)
   services/library  indicator library loading, seeding and embedding
   services/storage  private file storage (Supabase / local)
+  services/qualitative  redaction of qualitative entries when they are saved
+  services/maintenance  AiCall retention and the stored-text backfill (run without the API environment)
   jobs/             BullMQ queues and worker
 prisma/             schema, seed, reviewed SQL for shared databases
 knowledge/          M&E rules, indicator library, KPI Assistant spec and eval cases

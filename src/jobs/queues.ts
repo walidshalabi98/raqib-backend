@@ -1,11 +1,13 @@
 import { Queue } from 'bullmq';
 import { redis } from '../config/redis';
+import { MAINTENANCE_QUEUE } from '../services/maintenance/aiCallRetention';
 
 let documentParsingQueue: Queue;
 let frameworkQueue: Queue;
 let indicatorQueue: Queue;
 let reportQueue: Queue;
 let qualitativeQueue: Queue;
+let maintenanceQueue: Queue;
 
 export function getDocumentParsingQueue(): Queue {
   if (!documentParsingQueue) {
@@ -40,4 +42,12 @@ export function getQualitativeQueue(): Queue {
     qualitativeQueue = new Queue('qualitative-coding', { connection: redis });
   }
   return qualitativeQueue;
+}
+
+/** Scheduled housekeeping jobs (the nightly 'prune-ai-calls'); the worker registers the schedule. */
+export function getMaintenanceQueue(): Queue {
+  if (!maintenanceQueue) {
+    maintenanceQueue = new Queue(MAINTENANCE_QUEUE, { connection: redis });
+  }
+  return maintenanceQueue;
 }

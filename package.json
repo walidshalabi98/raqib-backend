@@ -19,7 +19,9 @@
     "lint": "eslint .",
     "seed:library": "tsx scripts/seed-library.ts",
     "verify:migration": "scripts/verify-migrations.sh",
-    "ai:smoke": "tsx scripts/ai-smoke.ts"
+    "ai:smoke": "tsx scripts/ai-smoke.ts",
+    "ai-calls:prune": "tsx scripts/prune-ai-calls.ts",
+    "redact:backfill": "tsx scripts/redact-stored-text.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.133.0",

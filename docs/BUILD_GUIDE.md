@@ -227,6 +227,8 @@ Read `docs/UX_STANDARDS.md` (frontend repo) and apply it. Main work:
 7. **Arabic and RTL**: full translation files (`src/i18n/en.json`, `src/i18n/ar.json`), `dir="rtl"` on the root when Arabic is selected, logical CSS properties, an Arabic-capable font, Arabic number formatting option.
 8. **Help in place**: a glossary popover on M&E terms (indicator, baseline, means of verification, disaggregation…) using text from `me-foundations.md` §1.
 9. **Empty states and loading**: every list has a helpful empty state with the next action; skeletons instead of spinners; optimistic updates with undo for deletions.
+10. **Retry a failed AI assessment**: a backend endpoint that runs the AI generation again for an assessment left in `analysis` with "AI generation failed", and a "Try again" button next to that message (owner decision, 12 October 2026).
+11. **Upgrade Tailwind** to version 4 (and drop `lovable-tagger` if it still needs Tailwind 3), which clears the 5 high `npm audit` findings in Tailwind 3's file-watcher chain accepted until then.
 
 Acceptance criteria:
 
@@ -316,7 +318,7 @@ Also: org isolation (user A cannot open user B's project URL), donor viewer cann
 
 ### 7.4 Pre-release checklist
 
-- [ ] CI green in both repos; no high/critical `npm audit` findings
+- [ ] CI green in both repos; no high/critical `npm audit` findings (until Phase 6, except the 5 accepted frontend findings in Tailwind 3's file-watcher chain, §10)
 - [ ] Migrations tested on a copy of production data
 - [ ] `eval:kpi` meets targets
 - [ ] Arabic screens reviewed by a native speaker
@@ -377,8 +379,15 @@ Decisions already made (12 October 2026):
 
 - **Project status:** M&E officers may change a project's status (as well as org admins).
 - **Arabic review:** Walid reviews the Arabic text of every UI and AI pull request.
-- **Migration rehearsal data:** Supabase development branches use made-up data (the dev seed), never copied beneficiary data.
+- **Migration rehearsal data:** Supabase development branches use made-up data (the dev seed), never copied beneficiary data. On the free plan (no branches) the rehearsal uses a throwaway Supabase project with the same made-up data (`docs/DATA_MODEL.md` §9).
 - **Dropdowns:** keep both the native select (data-entry forms) and the Radix Select (elsewhere); every dropdown must work on phones (375 px, touch), with a keyboard and in Arabic.
+- **Backfill of stored text:** yes — a one-off script removes phone numbers, ID numbers and email addresses from text stored before Phase 3 (`Document.parsedText`, `Document.aiAnalysis`); it is a dry run unless `--apply` is given (`npm run redact:backfill`).
+- **AI call log retention:** `AiCall` rows are kept for 24 months, then deleted by a nightly job (`AI_CALL_RETENTION_MONTHS`).
+- **Qualitative notes:** typed notes are redacted when they are saved, not only before AI calls; the backfill also cleans existing notes (`--include-qualitative`).
+- **Midterm assessments** create an `assessment_report` report, like every other assessment type (not `quarterly_summary`).
+- **Verified targets:** keep the wording "Found in the document text".
+- **Failed AI assessments:** Phase 6 adds a retry (backend endpoint and button).
+- **Frontend `npm audit`:** the 5 high findings in Tailwind 3's dev-only file-watcher chain are accepted until Tailwind is upgraded in Phase 6.
 
 ---
 
@@ -386,10 +395,10 @@ Decisions already made (12 October 2026):
 
 | Phase | Status | PR | Notes |
 |---|---|---|---|
-| 0 Safety | Merged (SQL pending) | backend #2, frontend #2 | `WebhookToken` SQL not yet applied to Supabase (project paused); the storage module missing from backend #2 is added in backend #3. |
-| 1 Build | Done | backend #3, frontend #3 | Frontend `npm audit` keeps 5 high findings in Tailwind 3's file-watcher chain (no patched `braces` exists; `lovable-tagger` needs Tailwind 3) — decision needed. Lint has 62 `no-explicit-any` warnings until typed API models (Phase 2). |
-| 2 Data model | Merged (SQL pending) | backend #4, frontend #4 | `prisma/sql/2026-10-11_phase2_data_model.sql` not yet applied to Supabase (project paused; verified locally with `npm run verify:migration`); rehearse on a development branch with the dev seed. Arabic strings: Walid to review. |
-| 3 AI foundation | In review | backend #5, frontend #5 | `prisma/sql/2026-10-12_phase3_ai_foundation.sql` (AiCall table, Document.aiAnalysis) not yet applied to Supabase; apply after the Phase 0 and Phase 2 SQL. The real-API smoke test (`npm run ai:smoke`) needs an Anthropic key. |
+| 0 Safety | Merged (SQL applied) | backend #2, frontend #2 | `WebhookToken` SQL applied to the shared Supabase database on 12 October 2026, with the owner's approval, after a rehearsal on a throwaway project (`docs/DATA_MODEL.md` §9); the storage module missing from backend #2 is added in backend #3. |
+| 1 Build | Done | backend #3, frontend #3 | Frontend `npm audit` keeps 5 high findings in Tailwind 3's file-watcher chain (no patched `braces` exists; `lovable-tagger` needs Tailwind 3) — accepted by the owner until the Tailwind upgrade in Phase 6. Lint has 62 `no-explicit-any` warnings until typed API models (Phase 2). |
+| 2 Data model | Merged (SQL applied) | backend #4, frontend #4 | `prisma/sql/2026-10-11_phase2_data_model.sql` applied to the shared Supabase database on 12 October 2026 (verified locally with `npm run verify:migration`, rehearsed with the dev seed). The indicator library is loaded with `npm run seed:library` when the API is deployed. Arabic strings: Walid to review. |
+| 3 AI foundation | Merged (SQL applied) | backend #5, frontend #5 | `prisma/sql/2026-10-12_phase3_ai_foundation.sql` (AiCall table, Document.aiAnalysis) applied to the shared Supabase database on 12 October 2026; when the API is deployed, run `npm run redact:backfill -- --include-qualitative` (`docs/DATA_MODEL.md` §9). The real-API smoke test (`npm run ai:smoke`) waits for an Anthropic key, which the owner will add later. Follow-up for the 12 October decisions (notes redacted when saved, the backfill script, 24-month `AiCall` retention, midterm assessment report type): in review. |
 | 4 KPI Assistant | Not started | | |
 | 5 Active Monitoring | Not started | | |
 | 6 Experience | Not started | | |

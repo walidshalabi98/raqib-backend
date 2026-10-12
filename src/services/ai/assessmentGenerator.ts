@@ -130,7 +130,7 @@ export async function generateAutoAssessment(
       await tx.report.create({
         data: {
           projectId,
-          type: assessmentType === 'baseline' ? 'assessment_report' : assessmentType === 'midterm' ? 'quarterly_summary' : 'assessment_report',
+          type: 'assessment_report', // for every assessment type, midterm included
           title: `AI ${capitalise(assessmentType)} Assessment — ${input.project.name}`,
           aiNarrative: html,
           status: 'draft',

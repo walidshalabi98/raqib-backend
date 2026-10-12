@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseEnv } from '../src/config/env';
+import { aiCallPruneSettings } from '../src/services/maintenance/aiCallRetention';
 
 const valid = {
   DATABASE_URL: 'postgresql://u:p@localhost:5432/raqib',
@@ -114,5 +115,49 @@ describe('AI client settings', () => {
     ['AI_REFUSAL_FALLBACK', 'on', /AI_REFUSAL_FALLBACK: must be "default" or "off"/],
   ])('refuses %s=%s', (name, value, message) => {
     expect(() => parseEnv({ ...valid, [name]: value })).toThrow(message);
+  });
+});
+
+describe('AiCall retention setting', () => {
+  it('keeps AiCall rows for 24 months by default, also for a blank value', () => {
+    expect(parseEnv(valid).aiCallRetentionMonths).toBe(24);
+    expect(parseEnv({ ...valid, AI_CALL_RETENTION_MONTHS: '' }).aiCallRetentionMonths).toBe(24);
+    expect(parseEnv({ ...valid, AI_CALL_RETENTION_MONTHS: '  ' }).aiCallRetentionMonths).toBe(24);
+  });
+
+  it.each([['1', 1], [' 36 ', 36], ['120', 120]])('reads AI_CALL_RETENTION_MONTHS=%s', (value, months) => {
+    expect(parseEnv({ ...valid, AI_CALL_RETENTION_MONTHS: value }).aiCallRetentionMonths).toBe(months);
+  });
+
+  it.each([
+    ['0', /AI_CALL_RETENTION_MONTHS: must be between 1 and 120/],
+    ['-6', /AI_CALL_RETENTION_MONTHS: must be between 1 and 120/],
+    ['121', /AI_CALL_RETENTION_MONTHS: must be between 1 and 120/],
+    ['12.5', /AI_CALL_RETENTION_MONTHS: must be a whole number/],
+    ['two years', /AI_CALL_RETENTION_MONTHS: must be a number/],
+  ])('refuses AI_CALL_RETENTION_MONTHS=%s', (value, message) => {
+    expect(() => parseEnv({ ...valid, AI_CALL_RETENTION_MONTHS: value })).toThrow(message);
+  });
+
+  it.each([undefined, '', ' ', '1', '24', ' 60 ', '120', '0', '121', '12.5', 'two years'])(
+    'npm run ai-calls:prune reads AI_CALL_RETENTION_MONTHS=%j like the API',
+    value => {
+      const cli = () => aiCallPruneSettings({ DATABASE_URL: valid.DATABASE_URL, AI_CALL_RETENTION_MONTHS: value });
+      const api = () => parseEnv({ ...valid, AI_CALL_RETENTION_MONTHS: value });
+      let apiMonths: number | undefined;
+      try {
+        apiMonths = api().aiCallRetentionMonths;
+      } catch (err) {
+        const message = /AI_CALL_RETENTION_MONTHS: (.*)/.exec((err as Error).message)![1];
+        expect(cli).toThrow(`AI_CALL_RETENTION_MONTHS ${message}`);
+        return;
+      }
+      expect(cli().months).toBe(apiMonths);
+    },
+  );
+
+  it('the prune script needs DATABASE_URL but none of the API secrets', () => {
+    expect(aiCallPruneSettings({ DATABASE_URL: valid.DATABASE_URL })).toEqual({ months: 24 });
+    expect(() => aiCallPruneSettings({ DATABASE_URL: ' ' })).toThrow(/DATABASE_URL is required/);
   });
 });
