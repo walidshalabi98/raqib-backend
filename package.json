@@ -21,7 +21,7 @@
     "verify:migration": "scripts/verify-phase2-migration.sh"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
+    "@anthropic-ai/sdk": "^0.133.0",
     "@prisma/client": "^6.19.3",
     "@react-pdf/renderer": "^4.3.0",
     "@supabase/supabase-js": "^2.117.3",

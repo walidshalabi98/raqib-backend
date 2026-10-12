@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { prisma } from '../../config/prisma';
 import { env } from '../../config/env';
-import { SYSTEM_CONTEXT } from './prompts';
+import { SYSTEM_CONTEXT } from './prompts/system';
 
 const anthropic = new Anthropic({ apiKey: env.anthropicApiKey });
 

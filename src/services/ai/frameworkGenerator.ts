@@ -2,13 +2,13 @@ import Anthropic from '@anthropic-ai/sdk';
 import { IndicatorLevel, Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { env } from '../../config/env';
+import { SYSTEM_CONTEXT } from './prompts/system';
 import {
-  SYSTEM_CONTEXT,
   FRAMEWORK_PROMPT_VERSION,
   FrameworkProjectInfo,
   extractProjectStructurePrompt,
   generateFrameworkPrompt,
-} from './prompts';
+} from './prompts/framework';
 import {
   LibraryEntryReference,
   ProjectStructure,

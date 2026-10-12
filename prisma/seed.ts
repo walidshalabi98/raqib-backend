@@ -1,6 +1,6 @@
 import { CollectionMethod, IndicatorLevel, Prisma, PrismaClient } from '@prisma/client';
 import bcrypt from 'bcrypt';
-import { FRAMEWORK_PROMPT_VERSION } from '../src/services/ai/prompts';
+import { FRAMEWORK_PROMPT_VERSION } from '../src/services/ai/prompts/framework';
 import { seedLibrary } from '../src/services/library/seed';
 
 const prisma = new PrismaClient();

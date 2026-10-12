@@ -1,5 +1,5 @@
 import { CollectionMethod, Frequency, IndicatorDirection, IndicatorLevel, Prisma, Sector } from '@prisma/client';
-import { FRAMEWORK_PROMPT_VERSION } from './prompts';
+import { FRAMEWORK_PROMPT_VERSION } from './prompts/framework';
 
 /**
  * Pure helpers for the AI framework generator (BUILD_GUIDE Phase 2 task 7).

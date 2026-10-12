@@ -35,7 +35,7 @@ import {
   structureForPrompt,
   withLibrarySexDisaggregation,
 } from '../src/services/ai/frameworkNormalize';
-import { FRAMEWORK_PROMPT_VERSION, extractProjectStructurePrompt, generateFrameworkPrompt } from '../src/services/ai/prompts';
+import { FRAMEWORK_PROMPT_VERSION, extractProjectStructurePrompt, generateFrameworkPrompt } from '../src/services/ai/prompts/framework';
 import { prisma } from '../src/config/prisma';
 import { DEFAULT_LIBRARY_PATH } from '../src/services/library/load';
 import { hasTestDatabase, resetDatabase } from './helpers';
