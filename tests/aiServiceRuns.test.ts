@@ -722,7 +722,8 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
       expect(report.aiNarrative).toContain('Check these figures: 350 — not found in the data provided');
       const lines = log.mock.calls.map(args => args.join(' ')).join('\n');
       expect(lines).toContain('2 unverified figures');
-      expect(lines).not.toContain('350');
+      // Random record ids in the log line can contain "350"; the figure itself must not appear.
+      expect(lines.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<id>')).not.toContain('350');
     });
 
     it('marks the assessment failed with a safe message when gathering the data fails, without calling the model', async () => {
