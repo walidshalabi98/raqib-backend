@@ -7,7 +7,7 @@
 --
 -- DDL generated with:
 --   prisma migrate diff --from-schema-datamodel <schema at 022e09a> --to-schema-datamodel prisma/schema.prisma --script
--- Changes to the generated DDL (none of them changes the resulting schema; scripts/verify-phase2-migration.sh
+-- Changes to the generated DDL (none of them changes the resulting schema; scripts/verify-migrations.sh
 -- checks that `prisma migrate diff --from-url <db> --to-schema-datamodel prisma/schema.prisma` reports no drift):
 --   * the enum ADD VALUE statements come first, outside the transaction, with IF NOT EXISTS so that a re-run after
 --     a failed attempt is safe (Postgres cannot use a newly added enum value in the transaction that added it);
@@ -17,7 +17,7 @@
 -- How to run (see docs/DATA_MODEL.md): on a Supabase development branch first, then on the shared database:
 --   psql "$DIRECT_URL" -v ON_ERROR_STOP=1 -f prisma/sql/2026-10-11_phase2_data_model.sql
 -- Do not add --single-transaction (the file manages its own transaction). Then run `npm run seed:library`.
--- Proven locally on a fresh database and on a copy of the seed by scripts/verify-phase2-migration.sh.
+-- Proven locally on a fresh database and on a copy of the seed by scripts/verify-migrations.sh.
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- 1. New enum values (outside the transaction)

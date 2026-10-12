@@ -66,3 +66,58 @@ jobs:
 
       - name: Audit dependencies
         run: npm audit --audit-level=high
+
+  # The reviewed SQL files in prisma/sql are what shared and Supabase databases get (docs/DATA_MODEL.md §9); the tests
+  # above use `prisma db push`. This job proves the SQL against throwaway databases on its own Postgres service
+  # (scripts/verify-migrations.sh): no drift from prisma/schema.prisma, data kept, guards, self-checks, lock_timeout,
+  # pgvector in an `extensions` schema as on Supabase.
+  migrations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: raqib
+          POSTGRES_PASSWORD: raqib
+          POSTGRES_DB: raqib_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U raqib -d raqib_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Disposable CI server; the script creates and drops its own raqib_mverify_*_test databases on it.
+      VERIFY_PG_BASE_URL: postgresql://raqib:raqib@localhost:5432
+
+    steps:
+      # Full history: the script reads the schema and seed at BASE_REV, PHASE2_REV and PRE_PHASE0_REV.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install psql
+        run: |
+          if ! command -v psql >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+          psql --version
+
+      - name: Install
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Verify the SQL migrations
+        run: npm run verify:migration

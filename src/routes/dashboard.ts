@@ -8,14 +8,16 @@ import { analyzeProjectRisks } from '../services/ai/riskAnalyzer';
 
 const router = Router();
 
+// The current framework of a project: the newest version whose AI generation did not fail.
+const CURRENT_FRAMEWORK = { where: { generationError: null }, orderBy: { version: 'desc' }, take: 1 } as const;
+
 // GET /api/projects/:id/dashboard — Aggregated dashboard data
 router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
       frameworks: {
-        orderBy: { version: 'desc' },
-        take: 1,
+        ...CURRENT_FRAMEWORK,
         include: {
           indicators: {
             include: {
@@ -129,10 +131,9 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
     where: { organizationId: orgId },
     include: {
       frameworks: {
-        orderBy: { version: 'desc' },
-        take: 1,
+        ...CURRENT_FRAMEWORK,
         include: {
-          indicators: { select: { status: true } },
+          indicators: { select: { id: true, indicatorText: true, status: true } },
         },
       },
       _count: { select: { assessments: true, reports: true, dataPoints: true } },
@@ -165,27 +166,18 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
     };
   });
 
-  // Off-track alerts
-  const offTrackIndicators = await prisma.indicator.findMany({
-    where: {
-      status: 'off_track',
-      framework: { project: { organizationId: orgId } },
-    },
-    include: {
-      framework: { include: { project: { select: { name: true } } } },
-    },
-    take: 10,
-  });
+  // Off-track alerts: indicators of each project's current framework only (never of older or failed versions).
+  const alerts = projects
+    .flatMap(p => (p.frameworks[0]?.indicators ?? [])
+      .filter(ind => ind.status === 'off_track')
+      .map(ind => ({ indicatorId: ind.id, indicatorText: ind.indicatorText, projectName: p.name })))
+    .slice(0, 10);
 
   res.json({
     totalProjects: projects.length,
     activeProjects: projects.filter(p => p.status === 'active').length,
     projects: summary,
-    alerts: offTrackIndicators.map(ind => ({
-      indicatorId: ind.id,
-      indicatorText: ind.indicatorText,
-      projectName: ind.framework.project.name,
-    })),
+    alerts,
   });
 }));
 

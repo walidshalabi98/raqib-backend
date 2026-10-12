@@ -5,6 +5,7 @@ import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { generateReportNarrative } from '../services/ai/reportNarrative';
+import { safeErrorSummary } from '../services/ai/errors';
 
 const router = Router();
 
@@ -39,7 +40,7 @@ router.post('/projects/:id/reports/generate', authenticate, authorize('org_admin
 
   // Generate report async inline (no Redis needed)
   generateReportNarrative(report.id, req.params.id).catch(err => {
-    console.error('Report generation failed:', err.message);
+    console.error(`Report generation failed for ${report.id}: ${safeErrorSummary(err)}`);
   });
 
   res.status(202).json({ reportId: report.id, status: 'processing' });

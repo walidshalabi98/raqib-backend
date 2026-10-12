@@ -1,5 +1,7 @@
 import { CollectionMethod, Frequency, IndicatorDirection, IndicatorLevel, Prisma, Sector } from '@prisma/client';
-import { FRAMEWORK_PROMPT_VERSION } from './prompts';
+import { ECHO_INDICATOR_CAP } from './prompts/donors';
+import { FRAMEWORK_PROMPT_VERSION } from './prompts/framework';
+import { redactPersonalData } from './redact';
 
 /**
  * Pure helpers for the AI framework generator (BUILD_GUIDE Phase 2 task 7).
@@ -16,7 +18,17 @@ export const TO_BE_CONFIRMED = 'To be confirmed by the M&E officer';
 /** Used when the model gives no target-setting method. Never a number (me-foundations.md §6). */
 export const DEFAULT_TARGET_METHOD = 'set after the baseline survey, using comparable programmes';
 
-/** Marker after which the document parser appends the model's own analysis to Document.parsedText (documentParser.ts). */
+/** Appended to baselineMethod when the baseline date is unknown (me-foundations.md §3: baseline value, date and method). */
+export const BASELINE_DATE_TO_BE_CONFIRMED = 'Baseline date: to be confirmed.';
+
+/** Appended to targetJustification when no intermediate target is known (me-foundations.md §3: final and intermediate targets). */
+export const INTERMEDIATE_TARGETS_TO_BE_CONFIRMED = 'Intermediate targets: to be confirmed after the baseline.';
+
+/**
+ * Marker after which the pre-Phase 3 document parser appended the model's own analysis to
+ * Document.parsedText. New analyses are stored in Document.aiAnalysis (StoredDocumentAnalysis in
+ * prompts/documentAnalysis.ts); the marker now appears only in legacy rows.
+ */
 export const AI_ANALYSIS_MARKER = '---AI_ANALYSIS---';
 
 // Field limits match the indicator and result validation of the REST API.
@@ -41,6 +53,7 @@ const LIMITS = {
   disaggregationKeys: 20,
   phase: 50,
   phases: 20,
+  intermediateTargets: 20,
   milestoneLabel: 300,
   milestones: 100,
   structureList: 30,
@@ -82,6 +95,30 @@ function orNull(value: string): string | null {
 function textList(value: unknown, max: number): string[] {
   if (!Array.isArray(value)) return [];
   return value.map(text).filter(Boolean).slice(0, max);
+}
+
+/**
+ * A shallow copy without unknown values: "" (the structured-output answer's "unknown"), null and
+ * blank list items are dropped, and so are lists left empty. The prompt then shows known facts only.
+ */
+function compactObject(value: Json): Json {
+  const out: Json = {};
+  for (const [key, v] of Object.entries(value)) {
+    if (Array.isArray(v)) {
+      const items = v.filter(item => item !== null && item !== undefined && !(typeof item === 'string' && item.trim() === ''));
+      if (items.length > 0) out[key] = items;
+    } else if (v !== null && v !== undefined && !(typeof v === 'string' && v.trim() === '')) {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+/** The compacted object, or null when nothing known is left. */
+function compactOrNull(value: unknown): Json | null {
+  if (!isObject(value)) return null;
+  const compact = compactObject(value);
+  return Object.keys(compact).length > 0 ? compact : null;
 }
 
 const enumKey = (value: string) => value.trim().toLowerCase().replace(/[\s\-/]+/g, '_');
@@ -257,13 +294,15 @@ function statement(parts: { text: string; textAr: string }, code: string): Resul
 
 /**
  * Normalises the model's project structure into a coded results chain.
- * Accepts the coded format asked for by extractProjectStructurePrompt and the
- * older uncoded one (goal as a string, outcomes/outputs/activities as text).
+ * Accepts the structured-output answer (PROJECT_STRUCTURE_SCHEMA in prompts/framework.ts)
+ * and the older uncoded format (goal as a string, outcomes/outputs/activities as text).
  * Codes the model gave are kept when unique; otherwise G, O1, O1.1 and A1.1.1
- * (activities) are assigned. Returns null when there is neither a goal nor an outcome.
+ * (activities) are assigned. "" means unknown: empty statements are dropped, and
+ * beneficiaries and timeline keep only known values. Returns null when there is
+ * neither a goal nor an outcome.
  *
- * When documentTexts are given, documentFigures whose value does not appear in
- * any document are dropped (see appearsInDocuments).
+ * When documentTexts are given, documentFigures that the documents do not support are
+ * dropped (see verifyDocumentFigures: the quote must be found and must contain the value).
  */
 export function normalizeProjectStructure(raw: unknown, options: { documentTexts?: readonly string[] } = {}): ProjectStructure | null {
   if (!isObject(raw)) return null;
@@ -313,18 +352,22 @@ export function normalizeProjectStructure(raw: unknown, options: { documentTexts
         quote: clip(text(f.quote), 500),
       };
     })
-    .filter((f): f is DocumentFigure => f !== null)
-    .filter(f => !options.documentTexts || appearsInDocuments(f.value, options.documentTexts))
+    .filter((f): f is DocumentFigure => f !== null);
+  const evidence = options.documentTexts ? normalisedDocuments(options.documentTexts.map((t, i) => ({ fileName: String(i + 1), text: t }))) : null;
+  const documentFigures = figures
+    .filter(f => evidence === null || figureSource(f, evidence) !== null)
     .slice(0, LIMITS.documentFigures);
 
+  const beneficiaries = compactOrNull(raw.beneficiaries);
+  const timeline = compactOrNull(raw.timeline);
   return {
     goal,
     outcomes,
-    ...(isObject(raw.beneficiaries) && { beneficiaries: raw.beneficiaries }),
-    ...(isObject(raw.timeline) && { timeline: raw.timeline }),
+    ...(beneficiaries && { beneficiaries }),
+    ...(timeline && { timeline }),
     donorRequirements: textList(raw.donorRequirements, LIMITS.structureList),
     crossCuttingThemes: textList(raw.crossCuttingThemes, LIMITS.structureList),
-    documentFigures: figures,
+    documentFigures,
   };
 }
 
@@ -408,7 +451,7 @@ const SECTOR_LABELS: Record<Sector, { en: string; ar: string }> = {
 
 const DONOR_REQUIREMENTS: Record<string, string[]> = {
   eu: ['GERF Level 2 indicators first, then other OPSYS indicators', 'Sex disaggregation for people-count indicators', 'Results matrix alignment', 'Gender Action Plan III alignment'],
-  echo: ['Compulsory Key Result Indicators per sub-sector', 'At most 3 indicators per sub-sector (4 with one justified custom indicator)', 'Baseline compulsory (at the latest in the interim report)', 'Specific source and method of verification'],
+  echo: ['Compulsory Key Result Indicators per sub-sector', `${ECHO_INDICATOR_CAP.charAt(0).toUpperCase()}${ECHO_INDICATOR_CAP.slice(1)}`, 'Baseline compulsory (at the latest in the interim report)', 'Specific source and method of verification'],
   usaid: ['Legacy award: USAID-era indicator reference sheets may still apply', 'Gender analysis', 'Do No Harm assessment'],
   giz: ['Results-based monitoring', 'Capacity development tracking', 'Sustainability indicators'],
   undp: ['UNDP Strategic Plan and SDG alignment', 'Human development indicators'],
@@ -587,38 +630,65 @@ export function libraryEntryTexts(entry: LibraryEntryReference): string[] {
 
 const DIGIT = /\d/;
 
+/**
+ * Text as compared by the document checks: NFKC, ASCII digits for Arabic-Indic and Extended
+ * Arabic-Indic digits, the Arabic decimal separator (٫) as ".", the Arabic thousands separator (٬)
+ * and the Arabic comma (،) as ",", the Arabic percent sign (٪) as "%", typographic quotes and dashes
+ * as ASCII, single spaces, no space before "%", lower case. "١٢٬٠٠٠" and "12,000" then compare equal.
+ */
 function normaliseForMatch(value: string): string {
   return value
     .normalize('NFKC')
     .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660)) // Arabic-Indic digits
     .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06F0)) // Extended Arabic-Indic digits
     .replace(/٫/g, '.')
+    .replace(/[٬،]/g, ',')
+    .replace(/٪/g, '%')
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"')
+    .replace(/[‐‑‒–—―]/g, '-')
     .replace(/\s+/g, ' ')
     .replace(/ %/g, '%')
     .toLowerCase();
 }
 
 /**
- * The document's own text: everything before the first AI analysis marker. The analysis the
- * parser appends is model output and must never "prove" a baseline or target (me-foundations.md §6).
+ * The document's own text: everything before the LAST AI analysis marker. The pre-Phase 3 parser
+ * appended one marker and its analysis at the end of the text; that analysis is model output and
+ * must never "prove" a baseline or target (me-foundations.md §6). A marker quoted earlier in the
+ * document belongs to the document's own text and is kept (the legacy migration splits the same way).
  */
 export function stripAiAnalysis(parsedText: string): string {
-  const at = parsedText.indexOf(AI_ANALYSIS_MARKER);
+  const at = parsedText.lastIndexOf(AI_ANALYSIS_MARKER);
   return at === -1 ? parsedText : parsedText.slice(0, at).trimEnd();
 }
 
-/** A project document's file name and its own text (see stripAiAnalysis). */
+/**
+ * A document's own text for prompts and evidence: the parser's AI analysis is cut off (model output
+ * must never "prove" a baseline or target), then phone numbers, ID numbers and email addresses are
+ * removed (CLAUDE.md rule 5). The parser already redacts what it stores; rows parsed before Phase 3
+ * may not be redacted, so this runs again. `removed` counts the matches (safe to log).
+ */
+export function documentTextForAi(parsedText: string | null | undefined): { text: string; removed: number } {
+  const { text: redacted, counts } = redactPersonalData(stripAiAnalysis(parsedText ?? ''));
+  return { text: redacted, removed: counts.phone + counts.idNumber + counts.email };
+}
+
+/** A project document's file name and its own text (see documentTextForAi). */
 export interface SourceDocument {
   fileName: string;
   text: string;
 }
 
+/** Characters that join digit groups into one number: decimal and thousands separators (ASCII and Arabic). */
+const NUMBER_JOINERS = new Set(['.', ',', '٫', '٬']);
+
 function partOfLargerNumber(haystack: string, start: number, end: number): boolean {
   const before = haystack[start - 1] ?? '';
   const after = haystack[end] ?? '';
   if (DIGIT.test(before) || DIGIT.test(after)) return true;
-  if ((before === '.' || before === ',') && DIGIT.test(haystack[start - 2] ?? '')) return true;
-  if ((after === '.' || after === ',') && DIGIT.test(haystack[end + 1] ?? '')) return true;
+  if (NUMBER_JOINERS.has(before) && DIGIT.test(haystack[start - 2] ?? '')) return true;
+  if (NUMBER_JOINERS.has(after) && DIGIT.test(haystack[end + 1] ?? '')) return true;
   return false;
 }
 
@@ -652,6 +722,98 @@ export function appearsInDocuments(value: string, documentTexts: readonly string
 export function findSourceDocument(value: string, documents: readonly SourceDocument[]): SourceDocument | null {
   const needle = matchNeedle(value);
   return needle === null ? null : documents.find(doc => containsValue(doc.text, needle)) ?? null;
+}
+
+// ------------------------------------------------------- verified document figures
+
+/** A documentFigures entry whose quote was found in a document (see verifyDocumentFigures). */
+export interface VerifiedFigure extends DocumentFigure {
+  /** File name of the document that holds the quote, cited when the value is used. */
+  source: string;
+}
+
+const MONTH_NAMES = [
+  'january', 'jan', 'february', 'feb', 'march', 'mar', 'april', 'apr', 'june', 'jun', 'july', 'jul', 'august', 'aug',
+  'september', 'sept', 'sep', 'october', 'oct', 'november', 'nov', 'december', 'dec',
+  'يناير', 'فبراير', 'مارس', 'أبريل', 'ابريل', 'إبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'اغسطس', 'سبتمبر', 'أكتوبر', 'اكتوبر',
+  'نوفمبر', 'ديسمبر', 'كانون', 'شباط', 'آذار', 'اذار', 'نيسان', 'أيار', 'ايار', 'حزيران', 'تموز', 'آب', 'أيلول', 'ايلول', 'تشرين',
+].join('|');
+// "may" only before a year ("15 May 2026"), so that "15 may be revised" is not read as a date.
+const MONTH_AFTER_VALUE = new RegExp(`^ ?(?:(?:${MONTH_NAMES})(?!\\p{L})|may ?,? ?\\d{4})`, 'u');
+const MONTH_BEFORE_VALUE = new RegExp(`(?<!\\p{L})(?:${MONTH_NAMES}|may)\\.? ?$`, 'u');
+
+/**
+ * True when the number at [start, end) of normalised text is part of a date or a range rather than a
+ * figure: next to a month name ("15 March 2026", "March 15", "١٥ آذار"), or joined to other digits by
+ * "/" or "-" ("15/03/2026", "2026-03-15", "10-15").
+ */
+function isDateOrRangePart(haystack: string, start: number, end: number): boolean {
+  if (MONTH_AFTER_VALUE.test(haystack.slice(end, end + 20)) || MONTH_BEFORE_VALUE.test(haystack.slice(Math.max(0, start - 20), start))) return true;
+  const before = haystack[start - 1] ?? '';
+  const after = haystack[end] ?? '';
+  if ((before === '/' || before === '-') && DIGIT.test(haystack[start - 2] ?? '')) return true;
+  if ((after === '/' || after === '-') && DIGIT.test(haystack[end + 1] ?? '')) return true;
+  return false;
+}
+
+/** Quote marks, brackets and final punctuation around a quote, which the model may add or drop. */
+const QUOTE_EDGES = /^[\s"'«»()[\]]+|[\s"'«»()[\].,;:!?]+$/g;
+/** A quote may skip text with an ellipsis ("…" becomes "..." under NFKC). */
+const QUOTE_ELLIPSIS = / ?\.{3,} ?/;
+/** Words of at least two letters: a quote needs two besides the value, so a bare number is no quote. */
+const QUOTE_WORD = /\p{L}{2,}/gu;
+
+/**
+ * True when the quote supports the figure in this (normalised) document text: every part of the
+ * quote (parts separated by an ellipsis) appears in the text; the part holding the value has at
+ * least two words; and at one place where that part appears, the value stands alone there (not part
+ * of a larger number, a date or a range).
+ */
+function quoteSupportsValue(normalisedDoc: string, quote: string, needle: string): boolean {
+  const parts = normaliseForMatch(quote).split(QUOTE_ELLIPSIS).map(p => p.replace(QUOTE_EDGES, '')).filter(Boolean);
+  const holder = parts.find(p => p.includes(needle) && (p.match(QUOTE_WORD)?.length ?? 0) >= 2);
+  if (!holder || !parts.every(p => normalisedDoc.includes(p))) return false;
+  for (let at = normalisedDoc.indexOf(holder); at !== -1; at = normalisedDoc.indexOf(holder, at + 1)) {
+    for (let offset = holder.indexOf(needle); offset !== -1; offset = holder.indexOf(needle, offset + 1)) {
+      const start = at + offset;
+      const end = start + needle.length;
+      if (!partOfLargerNumber(normalisedDoc, start, end) && !isDateOrRangePart(normalisedDoc, start, end)) return true;
+    }
+  }
+  return false;
+}
+
+/** The documents as compared by quoteSupportsValue: own text only (see stripAiAnalysis), normalised. */
+function normalisedDocuments(documents: readonly SourceDocument[]): Array<{ fileName: string; text: string }> {
+  return documents.map(d => ({ fileName: d.fileName, text: normaliseForMatch(stripAiAnalysis(d.text)) }));
+}
+
+function figureSource(figure: DocumentFigure, documents: ReadonlyArray<{ fileName: string; text: string }>): string | null {
+  const needle = matchNeedle(figure.value);
+  if (needle === null || !figure.quote) return null;
+  return documents.find(doc => quoteSupportsValue(doc.text, figure.quote, needle))?.fileName ?? null;
+}
+
+/**
+ * The document figures that the documents support, each with the file it was found in: the quote
+ * is found in a document (ignoring case, spacing, Arabic-Indic digits and separators, typographic
+ * quotes and an ellipsis between parts), it contains the value, and the value stands alone there
+ * (not part of a larger number, a date or a range). Only these figures can supply a baseline, a
+ * target or an intermediate target (me-foundations.md §6), and only for their own kind.
+ */
+export function verifyDocumentFigures(figures: readonly DocumentFigure[], documents: readonly SourceDocument[]): VerifiedFigure[] {
+  const docs = normalisedDocuments(documents);
+  return figures.flatMap(figure => {
+    const source = figureSource(figure, docs);
+    return source === null ? [] : [{ ...figure, source }];
+  });
+}
+
+/** The verified figure of this kind whose value equals `value` (after normalisation), or null. */
+export function matchingFigure(value: string, kind: DocumentFigure['kind'], figures: readonly VerifiedFigure[]): VerifiedFigure | null {
+  const needle = matchNeedle(value);
+  if (needle === null) return null;
+  return figures.find(f => f.kind === kind && matchNeedle(f.value) === needle) ?? null;
 }
 
 // "officials" only in the plural: "official" is usually an adjective ("official records").
@@ -777,14 +939,21 @@ const BARE_NUMBER = /^[~≈<>≤≥]?\s*[+-]?[\d٠-٩.,]+\s*%?$/;
 type BaselineBasis = 'document' | 'none';
 type TargetBasis = 'document' | 'standard_threshold' | 'method_only' | 'none';
 
+/** An intermediate target as stored on Indicator.intermediateTargets (a type, so that it is valid Prisma JSON). */
+export type IntermediateTarget = { date: string; value: string };
+
 export interface BaselineTargetInput {
   baselineValue: string;
   baselineBasis: string;
   /** The model's baseline method; the document is cited in it when the baseline is kept. */
   baselineMethod?: string;
+  /** The model's baseline date, "YYYY-MM-DD": when a document baseline was measured, otherwise the planned date. */
+  baselineDate?: string;
   targetValue: string;
   targetBasis: string;
   targetJustification: string;
+  /** The model's intermediate targets [{ date, value }]: kept only for document target values. */
+  intermediateTargets?: unknown;
   standardReferenceCode: string | null;
   /** The linked library entry: its own text is the only evidence for a standard threshold. */
   libraryEntry?: LibraryEntryReference | null;
@@ -792,9 +961,13 @@ export interface BaselineTargetInput {
 
 export interface BaselineTargetResult {
   baselineValue: string | null;
+  /** UTC midnight of the baseline date, or null when unknown (baselineMethod then says "Baseline date: to be confirmed."). */
+  baselineDate: Date | null;
   baselineMethod: string;
   targetValue: string | null;
   targetJustification: string;
+  /** Verified intermediate targets sorted by date; [] when none (targetJustification then says they are to be confirmed). */
+  intermediateTargets: IntermediateTarget[];
 }
 
 function methodText(justification: string, fallback: string): string {
@@ -820,22 +993,74 @@ function withSource(value: string, fallback: string, fileName: string, max: numb
 
 const sentence = (value: string) => /[.!?]$/.test(value) ? value : `${value}.`;
 
+/** `body` as a sentence, then `tail`; the body is shortened when needed so that the tail always fits within `max`. */
+function withTail(body: string, tail: string, max: number): string {
+  const trimmed = body.trim();
+  if (!trimmed) return clip(tail, max);
+  return `${clip(sentence(trimmed), Math.max(0, max - tail.length - 1))} ${tail}`;
+}
+
+/** A real calendar date written exactly as YYYY-MM-DD, at UTC midnight; null for anything else. */
+export function strictIsoDate(value: unknown): Date | null {
+  const raw = text(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const date = new Date(`${raw}T00:00:00.000Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === raw ? date : null;
+}
+
 /**
- * Applies me-foundations.md §6 (the AI never invents baselines or targets):
- * - a baseline is kept only with basis 'document' and when the exact value
- *   appears in a document; the document is cited in baselineMethod
- *   ("… (source: proposal.pdf)");
- * - a target is kept with basis 'document' when it appears in a document (cited in
- *   targetJustification), or with basis 'standard_threshold' when it appears in the
- *   linked library entry's own text (see libraryEntryTexts; a standardReferenceCode
- *   written by the model is not enough); it is cleared for 'method_only', 'none',
- *   unknown bases and unverified values;
- * - whenever the target is cleared, targetJustification holds the proposed
- *   method: "Proposed method: … — confirm after baseline." The model's text is used
- *   only when it sets the target from the baseline (so a removed target's
- *   justification cannot carry the invented number), otherwise DEFAULT_TARGET_METHOD.
+ * The model's intermediate targets that the documents support: each value must equal a verified
+ * figure of kind 'target' (like a document target) and each date must be a real YYYY-MM-DD date.
+ * One target per date (the first), sorted by date, at most 20. `removed` counts the rest.
  */
-export function resolveBaselineAndTarget(input: BaselineTargetInput, documents: readonly SourceDocument[]): BaselineTargetResult {
+function resolveIntermediateTargets(raw: unknown, figures: readonly VerifiedFigure[]): { targets: IntermediateTarget[]; sources: string[]; removed: number } {
+  const items = Array.isArray(raw) ? raw : [];
+  const byDate = new Map<string, IntermediateTarget>();
+  const sources = new Set<string>();
+  let removed = 0;
+  for (const item of items) {
+    const date = isObject(item) ? strictIsoDate(item.date) : null;
+    const value = isObject(item) ? clip(text(item.value), LIMITS.value) : '';
+    if (!value && !date) continue; // an empty row is "nothing", not a removed target
+    const figure = value ? matchingFigure(value, 'target', figures) : null;
+    if (!date || !figure) {
+      removed++;
+      continue;
+    }
+    const key = date.toISOString().slice(0, 10);
+    if (byDate.has(key)) continue;
+    byDate.set(key, { date: key, value });
+    sources.add(figure.source);
+  }
+  const targets = Array.from(byDate.values())
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(0, LIMITS.intermediateTargets);
+  return { targets, sources: Array.from(sources), removed };
+}
+
+/**
+ * Applies me-foundations.md §6 (the AI never invents baselines or targets). `figures` are the
+ * document figures the documents support (see verifyDocumentFigures); a document value must equal
+ * one of them of the right kind, so a target used as a baseline, a date ("15 March"), a budget
+ * cell or any number the structure step did not find as a baseline or target is not enough.
+ * - a baseline is kept only with basis 'document' and when it equals a verified figure of kind
+ *   'baseline'; the figure's document is cited in baselineMethod ("… (source: proposal.pdf)");
+ * - baselineDate is a real YYYY-MM-DD date (the measured date of a document baseline, otherwise
+ *   the planned date); it is dropped with a rejected document baseline. When it is unknown,
+ *   baselineMethod ends with "Baseline date: to be confirmed.";
+ * - a target is kept with basis 'document' when it equals a verified figure of kind 'target' (cited
+ *   in targetJustification), or with basis 'standard_threshold' when it appears in the linked library
+ *   entry's own text (see libraryEntryTexts; a standardReferenceCode written by the model is not
+ *   enough); it is cleared for 'method_only', 'none', unknown bases and unverified values;
+ * - whenever the target is cleared, targetJustification holds the proposed method: "Proposed
+ *   method: … — confirm after baseline." The model's text is used only when it sets the target
+ *   from the baseline (so a removed target's justification cannot carry the invented number),
+ *   otherwise DEFAULT_TARGET_METHOD;
+ * - intermediate targets are kept only when their value equals a verified figure of kind 'target'
+ *   (cited in targetJustification); without any, targetJustification ends with "Intermediate
+ *   targets: to be confirmed after the baseline."
+ */
+export function resolveBaselineAndTarget(input: BaselineTargetInput, figures: readonly VerifiedFigure[]): BaselineTargetResult {
   const baselineBasis = matchEnum<BaselineBasis>(input.baselineBasis, ['document', 'none']) ?? 'none';
   const targetBasis = matchEnum<TargetBasis>(input.targetBasis, ['document', 'standard_threshold', 'method_only', 'none'], {
     standard: 'standard_threshold',
@@ -847,26 +1072,33 @@ export function resolveBaselineAndTarget(input: BaselineTargetInput, documents: 
 
   let baselineValue: string | null = null;
   let baselineMethod = clip(modelBaselineMethod, LIMITS.baselineMethod) || TO_BE_CONFIRMED;
+  let baselineRejected = false;
   if (baselineBasis === 'document' && input.baselineValue) {
-    const source = findSourceDocument(input.baselineValue, documents);
-    if (source) {
+    const figure = matchingFigure(input.baselineValue, 'baseline', figures);
+    if (figure) {
       baselineValue = input.baselineValue;
-      baselineMethod = withSource(modelBaselineMethod, 'Baseline taken from the project documents', source.fileName, LIMITS.baselineMethod);
+      baselineMethod = withSource(modelBaselineMethod, 'Baseline taken from the project documents', figure.source, LIMITS.baselineMethod);
     } else {
-      notes.push('The baseline proposed by the AI was not found in the project documents and was removed (pending baseline).');
+      baselineRejected = true;
+      notes.push('The baseline proposed by the AI was not found as a baseline in the project documents and was removed (pending baseline).');
     }
+  }
+  // The date of a rejected baseline dates a value that is not in the documents.
+  const baselineDate = baselineRejected ? null : strictIsoDate(input.baselineDate);
+  if (!baselineDate && !baselineMethod.endsWith(BASELINE_DATE_TO_BE_CONFIRMED)) {
+    baselineMethod = withTail(baselineMethod, BASELINE_DATE_TO_BE_CONFIRMED, LIMITS.baselineMethod);
   }
 
   let targetValue: string | null = null;
   let justification: string;
-  const targetSource = targetBasis === 'document' && input.targetValue !== '' ? findSourceDocument(input.targetValue, documents) : null;
+  const targetFigure = targetBasis === 'document' && input.targetValue !== '' ? matchingFigure(input.targetValue, 'target', figures) : null;
   const standardEntry = targetBasis === 'standard_threshold' && input.targetValue !== '' && input.libraryEntry
     && appearsInDocuments(input.targetValue, libraryEntryTexts(input.libraryEntry))
     ? input.libraryEntry : null;
 
-  if (targetSource) {
+  if (targetFigure) {
     targetValue = input.targetValue;
-    justification = withSource(input.targetJustification, 'Target taken from the project documents', targetSource.fileName, LIMITS.targetJustification);
+    justification = withSource(input.targetJustification, 'Target taken from the project documents', targetFigure.source, LIMITS.targetJustification);
   } else if (standardEntry) {
     targetValue = input.targetValue;
     const why = input.targetJustification.replace(/[.\s]+$/, '');
@@ -882,18 +1114,28 @@ export function resolveBaselineAndTarget(input: BaselineTargetInput, documents: 
     const method = methodText(input.targetJustification, '');
     justification = `Proposed method: ${describesTargetMethod(method) ? method : DEFAULT_TARGET_METHOD} — confirm after baseline.`;
     if (targetBasis === 'document' && input.targetValue) {
-      notes.push('The target proposed by the AI was not found in the project documents and was removed.');
+      notes.push('The target proposed by the AI was not found as a target in the project documents and was removed.');
     }
     if (targetBasis === 'standard_threshold' && input.targetValue) {
       notes.push('The standard threshold proposed by the AI was not found in the linked library entry and was removed.');
     }
   }
 
+  const intermediate = resolveIntermediateTargets(input.intermediateTargets, figures);
+  if (intermediate.removed > 0) {
+    notes.push('Intermediate targets proposed by the AI without a target value of the project documents or a valid date were removed.');
+  }
+  const intermediateTail = intermediate.targets.length > 0
+    ? `Intermediate targets taken from the project documents (source: ${intermediate.sources.join(', ')}).`
+    : INTERMEDIATE_TARGETS_TO_BE_CONFIRMED;
+
   return {
     baselineValue,
+    baselineDate,
     baselineMethod,
     targetValue,
-    targetJustification: clip(notes.length > 0 ? [sentence(justification), ...notes].join(' ') : justification, LIMITS.targetJustification),
+    targetJustification: withTail([sentence(justification), ...notes].join(' '), intermediateTail, LIMITS.targetJustification),
+    intermediateTargets: intermediate.targets,
   };
 }
 
@@ -911,8 +1153,11 @@ export interface NormalizeIndicatorsContext {
    * text is the only evidence for a standard threshold.
    */
   libraryEntries?: ReadonlyMap<string, LibraryEntryReference>;
-  /** The project's documents (own text only, see stripAiAnalysis): the only source of baseline and target values, cited by file name. */
-  documents: readonly SourceDocument[];
+  /**
+   * The structure step's document figures that the documents support (verifyDocumentFigures): the
+   * only source of document baselines, targets and intermediate targets, cited by file name.
+   */
+  verifiedFigures: readonly VerifiedFigure[];
   /** Model id used for the call (stored in Indicator.aiModel). */
   aiModel: string;
   promptVersion?: string;
@@ -976,16 +1221,17 @@ function normalizeCalculation(raw: Json, percent: boolean): Record<string, strin
   const numerator = clip(pick(source, 'numerator') || pick(raw, 'numerator'), LIMITS.calculationPart);
   const denominator = clip(pick(source, 'denominator') || pick(raw, 'denominator'), LIMITS.calculationPart);
   const formula = clip(pick(source, 'formula') || pick(raw, 'formula'), LIMITS.formula);
-  const rounding = clip(pick(source, 'rounding'), 200);
+  const rounding = clip(pick(source, 'rounding') || pick(raw, 'rounding'), 200);
   if (numerator) calc.numerator = numerator;
   if (denominator) calc.denominator = denominator;
   if (formula) calc.formula = formula;
   if (rounding) calc.rounding = rounding;
-  // Percentages need an explicit numerator and denominator (me-foundations.md §2 rule 3).
+  // Percentages need an explicit numerator and denominator (me-foundations.md §2 rule 3) and a rounding rule (§3).
   if (percent) {
     calc.numerator ??= TO_BE_CONFIRMED;
     calc.denominator ??= TO_BE_CONFIRMED;
     calc.formula ??= 'numerator ÷ denominator × 100';
+    calc.rounding ??= TO_BE_CONFIRMED;
   }
   return Object.keys(calc).length > 0 ? calc : undefined;
 }
@@ -1033,12 +1279,14 @@ export function normalizeIndicator(raw: unknown, sortOrder: number, ctx: Normali
     baselineValue: clip(text(raw.baselineValue), LIMITS.value),
     baselineBasis: text(raw.baselineBasis),
     baselineMethod: pick(raw, 'baselineMethod'),
+    baselineDate: text(raw.baselineDate),
     targetValue: clip(text(raw.targetValue), LIMITS.value),
     targetBasis: text(raw.targetBasis),
     targetJustification: pick(raw, 'targetJustification'),
+    intermediateTargets: raw.intermediateTargets,
     standardReferenceCode,
     libraryEntry,
-  }, ctx.documents);
+  }, ctx.verifiedFigures);
 
   const phases = textList(raw.phases, LIMITS.phases).map(p => clip(p, LIMITS.phase));
   const startDate = parseDate(raw.startDate);
@@ -1061,13 +1309,15 @@ export function normalizeIndicator(raw: unknown, sortOrder: number, ctx: Normali
     disaggregation,
     meansOfVerification: meansRaw && !isGenericMeansOfVerification(meansRaw) ? meansRaw : TO_BE_CONFIRMED,
     baselineValue: values.baselineValue,
+    baselineDate: values.baselineDate,
     baselineMethod: values.baselineMethod,
     targetValue: values.targetValue,
     targetJustification: values.targetJustification,
-    assumptions: orNull(clip(pick(raw, 'assumptions'), LIMITS.assumptions)),
+    ...(values.intermediateTargets.length > 0 && { intermediateTargets: values.intermediateTargets }),
+    assumptions: clip(pick(raw, 'assumptions'), LIMITS.assumptions) || TO_BE_CONFIRMED,
     libraryId,
     standardReferenceCode,
-    responsibility: orNull(clip(pick(raw, 'responsibility'), LIMITS.responsibility)),
+    responsibility: clip(pick(raw, 'responsibility'), LIMITS.responsibility) || TO_BE_CONFIRMED,
     phases: phases.length > 0 ? phases : ['baseline', 'midterm', 'endline'],
     ...(startDate && { startDate }),
     ...(endDate && { endDate }),
@@ -1099,10 +1349,17 @@ export function extractIndicatorList(parsed: unknown): unknown[] {
  *   reference replaces the model's standardReferenceCode;
  * - the linked entry's sex keys (sex, sex_of_household_head) are kept, and 'sex' is
  *   added to people-level indicators that lack sex / sex_of_household_head;
- * - baselines and targets per resolveBaselineAndTarget (never invented; document
- *   values cite the document);
+ * - baselines, baseline dates, targets and intermediate targets per resolveBaselineAndTarget
+ *   (never invented: document values must be verified document figures of the same kind and
+ *   cite the document; an unknown baseline date or no intermediate target is marked "to be
+ *   confirmed" in baselineMethod or targetJustification);
+ * - "" (the structured-output answer's "unknown") counts as missing everywhere:
+ *   indicatorTextAr, libraryId, standardReferenceCode, calculation parts, dates, baseline and target values;
  * - empty definition, means of verification (or a generic one such as "project
- *   reports") and baseline method → "To be confirmed by the M&E officer";
+ *   reports"), baseline method, assumptions and responsibility → "To be confirmed by
+ *   the M&E officer" (me-foundations.md §3), and so are the numerator, denominator and rounding
+ *   of a percentage; targetJustification is always filled (see resolveBaselineAndTarget);
+ *   referenceSheetGaps lists what is still open (including a missing Arabic name or unit);
  * - provenance ai_generated with the model and prompt version;
  * - indicators without text and repeats (same result, same wording) are dropped.
  */
@@ -1118,4 +1375,87 @@ export function normalizeIndicators(parsed: unknown, ctx: NormalizeIndicatorsCon
     out.push(payload);
   }
   return out;
+}
+
+// ------------------------------------------------------- reference-sheet gaps
+
+/** Reference-sheet fields checked by referenceSheetGaps, in reference-sheet order (me-foundations.md §3). */
+export const REFERENCE_SHEET_FIELDS = [
+  'indicatorTextAr', 'definition', 'unit', 'calculation', 'direction', 'disaggregation', 'meansOfVerification',
+  'baselineDate', 'baselineMethod', 'intermediateTargets', 'targetJustification', 'assumptions', 'responsibility',
+] as const;
+
+export type ReferenceSheetField = typeof REFERENCE_SHEET_FIELDS[number];
+
+/** The indicator fields referenceSheetGaps reads: a create payload or a stored Indicator row. */
+export interface ReferenceSheetFields {
+  indicatorText: string;
+  indicatorTextAr?: string | null;
+  /** The baseline date is required for impact and outcome indicators (me-foundations.md §6). */
+  level?: string | null;
+  unit?: string | null;
+  definition?: string | null;
+  calculation?: unknown;
+  direction?: string | null;
+  disaggregation?: unknown;
+  meansOfVerification?: string | null;
+  baselineDate?: Date | string | null;
+  baselineMethod?: string | null;
+  targetJustification?: string | null;
+  intermediateTargets?: unknown;
+  assumptions?: string | null;
+  responsibility?: string | null;
+}
+
+/**
+ * Empty, or still the "to be confirmed" marker. `marker` ("Baseline date: to be confirmed.", or the
+ * intermediate targets one) is ignored at the end: it marks another field.
+ */
+function unconfirmed(value: unknown, marker?: string): boolean {
+  let t = text(value);
+  if (marker && t.endsWith(marker)) t = t.slice(0, -marker.length).trim();
+  t = t.replace(/\.$/, '');
+  return t === '' || t === TO_BE_CONFIRMED;
+}
+
+function hasDate(value: unknown): boolean {
+  if (value instanceof Date) return !Number.isNaN(value.getTime());
+  return strictIsoDate(value) !== null;
+}
+
+function hasIntermediateTargets(value: unknown): boolean {
+  return Array.isArray(value) && value.some(t => isObject(t) && text(t.value) !== '' && text(t.date) !== '');
+}
+
+/**
+ * The reference-sheet fields an M&E officer still has to fill or confirm: an empty Arabic name or
+ * unit; empty or "To be confirmed by the M&E officer" text (a generic means of verification counts
+ * as missing); the numerator, denominator or rounding of a percentage; a missing or unknown
+ * direction; a people-level indicator without sex disaggregation (sex or sex_of_household_head);
+ * the baseline date of an impact or outcome indicator; and intermediate targets.
+ * Pure; used by tests and scripts/ai-smoke.ts to check generated frameworks.
+ */
+export function referenceSheetGaps(indicator: ReferenceSheetFields): ReferenceSheetField[] {
+  const gaps = new Set<ReferenceSheetField>();
+  if (text(indicator.indicatorTextAr) === '') gaps.add('indicatorTextAr');
+  if (unconfirmed(indicator.definition)) gaps.add('definition');
+  if (text(indicator.unit) === '') gaps.add('unit');
+  if (isPercentUnit(indicator.unit ?? '', indicator.indicatorText)) {
+    const calc = isObject(indicator.calculation) ? indicator.calculation : {};
+    if (unconfirmed(calc.numerator) || unconfirmed(calc.denominator) || unconfirmed(calc.rounding)) gaps.add('calculation');
+  }
+  if (normalizeDirection(indicator.direction) === null) gaps.add('direction');
+  if (isPeopleLevelIndicator(indicator.indicatorText, indicator.indicatorTextAr)) {
+    const keys = Array.isArray(indicator.disaggregation) ? indicator.disaggregation.map(text) : [];
+    if (!SEX_KEYS.some(key => keys.includes(key))) gaps.add('disaggregation');
+  }
+  const means = text(indicator.meansOfVerification);
+  if (unconfirmed(means) || isGenericMeansOfVerification(means)) gaps.add('meansOfVerification');
+  if ((indicator.level === 'impact' || indicator.level === 'outcome') && !hasDate(indicator.baselineDate)) gaps.add('baselineDate');
+  if (unconfirmed(indicator.baselineMethod, BASELINE_DATE_TO_BE_CONFIRMED)) gaps.add('baselineMethod');
+  if (!hasIntermediateTargets(indicator.intermediateTargets)) gaps.add('intermediateTargets');
+  if (unconfirmed(indicator.targetJustification, INTERMEDIATE_TARGETS_TO_BE_CONFIRMED)) gaps.add('targetJustification');
+  if (unconfirmed(indicator.assumptions)) gaps.add('assumptions');
+  if (unconfirmed(indicator.responsibility)) gaps.add('responsibility');
+  return REFERENCE_SHEET_FIELDS.filter(field => gaps.has(field));
 }

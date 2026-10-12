@@ -373,6 +373,13 @@ Paste the matching prompt at the start of a session (in the repository named).
 4. **Pricing hypothesis** to test in the pilot (per organisation per year, per active project, or bundled with Momentum Labs assessments).
 5. **Data protection:** where production data is hosted, who can access it, and the data processing agreement offered to pilot organisations.
 
+Decisions already made (12 October 2026):
+
+- **Project status:** M&E officers may change a project's status (as well as org admins).
+- **Arabic review:** Walid reviews the Arabic text of every UI and AI pull request.
+- **Migration rehearsal data:** Supabase development branches use made-up data (the dev seed), never copied beneficiary data.
+- **Dropdowns:** keep both the native select (data-entry forms) and the Radix Select (elsewhere); every dropdown must work on phones (375 px, touch), with a keyboard and in Arabic.
+
 ---
 
 ## Status table
@@ -381,8 +388,8 @@ Paste the matching prompt at the start of a session (in the repository named).
 |---|---|---|---|
 | 0 Safety | Merged (SQL pending) | backend #2, frontend #2 | `WebhookToken` SQL not yet applied to Supabase (project paused); the storage module missing from backend #2 is added in backend #3. |
 | 1 Build | Done | backend #3, frontend #3 | Frontend `npm audit` keeps 5 high findings in Tailwind 3's file-watcher chain (no patched `braces` exists; `lovable-tagger` needs Tailwind 3) — decision needed. Lint has 62 `no-explicit-any` warnings until typed API models (Phase 2). |
-| 2 Data model | In review | backend #4, frontend #4 | `prisma/sql/2026-10-11_phase2_data_model.sql` not yet applied to Supabase (project paused; verified locally with `npm run verify:migration`). Arabic strings need native-speaker review. |
-| 3 AI foundation | Not started | | |
+| 2 Data model | Merged (SQL pending) | backend #4, frontend #4 | `prisma/sql/2026-10-11_phase2_data_model.sql` not yet applied to Supabase (project paused; verified locally with `npm run verify:migration`); rehearse on a development branch with the dev seed. Arabic strings: Walid to review. |
+| 3 AI foundation | In review | backend #5, frontend #5 | `prisma/sql/2026-10-12_phase3_ai_foundation.sql` (AiCall table, Document.aiAnalysis) not yet applied to Supabase; apply after the Phase 0 and Phase 2 SQL. The real-API smoke test (`npm run ai:smoke`) needs an Anthropic key. |
 | 4 KPI Assistant | Not started | | |
 | 5 Active Monitoring | Not started | | |
 | 6 Experience | Not started | | |

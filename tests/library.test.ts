@@ -1,13 +1,22 @@
+import { execFile } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { promisify } from 'util';
 import request from 'supertest';
 import { Prisma } from '@prisma/client';
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
+import {
+  EMBEDDING_DIMENSIONS, EmbeddingError, NoopEmbeddingProvider, type EmbeddingInputType, type EmbeddingProvider,
+} from '../src/services/ai/embeddings';
+import { redactPersonalData } from '../src/services/ai/redact';
+import { embedLibraryEntries, libraryEmbeddingText } from '../src/services/library/embed';
 import { DEFAULT_LIBRARY_PATH, loadLibraryFile, LibraryValidationError, validateLibraryData } from '../src/services/library/load';
 import { libraryContentDiffers, seedLibrary, stableStringify, toLibraryContent } from '../src/services/library/seed';
+import { librarySeedSettings, runLibrarySeed } from '../src/services/library/seedCli';
+import { isLibraryVectorType, libraryVectorType, vectorTypeSql } from '../src/services/library/vector';
 import { buildLibraryWhere, matchesLibrarySearch, normaliseSearchText, parseLibraryQuery } from '../src/services/library/query';
 import { bearer, hasTestDatabase, resetDatabase } from './helpers';
 
@@ -22,6 +31,58 @@ function problemsOf(fn: () => unknown): string[] {
     return (err as LibraryValidationError).problems;
   }
   throw new Error('expected a LibraryValidationError');
+}
+
+/** seedLibrary's embedding fields when no provider is passed (prisma/seed.ts, most tests). */
+const NO_PROVIDER = { embedded: 0, embeddingsSkipped: 'no embedding provider was given (keyword search is used)', embeddingError: null };
+
+/** Deterministic stand-in for a Voyage vector: length and checksum of the text (integers, exact in pgvector's float4). */
+function fakeVector(text: string, dimensions = EMBEDDING_DIMENSIONS): number[] {
+  let checksum = 0;
+  for (const ch of text) checksum = (checksum * 31 + ch.codePointAt(0)!) % 10007;
+  return Array.from({ length: dimensions }, (_, i) => (i === 0 ? text.length : i === 1 ? checksum : 0));
+}
+
+/** An enabled provider that records what it is asked to embed. `failOnCall` makes that call (1-based) throw. */
+class FakeEmbeddings implements EmbeddingProvider {
+  readonly name = 'fake';
+  readonly model: string;
+  readonly dimensions: number;
+  readonly enabled = true;
+  readonly calls: { texts: string[]; inputType: EmbeddingInputType }[] = [];
+  private readonly failOnCall?: number;
+
+  constructor(options: { model?: string; dimensions?: number; failOnCall?: number } = {}) {
+    this.model = options.model ?? 'fake-embed-1';
+    this.dimensions = options.dimensions ?? EMBEDDING_DIMENSIONS;
+    this.failOnCall = options.failOnCall;
+  }
+
+  async embed(texts: string[], inputType: EmbeddingInputType): Promise<number[][]> {
+    this.calls.push({ texts, inputType });
+    if (this.calls.length === this.failOnCall) {
+      throw new EmbeddingError('Voyage embeddings request failed (HTTP 503) (gave up after 4 attempts)', 503, true, 4);
+    }
+    return texts.map(text => fakeVector(text, this.dimensions));
+  }
+
+  get texts(): string[] {
+    return this.calls.flatMap(c => c.texts);
+  }
+}
+
+/** An enabled provider whose embed() is the given function. */
+const providerWith = (embed: EmbeddingProvider['embed']): EmbeddingProvider =>
+  ({ name: 'broken', model: 'broken-1', dimensions: EMBEDDING_DIMENSIONS, enabled: true, embed });
+
+const fileEntry = (id: string) => loadLibraryFile().entries.find(e => e.id === id)!;
+
+/** Stores a copy of HE-02 under `id`: an entry kept in the database after it left the library file. */
+async function addEntryOutsideFile(id: string) {
+  const { createdAt: _c, updatedAt: _u, ...rest } = await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'HE-02' } });
+  await prisma.indicatorLibraryEntry.create({
+    data: { ...rest, id, calculation: rest.calculation ?? Prisma.DbNull, standardReference: rest.standardReference ?? Prisma.DbNull },
+  });
 }
 
 describe('loadLibraryFile', () => {
@@ -150,6 +211,43 @@ describe('library seed helpers', () => {
     expect(libraryContentDiffers(content, { ...stored, tags: [...(content.tags as string[])].reverse() })).toBe(true);
     expect(libraryContentDiffers(content, { ...stored, calculation: null })).toBe(true);
   });
+
+  it('builds the embedded text from the names, definition and tags', () => {
+    const e = entry();
+    expect(libraryEmbeddingText(e)).toBe(
+      [e.name, e.nameAr, e.definition, 'Tags: fcs, food consumption, humanitarian, cash, in kind'].join('\n'),
+    );
+    expect(libraryEmbeddingText({ name: ' Only a name ', nameAr: '', definition: null, tags: [] })).toBe('Only a name');
+    expect(libraryEmbeddingText({ name: 'N', tags: ['', ' a_b '] })).toBe('N\nTags: a b');
+    // Other fields (unit, methods, notes…) are not embedded: changing them keeps the vector.
+    expect(libraryEmbeddingText({ ...e, unit: 'count', notes: 'Changed' } as typeof e)).toBe(libraryEmbeddingText(e));
+  });
+
+  it('embeds reference text only: no phone numbers, ID numbers or email addresses', () => {
+    for (const e of loadLibraryFile().entries) {
+      expect(redactPersonalData(libraryEmbeddingText(e)).counts, e.id).toEqual({ phone: 0, idNumber: 0, email: 0 });
+    }
+  });
+});
+
+describe('pgvector column type', () => {
+  it('accepts vector(1024) as format_type() writes it, bare or schema-qualified', () => {
+    for (const type of ['vector(1024)', 'extensions.vector(1024)', 'public.vector(1024)', '"Extensions".vector(1024)', '"user".vector(1024)']) {
+      expect(isLibraryVectorType(type), type).toBe(true);
+      expect(vectorTypeSql(type).sql).toBe(type);
+    }
+  });
+
+  it('rejects anything else, so nothing but a vector type name is spliced into SQL', () => {
+    for (const type of [
+      'vector', 'vector(512)', 'halfvec(1024)', 'text', '', ' vector(1024)', 'vector(1024) ', 'Extensions.vector(1024)',
+      'a.b.vector(1024)', '"ext.vector(1024)', '"a"b".vector(1024)', '"a b".vector(1024)', 'public.vector(1024); DROP TABLE x',
+      'vector(1024)--', 'vector(1024)::text',
+    ]) {
+      expect(isLibraryVectorType(type), type).toBe(false);
+      expect(() => vectorTypeSql(type), type).toThrow(/expected vector\(1024\)/);
+    }
+  });
 });
 
 describe('library query helpers', () => {
@@ -201,29 +299,33 @@ describe('library query helpers', () => {
 describe.skipIf(!hasTestDatabase)('seedLibrary (database)', () => {
   const updatedAtById = async () =>
     new Map((await prisma.indicatorLibraryEntry.findMany({ select: { id: true, updatedAt: true } })).map(r => [r.id, r.updatedAt.getTime()]));
+  const seedContent = () => seedLibrary(prisma, { logger: silent });
 
-  beforeAll(async () => {
+  // Every test starts from an empty database and seeds what it needs, so each one runs alone or in any order.
+  beforeEach(async () => {
     await resetDatabase();
   });
 
   it('creates every entry, then changes nothing on a second run', async () => {
-    const first = await seedLibrary(prisma, { logger: silent });
-    expect(first).toEqual({ created: 63, updated: 0, unchanged: 0, total: 63, version: '1.0.0', notInFile: [] });
+    const first = await seedContent();
+    expect(first).toEqual({ created: 63, updated: 0, unchanged: 0, total: 63, version: '1.0.0', notInFile: [], ...NO_PROVIDER });
     expect(await prisma.indicatorLibraryEntry.count()).toBe(63);
     const before = await updatedAtById();
 
     await new Promise(r => setTimeout(r, 20));
-    const second = await seedLibrary(prisma, { logger: silent });
-    expect(second).toEqual({ created: 0, updated: 0, unchanged: 63, total: 63, version: '1.0.0', notInFile: [] });
+    const second = await seedContent();
+    expect(second).toEqual({ created: 0, updated: 0, unchanged: 63, total: 63, version: '1.0.0', notInFile: [], ...NO_PROVIDER });
     expect(await updatedAtById()).toEqual(before);
   });
 
   it('stores the file content', async () => {
+    await seedContent();
     const fs01 = await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'FS-01' } });
     expect(fs01).toMatchObject({
       sector: 'food_security', level: 'outcome', unit: 'percent', direction: 'increase', frequency: 'biannual',
       methods: ['hh_survey'], standardFramework: 'WFP', isStandard: true, version: '1.0.0',
       standardReference: { framework: 'WFP', code: 'Food Consumption Score' },
+      embeddingModel: null,
     });
     expect(fs01.tags).toEqual(['fcs', 'food_consumption', 'humanitarian', 'cash', 'in_kind']);
     const fs02 = await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'FS-02' } });
@@ -233,53 +335,71 @@ describe.skipIf(!hasTestDatabase)('seedLibrary (database)', () => {
     expect(custom.standardFramework).toBeNull();
   });
 
-  it('updates exactly the changed rows and keeps the embedding', async () => {
-    await prisma.indicatorLibraryEntry.update({ where: { id: 'FS-01' }, data: { name: 'Edited by hand' } });
-    await prisma.$executeRawUnsafe(
-      `UPDATE "IndicatorLibraryEntry" SET embedding = array_fill(0.5, ARRAY[1024])::vector WHERE id = 'FS-01'`,
-    );
+  /** Gives an entry a stored vector and the model that made it, as a seed with a key would. */
+  const giveEmbedding = (id: string) => prisma.$executeRaw`
+    UPDATE "IndicatorLibraryEntry" SET embedding = array_fill(0.5, ARRAY[1024])::vector, "embeddingModel" = 'fake-embed-1' WHERE id = ${id}`;
+  const embeddingOf = async (id: string) => {
+    const [row] = await prisma.$queryRaw<{ hasEmbedding: boolean; embeddingModel: string | null }[]>`
+      SELECT embedding IS NOT NULL AS "hasEmbedding", "embeddingModel" FROM "IndicatorLibraryEntry" WHERE id = ${id}`;
+    return row;
+  };
+
+  it('updates exactly the changed rows and keeps the embedding when the embedded text is unchanged', async () => {
+    await seedContent();
+    await prisma.indicatorLibraryEntry.update({ where: { id: 'FS-01' }, data: { unit: 'Edited by hand' } });
+    await giveEmbedding('FS-01');
     const before = await updatedAtById();
 
-    const result = await seedLibrary(prisma, { logger: silent });
-    expect(result).toMatchObject({ created: 0, updated: 1, unchanged: 62 });
+    const result = await seedContent();
+    expect(result).toMatchObject({ created: 0, updated: 1, unchanged: 62, ...NO_PROVIDER });
 
     const after = await updatedAtById();
     expect(after.get('FS-01')).toBeGreaterThan(before.get('FS-01')!);
     for (const [id, t] of before) if (id !== 'FS-01') expect(after.get(id)).toBe(t);
+    expect((await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'FS-01' } })).unit).toBe('percent');
+    expect(await embeddingOf('FS-01')).toEqual({ hasEmbedding: true, embeddingModel: 'fake-embed-1' });
+  });
+
+  it('clears a stale embedding and its model when the embedded text changed, even without a provider', async () => {
+    await seedContent();
+    await giveEmbedding('FS-01');
+    await giveEmbedding('FS-02');
+    await prisma.indicatorLibraryEntry.update({ where: { id: 'FS-01' }, data: { name: 'Edited by hand' } });
+
+    const result = await seedContent();
+    expect(result).toMatchObject({ created: 0, updated: 1, unchanged: 62, ...NO_PROVIDER });
     expect((await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'FS-01' } })).name).toMatch(/Food Consumption Score/);
-    const [{ hasEmbedding }] = await prisma.$queryRaw<{ hasEmbedding: boolean }[]>`
-      SELECT embedding IS NOT NULL AS "hasEmbedding" FROM "IndicatorLibraryEntry" WHERE id = 'FS-01'`;
-    expect(hasEmbedding).toBe(true);
+    // The vector was made for other text; it is cleared so it is never searched (the next seed with a key re-embeds it).
+    expect(await embeddingOf('FS-01')).toEqual({ hasEmbedding: false, embeddingModel: null });
+    expect(await embeddingOf('FS-02')).toEqual({ hasEmbedding: true, embeddingModel: 'fake-embed-1' });
   });
 
   it('treats a reordered array or a cleared JSON field as a change', async () => {
+    await seedContent();
     const wa01 = await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'WA-01' } });
     await prisma.indicatorLibraryEntry.update({ where: { id: 'WA-01' }, data: { tags: [...wa01.tags].reverse() } });
     await prisma.indicatorLibraryEntry.update({ where: { id: 'WA-02' }, data: { calculation: Prisma.DbNull } });
-    const result = await seedLibrary(prisma, { logger: silent });
+    const result = await seedContent();
     expect(result).toMatchObject({ created: 0, updated: 2, unchanged: 61 });
     expect((await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'WA-01' } })).tags).toEqual(wa01.tags);
-    expect((await seedLibrary(prisma, { logger: silent })).unchanged).toBe(63);
+    expect((await seedContent()).unchanged).toBe(63);
   });
 
   it('re-creates a missing entry and keeps entries that are not in the file', async () => {
+    await seedContent();
     await prisma.indicatorLibraryEntry.delete({ where: { id: 'HE-01' } });
-    const extra = await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'HE-02' } });
-    const { createdAt: _c, updatedAt: _u, ...rest } = extra;
-    await prisma.indicatorLibraryEntry.create({
-      data: { ...rest, id: 'ZZ-99', calculation: rest.calculation ?? Prisma.DbNull, standardReference: rest.standardReference ?? Prisma.DbNull },
-    });
+    await addEntryOutsideFile('ZZ-99');
     const logger = { warn: vi.fn() };
 
     const result = await seedLibrary(prisma, { logger });
-    expect(result).toEqual({ created: 1, updated: 0, unchanged: 62, total: 63, version: '1.0.0', notInFile: ['ZZ-99'] });
+    expect(result).toEqual({ created: 1, updated: 0, unchanged: 62, total: 63, version: '1.0.0', notInFile: ['ZZ-99'], ...NO_PROVIDER });
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('ZZ-99'));
     expect(await prisma.indicatorLibraryEntry.findUnique({ where: { id: 'ZZ-99' } })).not.toBeNull();
     expect(await prisma.indicatorLibraryEntry.count()).toBe(64);
-    await prisma.indicatorLibraryEntry.delete({ where: { id: 'ZZ-99' } });
   });
 
   it('writes nothing when the file is invalid', async () => {
+    await seedContent();
     const data = rawLibrary();
     data.indicators[0].name = 'Changed in an invalid file';
     data.indicators[1].sector = 'space';
@@ -294,6 +414,384 @@ describe.skipIf(!hasTestDatabase)('seedLibrary (database)', () => {
   });
 });
 
+describe.skipIf(!hasTestDatabase)('seedLibrary embeddings (database)', () => {
+  const ALL_IDS = loadLibraryFile().entries.map(e => e.id);
+  const SORTED_IDS = [...ALL_IDS].sort();
+
+  /** Stored vectors by id (entries without one are left out). */
+  const storedVectors = async () => {
+    const rows = await prisma.$queryRaw<{ id: string; vector: string }[]>`
+      SELECT id, embedding::text AS vector FROM "IndicatorLibraryEntry" WHERE embedding IS NOT NULL ORDER BY id`;
+    return new Map(rows.map(r => [r.id, JSON.parse(r.vector) as number[]]));
+  };
+  /** embeddingModel of every entry, by id. */
+  const storedModels = async () => {
+    const rows = await prisma.indicatorLibraryEntry.findMany({ select: { id: true, embeddingModel: true }, orderBy: { id: 'asc' } });
+    return new Map(rows.map(r => [r.id, r.embeddingModel]));
+  };
+  const modelCounts = async () => {
+    const counts: Record<string, number> = {};
+    for (const model of (await storedModels()).values()) counts[model ?? 'null'] = (counts[model ?? 'null'] ?? 0) + 1;
+    return counts;
+  };
+  const embeddedCount = async () => (await storedVectors()).size;
+  const updatedAtById = async () =>
+    new Map((await prisma.indicatorLibraryEntry.findMany({ select: { id: true, updatedAt: true } })).map(r => [r.id, r.updatedAt.getTime()]));
+  const textOf = (id: string) => libraryEmbeddingText(fileEntry(id));
+  /** The library as a seed with a key leaves it: every entry embedded by `model`. */
+  const seedEmbedded = async (model = 'fake-embed-1') => {
+    const result = await seedLibrary(prisma, { logger: silent, embeddings: new FakeEmbeddings({ model }) });
+    expect(result).toMatchObject({ embedded: 63, embeddingError: null });
+  };
+  /** The library content without any vector. */
+  const seedContent = () => seedLibrary(prisma, { logger: silent });
+
+  // Every test starts from an empty database and seeds what it needs, so each one runs alone or in any order.
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('embeds every entry with input type "document" and stores 1024-dimension vectors with their model', async () => {
+    const embeddings = new FakeEmbeddings();
+    const result = await seedLibrary(prisma, { logger: silent, embeddings });
+
+    expect(result).toEqual({
+      created: 63, updated: 0, unchanged: 0, total: 63, version: '1.0.0', notInFile: [],
+      embedded: 63, embeddingsSkipped: null, embeddingError: null,
+    });
+    expect(embeddings.calls).toHaveLength(1);
+    expect(embeddings.calls[0].inputType).toBe('document');
+    expect(embeddings.texts).toEqual(SORTED_IDS.map(textOf));
+
+    const stored = await storedVectors();
+    expect([...stored.keys()]).toEqual(SORTED_IDS);
+    for (const id of ALL_IDS) expect(stored.get(id), id).toEqual(fakeVector(textOf(id)));
+    const dims = await prisma.$queryRaw<{ dims: number }[]>`
+      SELECT DISTINCT vector_dims(embedding) AS dims FROM "IndicatorLibraryEntry"`;
+    expect(dims).toEqual([{ dims: 1024 }]);
+    expect(await modelCounts()).toEqual({ 'fake-embed-1': 63 });
+  });
+
+  it('embeds nothing on a second run and leaves the rows alone', async () => {
+    await seedEmbedded();
+    const before = await updatedAtById();
+    const vectorsBefore = await storedVectors();
+    const embeddings = new FakeEmbeddings();
+
+    const result = await seedLibrary(prisma, { logger: silent, embeddings });
+
+    expect(result).toMatchObject({ created: 0, updated: 0, unchanged: 63, embedded: 0, embeddingsSkipped: null, embeddingError: null });
+    expect(embeddings.calls).toHaveLength(0);
+    expect(await updatedAtById()).toEqual(before);
+    expect(await storedVectors()).toEqual(vectorsBefore);
+  });
+
+  it('re-embeds an entry whose embedded text was updated, and only that entry', async () => {
+    await seedEmbedded();
+    await prisma.indicatorLibraryEntry.update({ where: { id: 'FS-01' }, data: { name: 'Edited by hand' } });
+    // Stands for the vector made from the hand-edited text.
+    await prisma.$executeRawUnsafe(`UPDATE "IndicatorLibraryEntry" SET embedding = array_fill(0.5, ARRAY[1024])::vector WHERE id = 'FS-01'`);
+    const vectorsBefore = await storedVectors();
+    const embeddings = new FakeEmbeddings();
+
+    const result = await seedLibrary(prisma, { logger: silent, embeddings });
+
+    expect(result).toMatchObject({ created: 0, updated: 1, unchanged: 62, embedded: 1, embeddingError: null });
+    expect(embeddings.texts).toEqual([textOf('FS-01')]);
+    const after = await storedVectors();
+    expect(after.get('FS-01')).toEqual(fakeVector(textOf('FS-01')));
+    for (const id of ALL_IDS) if (id !== 'FS-01') expect(after.get(id), id).toEqual(vectorsBefore.get(id));
+    expect(await modelCounts()).toEqual({ 'fake-embed-1': 63 });
+  });
+
+  it('keeps the vector when only fields outside the embedded text change', async () => {
+    await seedEmbedded();
+    await prisma.indicatorLibraryEntry.update({ where: { id: 'HE-01' }, data: { unit: 'Edited by hand', methods: ['kii'] } });
+    const vectorBefore = (await storedVectors()).get('HE-01');
+    const embeddings = new FakeEmbeddings();
+
+    const result = await seedLibrary(prisma, { logger: silent, embeddings });
+
+    expect(result).toMatchObject({ updated: 1, embedded: 0 });
+    expect(embeddings.calls).toHaveLength(0);
+    expect((await storedVectors()).get('HE-01')).toEqual(vectorBefore);
+    expect((await storedModels()).get('HE-01')).toBe('fake-embed-1');
+  });
+
+  it('embeds entries whose vector is missing', async () => {
+    await seedEmbedded();
+    await prisma.$executeRaw`UPDATE "IndicatorLibraryEntry" SET embedding = NULL, "embeddingModel" = NULL WHERE id IN ('WA-02', 'WA-01')`;
+    const embeddings = new FakeEmbeddings();
+
+    const result = await seedLibrary(prisma, { logger: silent, embeddings });
+
+    expect(result).toMatchObject({ updated: 0, unchanged: 63, embedded: 2 });
+    expect(embeddings.texts).toEqual([textOf('WA-01'), textOf('WA-02')]);
+    expect(await embeddedCount()).toBe(63);
+    expect(await modelCounts()).toEqual({ 'fake-embed-1': 63 });
+  });
+
+  it('re-embeds an entry edited while embeddings were off once a key is available', async () => {
+    await seedEmbedded();
+    await prisma.indicatorLibraryEntry.update({ where: { id: 'FS-02' }, data: { definition: 'Edited by hand' } });
+
+    const withoutKey = await seedLibrary(prisma, { logger: silent, embeddings: new NoopEmbeddingProvider() });
+    expect(withoutKey).toMatchObject({ updated: 1, embedded: 0, embeddingsSkipped: 'VOYAGE_API_KEY is not set (keyword search is used)' });
+    expect((await storedVectors()).has('FS-02')).toBe(false);
+    expect((await storedModels()).get('FS-02')).toBeNull();
+
+    const embeddings = new FakeEmbeddings();
+    const withKey = await seedLibrary(prisma, { logger: silent, embeddings });
+    expect(withKey).toMatchObject({ updated: 0, embedded: 1, embeddingsSkipped: null });
+    expect(embeddings.texts).toEqual([textOf('FS-02')]);
+    expect((await storedVectors()).get('FS-02')).toEqual(fakeVector(textOf('FS-02')));
+    expect((await storedModels()).get('FS-02')).toBe('fake-embed-1');
+  });
+
+  it('re-embeds every entry with reembedAll, even up-to-date ones', async () => {
+    await seedEmbedded();
+    const embeddings = new FakeEmbeddings();
+    const result = await seedLibrary(prisma, { logger: silent, embeddings, reembedAll: true });
+    expect(result).toMatchObject({ unchanged: 63, embedded: 63, embeddingError: null });
+    expect(embeddings.texts).toHaveLength(63);
+  });
+
+  it('re-embeds vectors made by another model, or recorded without one, on the next plain run', async () => {
+    await seedEmbedded('fake-embed-1');
+    // A vector stored before embeddingModel existed: its model is unknown.
+    await prisma.$executeRaw`UPDATE "IndicatorLibraryEntry" SET "embeddingModel" = NULL WHERE id = 'FS-01'`;
+    const sameModel = new FakeEmbeddings({ model: 'fake-embed-1' });
+    expect(await seedLibrary(prisma, { logger: silent, embeddings: sameModel })).toMatchObject({ embedded: 1 });
+    expect(sameModel.texts).toEqual([textOf('FS-01')]);
+
+    // VOYAGE_MODEL changed: every vector is re-made with the new model, without --reembed.
+    const newModel = new FakeEmbeddings({ model: 'fake-embed-2' });
+    const result = await seedLibrary(prisma, { logger: silent, embeddings: newModel });
+    expect(result).toMatchObject({ updated: 0, embedded: 63, embeddingError: null });
+    expect(newModel.texts).toEqual(SORTED_IDS.map(textOf));
+    expect(await modelCounts()).toEqual({ 'fake-embed-2': 63 });
+    expect((await seedLibrary(prisma, { logger: silent, embeddings: new FakeEmbeddings({ model: 'fake-embed-2' }) })).embedded).toBe(0);
+  });
+
+  it('heals a re-embed that failed half way on the next plain run', async () => {
+    await seedEmbedded('fake-embed-1');
+
+    const failed = await seedLibrary(prisma, {
+      logger: silent, reembedAll: true, embeddings: new FakeEmbeddings({ model: 'fake-embed-2', failOnCall: 1 }),
+    });
+    expect(failed).toMatchObject({ embedded: 0, embeddingError: 'Voyage embeddings request failed (HTTP 503) (gave up after 4 attempts)' });
+    expect(await modelCounts()).toEqual({ 'fake-embed-1': 63 });
+
+    // A batch that fails part way: the batches before it are stored with the new model.
+    const partial = await embedLibraryEntries(prisma, new FakeEmbeddings({ model: 'fake-embed-2', failOnCall: 2 }), ALL_IDS, { batchSize: 20 });
+    expect(partial).toEqual({ embedded: 20, error: 'Voyage embeddings request failed (HTTP 503) (gave up after 4 attempts)' });
+    expect(await modelCounts()).toEqual({ 'fake-embed-1': 43, 'fake-embed-2': 20 });
+
+    const embeddings = new FakeEmbeddings({ model: 'fake-embed-2' });
+    const healed = await seedLibrary(prisma, { logger: silent, embeddings });
+    expect(healed).toMatchObject({ embedded: 43, embeddingError: null });
+    expect(embeddings.texts).toEqual(SORTED_IDS.slice(20).map(textOf));
+    expect(await modelCounts()).toEqual({ 'fake-embed-2': 63 });
+  });
+
+  it('embeds entries kept outside the library file too, so none keeps a stale vector', async () => {
+    await seedEmbedded('fake-embed-1');
+    await addEntryOutsideFile('ZZ-99');
+    await prisma.$executeRaw`UPDATE "IndicatorLibraryEntry" SET embedding = array_fill(0.5, ARRAY[1024])::vector, "embeddingModel" = 'fake-embed-1' WHERE id = 'ZZ-99'`;
+
+    const embeddings = new FakeEmbeddings({ model: 'fake-embed-2' });
+    const result = await seedLibrary(prisma, { logger: silent, embeddings });
+    expect(result).toMatchObject({ notInFile: ['ZZ-99'], embedded: 64, embeddingError: null });
+    expect(await modelCounts()).toEqual({ 'fake-embed-2': 64 });
+
+    const forced = new FakeEmbeddings({ model: 'fake-embed-2' });
+    expect(await seedLibrary(prisma, { logger: silent, embeddings: forced, reembedAll: true })).toMatchObject({ embedded: 64 });
+  });
+
+  it('reports a provider failure without losing the content; the next run embeds what is missing', async () => {
+    await seedContent();
+    await prisma.indicatorLibraryEntry.update({ where: { id: 'FS-01' }, data: { name: 'Edited by hand' } });
+
+    const failed = await seedLibrary(prisma, { logger: silent, embeddings: new FakeEmbeddings({ failOnCall: 1 }) });
+    expect(failed).toMatchObject({
+      updated: 1, embedded: 0, embeddingsSkipped: null,
+      embeddingError: 'Voyage embeddings request failed (HTTP 503) (gave up after 4 attempts)',
+    });
+    expect((await prisma.indicatorLibraryEntry.findUniqueOrThrow({ where: { id: 'FS-01' } })).name).toMatch(/Food Consumption Score/);
+    expect(await embeddedCount()).toBe(0);
+
+    // Batches before a failure are kept.
+    const partial = await embedLibraryEntries(prisma, new FakeEmbeddings({ failOnCall: 2 }), ALL_IDS, { batchSize: 20 });
+    expect(partial).toEqual({ embedded: 20, error: 'Voyage embeddings request failed (HTTP 503) (gave up after 4 attempts)' });
+    expect(await embeddedCount()).toBe(20);
+
+    const embeddings = new FakeEmbeddings();
+    const retried = await seedLibrary(prisma, { logger: silent, embeddings });
+    expect(retried).toMatchObject({ updated: 0, embedded: 43, embeddingError: null });
+    expect(await embeddedCount()).toBe(63);
+  });
+
+  it('stores nothing from a provider that returns unusable vectors or names no model', async () => {
+    await seedContent();
+    const cases: [EmbeddingProvider, RegExp][] = [
+      [new FakeEmbeddings({ dimensions: 512 }), /512-dimension vectors; the library column holds 1024/],
+      [providerWith(async () => null), /returned no vectors/],
+      [providerWith(async texts => texts.slice(1).map(t => fakeVector(t))), /returned 62 vectors for 63 entries/],
+      [providerWith(async texts => texts.map(t => fakeVector(t, 3))), /has 3 dimensions \(expected 1024\)/],
+      [providerWith(async texts => texts.map((t, i) => (i === 5 ? fakeVector(t).fill(Number.NaN, 2, 3) : fakeVector(t)))), /Vector value \[2\] is not a finite number/],
+      [{ ...providerWith(async texts => texts.map(t => fakeVector(t))), model: null }, /names no model/],
+    ];
+    for (const [embeddings, message] of cases) {
+      const result = await seedLibrary(prisma, { logger: silent, embeddings });
+      expect(result.embedded).toBe(0);
+      expect(result.embeddingError).toMatch(message);
+    }
+    expect(await embeddedCount()).toBe(0);
+    expect(await modelCounts()).toEqual({ null: 63 });
+  });
+
+  it('embeds nothing and keeps embeddings NULL with the no-op provider (no network)', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const first = await seedLibrary(prisma, { logger: silent, embeddings: new NoopEmbeddingProvider() });
+    expect(first).toEqual({
+      created: 63, updated: 0, unchanged: 0, total: 63, version: '1.0.0', notInFile: [],
+      embedded: 0, embeddingsSkipped: 'VOYAGE_API_KEY is not set (keyword search is used)', embeddingError: null,
+    });
+    expect(await embeddedCount()).toBe(0);
+    expect((await seedLibrary(prisma, { logger: silent, embeddings: new NoopEmbeddingProvider(), reembedAll: true })).embedded).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('stores vectors when pgvector lives in a schema that is not on the search path (Supabase "extensions")', async () => {
+    await seedContent();
+    const extensionSchema = async (db: Pick<Prisma.TransactionClient, '$queryRaw'>) => {
+      const [row] = await db.$queryRaw<{ schema: string }[]>`
+        SELECT n.nspname AS schema FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'`;
+      return row.schema;
+    };
+    const schemaBefore = await extensionSchema(prisma);
+    const rollback = new Error('roll back the extension move');
+    let seen: unknown;
+
+    // Everything happens in one transaction that is rolled back: the extension returns to its schema.
+    await expect(prisma.$transaction(async tx => {
+      await tx.$executeRawUnsafe('CREATE SCHEMA raqib_test_vector_elsewhere');
+      await tx.$executeRawUnsafe('ALTER EXTENSION vector SET SCHEMA raqib_test_vector_elsewhere');
+      // What Prisma does with `?schema=public` in DATABASE_URL.
+      await tx.$executeRawUnsafe('SET LOCAL search_path = public');
+
+      // A bare `vector` (the cast the seed used to send) no longer resolves, as on Supabase.
+      const [{ bareVectorResolves }] = await tx.$queryRaw<{ bareVectorResolves: boolean }[]>`
+        SELECT to_regtype('vector') IS NOT NULL AS "bareVectorResolves"`;
+
+      const columnType = (await libraryVectorType(tx)).sql;
+      const result = await embedLibraryEntries(tx, new FakeEmbeddings(), ['FS-01', 'WA-01']);
+      // After a failed statement the transaction only accepts the rollback.
+      const rows = result.error ? [] : await tx.$queryRaw<{ id: string; vector: string; embeddingModel: string }[]>`
+        SELECT id, embedding::text AS vector, "embeddingModel" FROM "IndicatorLibraryEntry" WHERE embedding IS NOT NULL ORDER BY id`;
+      seen = { bareVectorResolves, columnType, result, rows: rows.map(r => ({ ...r, vector: JSON.parse(r.vector) })) };
+      throw rollback;
+    }, { timeout: 30_000 })).rejects.toBe(rollback);
+
+    expect(seen).toEqual({
+      bareVectorResolves: false,
+      columnType: 'raqib_test_vector_elsewhere.vector(1024)',
+      result: { embedded: 2, error: null },
+      rows: [
+        { id: 'FS-01', vector: fakeVector(textOf('FS-01')), embeddingModel: 'fake-embed-1' },
+        { id: 'WA-01', vector: fakeVector(textOf('WA-01')), embeddingModel: 'fake-embed-1' },
+      ],
+    });
+    expect(await extensionSchema(prisma)).toBe(schemaBefore);
+    expect(await embeddedCount()).toBe(0);
+    expect((await libraryVectorType(prisma)).sql).toBe('vector(1024)');
+  });
+
+  describe('npm run seed:library', () => {
+    const captured = () => {
+      const lines = { log: [] as string[], error: [] as string[] };
+      return { lines, out: { log: (l: string) => lines.log.push(l), error: (l: string) => lines.error.push(l) } };
+    };
+    // Only what the command reads: no JWT secrets, no ANTHROPIC_API_KEY, no Supabase settings.
+    const ONLY_DATABASE = { DATABASE_URL: process.env.TEST_DATABASE_URL };
+
+    it('runs with DATABASE_URL alone, prints the counts and says why embeddings were skipped', async () => {
+      const { lines, out } = captured();
+      expect(await runLibrarySeed(prisma, [], ONLY_DATABASE, out)).toBe(0);
+      expect(lines.log).toEqual([
+        'Indicator library 1.0.0: 63 entries (63 created, 0 updated, 0 unchanged)',
+        'Embeddings skipped: VOYAGE_API_KEY is not set (keyword search is used)',
+      ]);
+      expect(lines.error).toEqual([]);
+      expect(await embeddedCount()).toBe(0);
+    });
+
+    it('rejects unknown options and a missing DATABASE_URL before touching the database', async () => {
+      const unknown = captured();
+      expect(await runLibrarySeed(prisma, ['--everything'], ONLY_DATABASE, unknown.out)).toBe(1);
+      expect(unknown.lines.error).toEqual(['Indicator library seed failed: unknown option --everything (the only option is --reembed)']);
+
+      const noDatabase = captured();
+      expect(await runLibrarySeed(prisma, [], { DATABASE_URL: '  ' }, noDatabase.out)).toBe(1);
+      expect(noDatabase.lines.error).toEqual(['Indicator library seed failed: invalid configuration: DATABASE_URL is required']);
+      expect(await prisma.indicatorLibraryEntry.count()).toBe(0);
+    });
+
+    it('reads only the Voyage settings for embeddings', () => {
+      expect(librarySeedSettings(ONLY_DATABASE)).toEqual({ voyageApiKey: null, voyageModel: 'voyage-4' });
+      expect(librarySeedSettings({ ...ONLY_DATABASE, VOYAGE_API_KEY: ' pa-not-a-real-key ', VOYAGE_MODEL: ' voyage-4-lite ' }))
+        .toEqual({ voyageApiKey: 'pa-not-a-real-key', voyageModel: 'voyage-4-lite' });
+      expect(librarySeedSettings({ ...ONLY_DATABASE, VOYAGE_API_KEY: '', VOYAGE_MODEL: '' })).toEqual({ voyageApiKey: null, voyageModel: 'voyage-4' });
+    });
+
+    it('reports an embedding failure with exit code 1 and the model the next run will use', async () => {
+      await seedEmbedded('fake-embed-1');
+      // The CLI builds its own provider; a Voyage key with fetch stubbed to fail stands in for an outage (no network).
+      const fetchMock = vi.fn(async () => new Response(JSON.stringify({ detail: 'Invalid model' }), { status: 400 }));
+      vi.stubGlobal('fetch', fetchMock);
+      const { lines, out } = captured();
+
+      const code = await runLibrarySeed(prisma, ['--reembed'], { ...ONLY_DATABASE, VOYAGE_API_KEY: 'pa-not-a-real-key', VOYAGE_MODEL: 'voyage-4-lite' }, out);
+
+      expect(code).toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(lines.log).toEqual([
+        'Indicator library 1.0.0: 63 entries (0 created, 0 updated, 63 unchanged)',
+        'Embeddings (voyage voyage-4-lite): 0 embedded',
+      ]);
+      expect(lines.error).toEqual([
+        'Embeddings failed: Voyage embeddings request failed (HTTP 400: Invalid model)',
+        'The library content was saved. Entries without a voyage-4-lite embedding (including those the re-embed did not reach) are embedded on the next run.',
+      ]);
+      expect(await modelCounts()).toEqual({ 'fake-embed-1': 63 });
+    });
+
+    it('runs as a script without the API environment', async () => {
+      // A fresh directory, so no .env file can fill in the API settings.
+      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'raqib-seed-library-'));
+      try {
+        const { stdout } = await promisify(execFile)(
+          path.resolve(__dirname, '../node_modules/.bin/tsx'),
+          [path.resolve(__dirname, '../scripts/seed-library.ts')],
+          // NODE_ENV=production: the API env would also demand the Supabase storage settings.
+          { cwd, env: { PATH: process.env.PATH, NODE_ENV: 'production', ...ONLY_DATABASE }, timeout: 60_000 },
+        );
+        expect(stdout).toContain('Indicator library 1.0.0: 63 entries (63 created, 0 updated, 0 unchanged)');
+        expect(stdout).toContain('Embeddings skipped: VOYAGE_API_KEY is not set (keyword search is used)');
+      } finally {
+        fs.rmSync(cwd, { recursive: true, force: true });
+      }
+      expect(await prisma.indicatorLibraryEntry.count()).toBe(63);
+    }, 60_000);
+  });
+});
+
 describe.skipIf(!hasTestDatabase)('indicator library routes', () => {
   let auth: string;
   let viewerAuth: string;
@@ -302,7 +800,7 @@ describe.skipIf(!hasTestDatabase)('indicator library routes', () => {
     await resetDatabase();
     await seedLibrary(prisma, { logger: silent });
     await prisma.$executeRawUnsafe(
-      `UPDATE "IndicatorLibraryEntry" SET embedding = array_fill(0.1, ARRAY[1024])::vector WHERE id = 'FS-01'`,
+      `UPDATE "IndicatorLibraryEntry" SET embedding = array_fill(0.1, ARRAY[1024])::vector, "embeddingModel" = 'voyage-4' WHERE id = 'FS-01'`,
     );
     const org = await prisma.organization.create({
       data: { name: 'Org lib', type: 'local_ngo', country: 'Palestine', city: 'Ramallah', contactEmail: 'lib@example.org' },
@@ -325,12 +823,15 @@ describe.skipIf(!hasTestDatabase)('indicator library routes', () => {
     expect((await request(app).get('/api/indicator-library/FS-01')).status).toBe(401);
   });
 
-  it('lists every entry ordered by id, without the embedding', async () => {
+  it('lists every entry ordered by id, without the embedding or its model', async () => {
     const res = await list();
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(63);
     expect(ids(res)).toEqual([...ids(res)].sort());
-    for (const e of res.body) expect(e).not.toHaveProperty('embedding');
+    for (const e of res.body) {
+      expect(e).not.toHaveProperty('embedding');
+      expect(e).not.toHaveProperty('embeddingModel');
+    }
     expect(res.body.find((e: any) => e.id === 'FS-01')).toMatchObject({
       name: expect.stringMatching(/Food Consumption Score/), nameAr: expect.stringMatching(/[\u0600-\u06FF]/),
       calculation: { numerator: expect.any(String), denominator: expect.any(String) }, version: '1.0.0',
@@ -417,6 +918,7 @@ describe.skipIf(!hasTestDatabase)('indicator library routes', () => {
     const fs01 = await request(app).get('/api/indicator-library/FS-01').set('Authorization', auth);
     expect(fs01.status).toBe(200);
     expect(fs01.body).not.toHaveProperty('embedding');
+    expect(fs01.body).not.toHaveProperty('embeddingModel');
     const missing = await request(app).get('/api/indicator-library/XX-99').set('Authorization', auth);
     expect(missing.status).toBe(404);
     expect(missing.body.message).toBe('Library entry not found');

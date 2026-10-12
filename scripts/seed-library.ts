@@ -3,27 +3,25 @@
  * Idempotent and non-destructive: creates missing entries, updates only entries
  * whose content changed, never deletes. Safe to run in any environment.
  *
+ * Needs DATABASE_URL only (not the API environment). With VOYAGE_API_KEY set, every entry
+ * without a vector from VOYAGE_MODEL (default voyage-4, 1024 dimensions) is embedded: missing
+ * vectors, and vectors made by another model, so a model change heals on the next run; a
+ * second run embeds nothing. Without the key the library is searched by keyword.
+ *
  *   npm run seed:library
  *   npm run seed:library -- path/to/draft-library.json   # check and load another file
+ *   npm run seed:library -- --reembed                    # re-embed every entry, even up-to-date ones
+ *
+ * The logic lives in src/services/library/seedCli.ts, which never loads src/config/env.ts.
  */
 import 'dotenv/config';
-import path from 'path';
 import { PrismaClient } from '@prisma/client';
-import { LibraryValidationError } from '../src/services/library/load';
-import { seedLibrary } from '../src/services/library/seed';
+import { runLibrarySeed } from '../src/services/library/seedCli';
 
 const prisma = new PrismaClient();
 
-async function main() {
-  const file = process.argv[2];
-  const r = await seedLibrary(prisma, { path: file ? path.resolve(file) : undefined });
-  console.log(`Indicator library ${r.version}: ${r.total} entries (${r.created} created, ${r.updated} updated, ${r.unchanged} unchanged)`);
-}
-
-main()
-  .catch(err => {
-    if (err instanceof LibraryValidationError) console.error(err.message);
-    else console.error('Indicator library seed failed:', err?.message || err);
-    process.exitCode = 1;
+runLibrarySeed(prisma, process.argv.slice(2), process.env)
+  .then(code => {
+    process.exitCode = code;
   })
   .finally(() => prisma.$disconnect());

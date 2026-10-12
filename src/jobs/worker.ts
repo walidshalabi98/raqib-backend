@@ -5,10 +5,20 @@ import { generateFramework } from '../services/ai/frameworkGenerator';
 import { generateIndicatorAlternatives } from '../services/ai/indicatorAlternative';
 import { generateReportNarrative } from '../services/ai/reportNarrative';
 import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
+import { loadSharedSystemPrompt } from '../services/ai/prompts/system';
+import { safeErrorSummary } from '../services/ai/errors';
 
 import '../config/env'; // ensure env is loaded
 
 console.log('[Worker] Starting RAQIB job workers...');
+
+// Fail fast when the AI system prompt (knowledge/me-foundations.md §1–12) cannot be built.
+try {
+  console.log(`[Worker] AI system prompt: ${loadSharedSystemPrompt().version}`);
+} catch (err) {
+  console.error(`[Worker] ${(err as Error).message}`);
+  process.exit(1);
+}
 
 // Document Parsing Worker
 const documentWorker = new Worker('document-parsing', async (job: Job) => {
@@ -20,7 +30,7 @@ documentWorker.on('completed', (job) => {
   console.log(`[Worker] Document parsing completed: ${job.id}`);
 });
 documentWorker.on('failed', (job, err) => {
-  console.error(`[Worker] Document parsing failed: ${job?.id}`, err.message);
+  console.error(`[Worker] Document parsing failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
 
 // Framework Generation Worker
@@ -33,7 +43,7 @@ frameworkWorker.on('completed', (job) => {
   console.log(`[Worker] Framework generation completed: ${job.id}`);
 });
 frameworkWorker.on('failed', (job, err) => {
-  console.error(`[Worker] Framework generation failed: ${job?.id}`, err.message);
+  console.error(`[Worker] Framework generation failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
 
 // Indicator Alternatives Worker
@@ -47,7 +57,7 @@ indicatorWorker.on('completed', (job) => {
   console.log(`[Worker] Indicator alternatives completed: ${job.id}`);
 });
 indicatorWorker.on('failed', (job, err) => {
-  console.error(`[Worker] Indicator alternatives failed: ${job?.id}`, err.message);
+  console.error(`[Worker] Indicator alternatives failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
 
 // Report Generation Worker
@@ -60,7 +70,7 @@ reportWorker.on('completed', (job) => {
   console.log(`[Worker] Report generation completed: ${job.id}`);
 });
 reportWorker.on('failed', (job, err) => {
-  console.error(`[Worker] Report generation failed: ${job?.id}`, err.message);
+  console.error(`[Worker] Report generation failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
 
 // Qualitative Coding Worker
@@ -73,7 +83,7 @@ qualitativeWorker.on('completed', (job) => {
   console.log(`[Worker] Qualitative coding completed: ${job.id}`);
 });
 qualitativeWorker.on('failed', (job, err) => {
-  console.error(`[Worker] Qualitative coding failed: ${job?.id}`, err.message);
+  console.error(`[Worker] Qualitative coding failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
 
 // Graceful shutdown

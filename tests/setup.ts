@@ -15,6 +15,9 @@ process.env.SUPABASE_URL = '';
 process.env.SUPABASE_SERVICE_KEY = '';
 process.env.LOCAL_STORAGE_DIR = path.join(os.tmpdir(), `raqib-test-storage-${process.pid}`);
 process.env.API_URL = 'http://127.0.0.1';
+// An accidental real SDK call fails at once (nothing listens on port 9), without network.
+process.env.ANTHROPIC_BASE_URL = 'http://127.0.0.1:9';
+process.env.VOYAGE_API_KEY = '';
 
 // Never call a real AI model from tests.
 vi.mock('../src/services/ai/documentParser', () => ({ parseDocument: vi.fn().mockResolvedValue(undefined), chunkText: vi.fn() }));

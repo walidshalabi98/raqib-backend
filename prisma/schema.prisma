@@ -225,6 +225,7 @@ model Organization {
   users              User[]
   projects           Project[]
   webhookTokens      WebhookToken[]
+  aiCalls            AiCall[]
 }
 
 // Per-organisation token for inbound webhooks (KoboToolbox, Manasati).
@@ -289,36 +290,44 @@ model Project {
   reports             Report[]
   beneficiaries       Beneficiary[]
   beneficiaryServices BeneficiaryService[]
+  aiCalls             AiCall[]
 }
 
 model Document {
-  id            String        @id @default(uuid())
-  projectId     String
-  project       Project       @relation(fields: [projectId], references: [id])
-  uploadedBy    String
-  uploader      User          @relation(fields: [uploadedBy], references: [id])
-  fileName      String
-  fileUrl       String
-  fileType      DocumentType
-  fileSizeBytes BigInt?
-  parsedText    String?
-  parsingStatus ParsingStatus @default(pending)
-  uploadedAt    DateTime      @default(now())
+  id                String        @id @default(uuid())
+  projectId         String
+  project           Project       @relation(fields: [projectId], references: [id])
+  uploadedBy        String
+  uploader          User          @relation(fields: [uploadedBy], references: [id])
+  fileName          String
+  fileUrl           String
+  fileType          DocumentType
+  fileSizeBytes     BigInt?
+  parsedText        String? // extracted text with phone, ID and email numbers removed (safe to send to AI)
+  aiAnalysis        Json? // the model's analysis of the document (documentParser); kept apart from parsedText
+  // Uploaded as an FGD/KII transcript (qualitative upload): coded with the qualitative entry only,
+  // never sent to document analysis, framework generation or assessments.
+  qualitativeSource Boolean       @default(false)
+  parsingStatus     ParsingStatus @default(pending)
+  uploadedAt        DateTime      @default(now())
 }
 
 model Framework {
-  id          String          @id @default(uuid())
-  projectId   String
-  project     Project         @relation(fields: [projectId], references: [id])
-  version     Int             @default(1)
-  status      FrameworkStatus @default(draft)
-  name        String?
-  aiModelUsed String?
-  generatedAt DateTime        @default(now())
-  approvedAt  DateTime?
-  approvedBy  String?
-  indicators  Indicator[]
-  resultNodes ResultNode[]
+  id              String          @id @default(uuid())
+  projectId       String
+  project         Project         @relation(fields: [projectId], references: [id])
+  version         Int             @default(1)
+  status          FrameworkStatus @default(draft)
+  name            String?
+  aiModelUsed     String?
+  // Set when AI generation of this version failed (a safe message, never model output); such a
+  // version is not used as the project's current framework.
+  generationError String?
+  generatedAt     DateTime        @default(now())
+  approvedAt      DateTime?
+  approvedBy      String?
+  indicators      Indicator[]
+  resultNodes     ResultNode[]
 }
 
 // Results chain node: goal/impact → outcome → output (→ activity).
@@ -491,6 +500,7 @@ model IndicatorLibraryEntry {
   notes               String?
   version             String // library meta.version the entry was loaded from
   embedding           Unsupported("vector(1024)")? // Voyage voyage-4 (Phase 3)
+  embeddingModel      String? // embedding model that produced `embedding`; a different model means re-embed
   createdAt           DateTime                     @default(now())
   updatedAt           DateTime                     @updatedAt
   indicators          Indicator[]
@@ -598,4 +608,43 @@ model BeneficiaryService {
   indicator     Indicator?  @relation(fields: [indicatorId], references: [id])
   notes         String?
   createdAt     DateTime    @default(now())
+}
+
+enum AiCallStatus {
+  success
+  refusal
+  max_tokens
+  invalid_output
+  error
+}
+
+// One row per AI model call (BUILD_GUIDE Phase 3): model, prompt versions, tokens, latency and
+// estimated cost. Never stores prompts, model output or personal data.
+model AiCall {
+  id                  String        @id @default(uuid())
+  feature             String // e.g. "framework.indicators"
+  model               String // model requested (AI_MODEL_MAIN / AI_MODEL_FAST)
+  servedModel         String? // model that produced the answer (differs after a server-side fallback)
+  promptVersion       String
+  systemPromptVersion String?
+  status              AiCallStatus
+  stopReason          String?
+  errorType           String? // error class name only, never the message
+  attempts            Int           @default(1)
+  inputTokens         Int           @default(0)
+  outputTokens        Int           @default(0)
+  cacheReadTokens     Int           @default(0)
+  cacheWriteTokens    Int           @default(0)
+  latencyMs           Int
+  estimatedCostUsd    Decimal?      @db.Decimal(12, 6)
+  organizationId      String?
+  organization        Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  projectId           String?
+  project             Project?      @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  createdAt           DateTime      @default(now())
+
+  @@index([createdAt])
+  @@index([organizationId, createdAt])
+  @@index([feature, createdAt])
+  @@index([projectId, createdAt])
 }

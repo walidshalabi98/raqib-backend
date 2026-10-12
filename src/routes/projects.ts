@@ -4,6 +4,7 @@ import { assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { validationErrorBody } from '../services/dataPoints/fields';
+import { DOCUMENT_FIELDS, withTextLength } from './documents';
 import { sortResultNodes } from '../services/indicators/hierarchy';
 import { parseProjectCreate, parseProjectUpdate } from '../services/projects/validation';
 
@@ -45,8 +46,11 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
-      documents: { orderBy: { uploadedAt: 'desc' } },
+      // The same document fields as GET /projects/:id/documents: never parsedText or fileUrl.
+      documents: { select: DOCUMENT_FIELDS, orderBy: { uploadedAt: 'desc' } },
+      // The current framework: the newest version whose AI generation did not fail.
       frameworks: {
+        where: { generationError: null },
         orderBy: { version: 'desc' },
         take: 1,
         include: { indicators: { orderBy: { sortOrder: 'asc' } } },
@@ -58,7 +62,7 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
   });
 
   if (!project) throw new AppError(404, 'Project not found');
-  res.json(project);
+  res.json({ ...project, documents: await withTextLength(project.documents) });
 }));
 
 // PATCH /api/projects/:id — any subset of the create fields, plus status.
@@ -114,10 +118,12 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
   if (!project) throw new AppError(404, 'Project not found');
 
   // Each framework with its results chain (impact > outcome > output > activity, in display order)
+  // Every version, including failed AI generations (generationError set; they have no results or indicators).
   const frameworks = project.frameworks.map(fw => ({
     id: fw.id,
     version: fw.version,
     status: fw.status,
+    generationError: fw.generationError,
     resultNodes: sortResultNodes(fw.resultNodes).map(node => ({
       id: node.id,
       code: node.code,

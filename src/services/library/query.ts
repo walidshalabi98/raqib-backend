@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { IndicatorLevel, Prisma, Sector } from '@prisma/client';
 
-/** Every column except `embedding` (an Unsupported pgvector column Prisma never returns). */
+/** Every column except the derived `embedding` (an Unsupported pgvector column Prisma never returns) and `embeddingModel`. */
 export const LIBRARY_ENTRY_SELECT = {
   id: true,
   sector: true,

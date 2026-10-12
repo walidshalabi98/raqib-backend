@@ -8,6 +8,8 @@ import { assertFileContent, documentUpload } from '../middleware/upload';
 import { buildDocumentKey, getStorage } from '../services/storage';
 import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
 import { parseDocument } from '../services/ai/documentParser';
+import { safeErrorSummary } from '../services/ai/errors';
+import { redactPersonalData } from '../services/ai/redact';
 
 const router = Router();
 
@@ -53,7 +55,7 @@ router.post('/projects/:id/qualitative', authenticate, aiLimiter, asyncHandler(a
 
   // Auto-trigger AI thematic coding after creation
   codeQualitativeEntry(entry.id, req.params.id).catch(err => {
-    console.error('Auto-coding qualitative entry failed:', err.message);
+    console.error(`Auto-coding qualitative entry ${entry.id} failed: ${safeErrorSummary(err)}`);
   });
 
   res.status(201).json(entry);
@@ -72,7 +74,8 @@ router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documen
 
   const { entryType, title, participants, location, dateConducted, facilitator } = req.body;
 
-  // 1. Create a document record for parsing
+  // 1. A document record for the transcript. qualitativeSource: it is coded with its qualitative entry
+  // only, and never sent to document analysis, framework generation or assessment summaries.
   const document = await prisma.document.create({
     data: {
       projectId: req.params.id,
@@ -82,25 +85,26 @@ router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documen
       fileType: 'other',
       fileSizeBytes: file.size,
       parsingStatus: 'pending',
+      qualitativeSource: true,
     },
   });
 
-  // 2. Parse the document to extract text
-  parseDocument(document.id).then(async () => {
-    // 3. After parsing, create a qualitative entry with the parsed text
-    const parsedDoc = await prisma.document.findUnique({ where: { id: document.id } });
-    const content = parsedDoc?.parsedText || `[Content from uploaded file: ${file.originalname}]`;
+  // File names can hold phone or ID numbers: the entry's title and placeholder content use a redacted name.
+  const safeFileName = redactPersonalData(file.originalname).text;
 
-    // Strip AI analysis marker from content for the qualitative entry
-    const aiMarker = '---AI_ANALYSIS---';
-    const cleanContent = content.includes(aiMarker) ? content.substring(0, content.indexOf(aiMarker)).trim() : content;
+  // 2. Parse the document to extract its text (parseDocument stores only redacted text)
+  parseDocument(document.id).then(async () => {
+    // 3. After parsing, create a qualitative entry with the parsed text. parsedText is the transcript
+    // as just extracted and redacted: there is no appended AI analysis to cut off.
+    const parsedDoc = await prisma.document.findUnique({ where: { id: document.id }, select: { parsedText: true } });
+    const content = parsedDoc?.parsedText?.trim() ? parsedDoc.parsedText : `[Content from uploaded file: ${safeFileName}]`;
 
     const entry = await prisma.qualitativeEntry.create({
       data: {
         projectId: req.params.id,
         entryType: entryType || 'fgd_transcript',
-        title: title || `Transcript: ${file.originalname}`,
-        content: cleanContent,
+        title: title || `Transcript: ${safeFileName}`,
+        content,
         participants: participants ? parseInt(participants) : undefined,
         location,
         dateConducted: dateConducted ? new Date(dateConducted) : undefined,
@@ -111,18 +115,19 @@ router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documen
 
     // 4. Auto-trigger AI thematic coding
     codeQualitativeEntry(entry.id, req.params.id).catch(err => {
-      console.error('Qualitative coding after upload failed:', err.message);
+      console.error(`Qualitative coding after upload failed for entry ${entry.id}: ${safeErrorSummary(err)}`);
     });
 
-    console.log(`[Qualitative] Created entry from uploaded doc: ${file.originalname}`);
+    // Log ids only: file names can hold personal data.
+    console.log(`[Qualitative] Created entry ${entry.id} from uploaded document ${document.id}`);
   }).catch(err => {
-    console.error('Document parsing for qualitative failed:', err.message);
+    console.error(`Document parsing for qualitative failed for document ${document.id}: ${safeErrorSummary(err)}`);
   });
 
   res.status(202).json({
     documentId: document.id,
     status: 'processing',
-    message: 'Document is being parsed and analyzed. A qualitative entry will be created automatically.',
+    message: 'The transcript is being read. A qualitative entry will be created and coded automatically.',
   });
 }));
 
@@ -139,7 +144,7 @@ router.post('/qualitative/:id/code', authenticate, aiLimiter, asyncHandler(async
 
   // Thematic coding runs inline (no Redis/BullMQ needed)
   codeQualitativeEntry(req.params.id, entry.projectId).catch(err => {
-    console.error('Qualitative coding failed:', err.message);
+    console.error(`Qualitative coding failed for entry ${req.params.id}: ${safeErrorSummary(err)}`);
   });
 
   res.status(202).json({ entryId: req.params.id, status: 'processing' });

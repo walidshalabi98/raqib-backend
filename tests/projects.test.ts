@@ -227,6 +227,7 @@ describe.skipIf(!hasTestDatabase)('projects API: sectors, humanitarian and donor
       id: a.framework.id,
       version: 1,
       status: 'draft',
+      generationError: null,
       resultNodes: [
         { id: goal.id, code: 'Goal', level: 'impact', text: 'Improved learning', textAr: 'تحسين التعلم', parentId: null },
         { id: a.result.id, code: 'O1', level: 'outcome', text: 'Outcome a', textAr: null, parentId: goal.id },
@@ -368,5 +369,52 @@ describe.skipIf(!hasTestDatabase)('projects API: sectors, humanitarian and donor
       expect(res.status).toBe(404);
       expect((await prisma.project.findUniqueOrThrow({ where: { id: b.project.id } })).sector).toBe('education');
     });
+  });
+});
+
+describe.skipIf(!hasTestDatabase)('GET /projects/:id and the indicator export: document fields and the current framework', () => {
+  let a: OrgFixture;
+
+  beforeAll(async () => {
+    await resetDatabase();
+    a = await createOrgFixture('docs');
+    await prisma.document.update({
+      where: { id: a.document.id },
+      data: { parsedText: 'Legacy text, call 0599123456', parsingStatus: 'completed', aiAnalysis: { summary: 'S' } },
+    });
+    // A newer version whose AI generation failed: never the project's current framework.
+    await prisma.framework.create({ data: { projectId: a.project.id, version: 2, generationError: 'The model declined this request.' } });
+  });
+
+  it('lists documents without parsedText, fileUrl or uploadedBy, with textLength', async () => {
+    const res = await request(app).get(`/api/projects/${a.project.id}`).set('Authorization', a.adminAuth);
+    expect(res.status).toBe(200);
+    expect(res.body.documents).toHaveLength(1);
+    const [doc] = res.body.documents;
+    expect(Object.keys(doc).sort()).toEqual(
+      ['aiAnalysis', 'fileName', 'fileSizeBytes', 'fileType', 'id', 'parsingStatus', 'projectId', 'qualitativeSource', 'textLength', 'uploadedAt', 'uploader'].sort(),
+    );
+    expect(doc.textLength).toBe('Legacy text, call 0599123456'.length);
+    expect(JSON.stringify(res.body)).not.toContain('0599123456');
+    expect(JSON.stringify(res.body)).not.toContain(a.document.fileUrl);
+  });
+
+  it('returns the newest version without a generationError as the framework, in the detail and the indicator export', async () => {
+    const detail = await request(app).get(`/api/projects/${a.project.id}`).set('Authorization', a.adminAuth);
+    expect(detail.body.frameworks.map((f: { version: number }) => f.version)).toEqual([1]);
+    expect(detail.body.frameworks[0].indicators.map((i: { id: string }) => i.id)).toEqual([a.indicator.id]);
+
+    const exported = await request(app).get(`/api/projects/${a.project.id}/export/indicators`).set('Authorization', a.adminAuth);
+    expect(exported.status).toBe(200);
+    expect(exported.body.framework).toEqual({ version: 1, status: 'draft' });
+    expect(exported.body.indicators.map((i: { indicator: string }) => i.indicator)).toEqual(['Indicator docs']);
+  });
+
+  it('exports every version with its generationError', async () => {
+    const res = await request(app).get(`/api/projects/${a.project.id}/export`).set('Authorization', a.adminAuth);
+    expect(res.body.frameworks.map((f: { version: number; generationError: string | null }) => [f.version, f.generationError])).toEqual([
+      [2, 'The model declined this request.'],
+      [1, null],
+    ]);
   });
 });
