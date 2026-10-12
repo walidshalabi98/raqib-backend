@@ -92,20 +92,28 @@ router.patch('/results/:id', authenticate, authorize('org_admin', 'platform_admi
 
   if (input.code !== undefined) await assertResultCodeFree(node.frameworkId, input.code, node.id);
 
-  const updated = await prisma.resultNode.update({
-    where: { id: node.id },
-    data: {
-      ...(input.level !== undefined && { level: input.level }),
-      ...(input.code !== undefined && { code: input.code }),
-      ...(input.text !== undefined && { text: input.text }),
-      ...(input.textAr !== undefined && { textAr: input.textAr }),
-      ...(input.parentId !== undefined && { parentId: input.parentId }),
-      ...(input.sortOrder !== undefined && { sortOrder: input.sortOrder }),
-    },
-    include: RESULT_NODE_INCLUDE,
+  const { updated, updatedIndicators } = await prisma.$transaction(async tx => {
+    const saved = await tx.resultNode.update({
+      where: { id: node.id },
+      data: {
+        ...(input.level !== undefined && { level: input.level }),
+        ...(input.code !== undefined && { code: input.code }),
+        ...(input.text !== undefined && { text: input.text }),
+        ...(input.textAr !== undefined && { textAr: input.textAr }),
+        ...(input.parentId !== undefined && { parentId: input.parentId }),
+        ...(input.sortOrder !== undefined && { sortOrder: input.sortOrder }),
+      },
+      include: RESULT_NODE_INCLUDE,
+    });
+    // Its indicators measure this result, so they move to its new level (knowledge/me-foundations.md §2 rule 5).
+    const moved = level !== node.level
+      ? await tx.indicator.updateMany({ where: { resultId: node.id }, data: { level } })
+      : { count: 0 };
+    return { updated: saved, updatedIndicators: moved.count };
   });
 
-  res.json(updated);
+  // updatedIndicators: how many linked indicators changed level with the result.
+  res.json({ ...updated, updatedIndicators });
 }));
 
 // DELETE /api/results/:id — refused while it has child results; its indicators are unlinked (ON DELETE SET NULL)

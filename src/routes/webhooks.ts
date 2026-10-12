@@ -3,6 +3,7 @@ import { prisma } from '../config/prisma';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { assertIndicatorsInProject } from '../middleware/access';
 import { authenticateWebhook, logWebhookRejection } from '../middleware/webhookAuth';
+import { normaliseValue } from '../services/dataPoints/validation';
 
 const router = Router();
 
@@ -45,7 +46,7 @@ router.post('/manasati', asyncHandler(async (req: Request, res: Response) => {
         data: {
           indicatorId: indicator.id,
           projectId: project.id,
-          value: String(item.value),
+          value: normaliseValue(String(item.value)),
           collectionDate: new Date(item.date || new Date()),
           collectionMethod: 'secondary_data',
           dataSource: 'Manasati',
@@ -102,7 +103,7 @@ router.post('/kobotoolbox', asyncHandler(async (req: Request, res: Response) => 
         data: {
           indicatorId: String(indicatorId),
           projectId: project.id,
-          value: String(submission[field]),
+          value: normaliseValue(String(submission[field])),
           collectionDate: new Date(submission._submission_time || new Date()),
           collectionMethod: 'hh_survey',
           dataSource: 'KoboToolbox',

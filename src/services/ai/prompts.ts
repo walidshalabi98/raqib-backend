@@ -10,7 +10,7 @@ export const SYSTEM_CONTEXT = `You are an expert M&E (Monitoring & Evaluation) s
 You always produce structured, professional outputs that follow international M&E best practices while being contextually appropriate for Palestine.`;
 
 /** Version of the framework generator prompts, stored on every generated indicator (Indicator.promptVersion). */
-export const FRAMEWORK_PROMPT_VERSION = 'framework-v2';
+export const FRAMEWORK_PROMPT_VERSION = 'framework-v3';
 
 export interface FrameworkProjectInfo {
   name: string;
@@ -192,8 +192,8 @@ REQUIREMENTS:
 ${projectInfo.humanitarian ? '- Humanitarian project: include at least one accountability to affected people indicator (prefer AC-01 to AC-05) and disaggregate people-level indicators by sex, age and disability.\n' : ''}
 BASELINES AND TARGETS — never invent numbers:
 - baselineValue: only a value written in the project documents (see documentFigures), copied exactly, with baselineBasis "document". Otherwise baselineValue "" and baselineBasis "none". baselineMethod says how and when the baseline is or will be measured ("pending baseline survey, planned for <month year>").
-- targetValue: only (a) a value written in the project documents, copied exactly (targetBasis "document"), or (b) a recognised standard threshold such as the Sphere minimum of 15 litres per person per day (targetBasis "standard_threshold", with standardReferenceCode). Otherwise targetValue "" and targetBasis "method_only" (describe the target-setting method in targetJustification, e.g. "baseline + 10 percentage points, consistent with similar programmes; confirm after the baseline survey") or "none".
-- targetJustification: where the target comes from, or the proposed method when there is no document value.
+- targetValue: only (a) a value written in the project documents, copied exactly (targetBasis "document"), or (b) a standard threshold written in the linked library candidate (its standard or definition), such as the Sphere minimum of 15 litres per person per day (targetBasis "standard_threshold", with that candidate's id as libraryId; a threshold that is not written in the linked library entry is removed). Otherwise targetValue "" and targetBasis "method_only" (describe in targetJustification how the target will be set from the baseline, e.g. "baseline + 10 percentage points, consistent with similar programmes; confirm after the baseline survey") or "none".
+- targetJustification: where the target comes from, or the proposed method (relative to the baseline) when there is no document value.
 ${options.hasDocuments ? '' : '- No project documents were provided: every baselineBasis must be "none" and no targetBasis may be "document".\n'}
 Return a JSON array of indicators:
 [

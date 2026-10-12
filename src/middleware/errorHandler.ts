@@ -57,11 +57,19 @@ export function errorHandler(err: Error, _req: Request, res: Response, _next: Ne
   if (err.constructor?.name === 'PrismaClientKnownRequestError') {
     const prismaErr = err as any;
     if (prismaErr.code === 'P2002') {
-      res.status(409).json({ message: 'A record with that value already exists' });
+      // ResultNode @@unique([frameworkId, code]): a duplicate that got past the API's check (e.g. two requests at once).
+      const target: unknown = prismaErr.meta?.target;
+      const resultCode = prismaErr.meta?.modelName === 'ResultNode' && Array.isArray(target) && target.includes('code');
+      res.status(409).json({ message: resultCode ? 'A result with that code already exists in this framework' : 'A record with that value already exists' });
       return;
     }
     if (prismaErr.code === 'P2025') {
       res.status(404).json({ message: 'Record not found' });
+      return;
+    }
+    // Foreign key violation: the request refers to a record that does not exist (often deleted meanwhile).
+    if (prismaErr.code === 'P2003') {
+      res.status(400).json({ message: 'A related record does not exist (it may have been deleted).' });
       return;
     }
   }

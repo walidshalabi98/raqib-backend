@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { assertAssessmentInProject, assertIndicatorAccess, assertIndicatorsInProject, assertProjectAccess } from '../middleware/access';
-import { authenticate } from '../middleware/auth';
+import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { validationErrorBody } from '../services/dataPoints/fields';
 import {
@@ -53,8 +53,8 @@ router.get('/indicators/:id/data', authenticate, asyncHandler(async (req: Reques
   });
 }));
 
-// POST /api/indicators/:id/data — Add data point (optionally disaggregated by `breakdown`)
-router.post('/indicators/:id/data', authenticate, asyncHandler(async (req: Request, res: Response) => {
+// POST /api/indicators/:id/data — Add data point (optionally disaggregated by `breakdown`); donor viewers only read
+router.post('/indicators/:id/data', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const indicator = await assertIndicatorAccess(req, req.params.id);
 
   const fields = parseDataPointFields(req.body);
@@ -62,7 +62,7 @@ router.post('/indicators/:id/data', authenticate, asyncHandler(async (req: Reque
     res.status(400).json(validationErrorBody(fields.errors));
     return;
   }
-  const input = completeDataPoint(fields.data, indicator.unit);
+  const input = completeDataPoint(fields.data, indicator);
   if (input.ok === false) {
     res.status(400).json(validationErrorBody(input.errors));
     return;
@@ -87,7 +87,7 @@ router.post('/indicators/:id/data', authenticate, asyncHandler(async (req: Reque
     },
   });
 
-  // Update indicator's current value
+  // Update indicator's current value (numbers in the same canonical form as the data point)
   await prisma.indicator.update({
     where: { id: req.params.id },
     data: { currentValue: dp.value },
@@ -96,8 +96,8 @@ router.post('/indicators/:id/data', authenticate, asyncHandler(async (req: Reque
   res.status(201).json(dataPoint);
 }));
 
-// POST /api/projects/:id/data/bulk — Bulk import data (each row may carry a `breakdown`)
-router.post('/projects/:id/data/bulk', authenticate, asyncHandler(async (req: Request, res: Response) => {
+// POST /api/projects/:id/data/bulk — Bulk import data (each row may carry a `breakdown`); donor viewers only read
+router.post('/projects/:id/data/bulk', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
   const { dataPoints } = req.body;
@@ -131,15 +131,15 @@ router.post('/projects/:id/data/bulk', authenticate, asyncHandler(async (req: Re
     await assertAssessmentInProject(req.params.id, assessmentId as string);
   }
 
-  // Breakdowns are checked against each indicator's unit (count units must add up to the value).
+  // Breakdowns are checked against each indicator's unit and text (count units must add up to the value).
   const indicators = await prisma.indicator.findMany({
     where: { id: { in: Array.from(new Set(indicatorIds)) }, framework: { projectId: req.params.id } },
-    select: { id: true, unit: true },
+    select: { id: true, unit: true, indicatorText: true },
   });
-  const unitById = new Map(indicators.map(ind => [ind.id, ind.unit]));
+  const indicatorById = new Map(indicators.map(ind => [ind.id, ind]));
   const data: Prisma.DataPointCreateManyInput[] = [];
   rows.forEach((row, i) => {
-    const input = completeDataPoint(row, unitById.get(row.indicatorId), rowLabel(i));
+    const input = completeDataPoint(row, indicatorById.get(row.indicatorId) ?? { unit: null }, rowLabel(i));
     if (input.ok === false) {
       errors.push(...input.errors);
       return;
@@ -165,7 +165,19 @@ router.post('/projects/:id/data/bulk', authenticate, asyncHandler(async (req: Re
     return;
   }
 
-  const created = await prisma.dataPoint.createMany({ data });
+  const created = await prisma.$transaction(async tx => {
+    const result = await tx.dataPoint.createMany({ data });
+    // Each imported indicator's current value becomes its most recent data point (by collection date).
+    for (const indicatorId of new Set(data.map(d => d.indicatorId))) {
+      const latest = await tx.dataPoint.findFirst({
+        where: { indicatorId },
+        orderBy: [{ collectionDate: 'desc' }, { createdAt: 'desc' }],
+        select: { value: true },
+      });
+      if (latest) await tx.indicator.update({ where: { id: indicatorId }, data: { currentValue: latest.value } });
+    }
+    return result;
+  });
 
   res.status(201).json({ count: created.count });
 }));

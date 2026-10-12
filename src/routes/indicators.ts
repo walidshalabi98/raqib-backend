@@ -2,23 +2,41 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertIndicatorAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
-import { asyncHandler } from '../middleware/errorHandler';
+import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
+import { levelForResult } from '../services/indicators/hierarchy';
 import { assertIndicatorReferences } from '../services/indicators/references';
 import { INDICATOR_INCLUDE } from '../services/indicators/selects';
-import { parseIndicatorUpdate, toIndicatorUpdateData } from '../services/indicators/validation';
+import { parseIndicatorUpdate, provenanceAfterUpdate, toIndicatorUpdateData } from '../services/indicators/validation';
 
 const router = Router();
 
-// PATCH /api/indicators/:id — any subset of the indicator and reference-sheet fields
+// PATCH /api/indicators/:id — any subset of the indicator and reference-sheet fields.
+// Provenance is set by the server; a linked indicator's level must match its result's level.
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const indicator = await assertIndicatorAccess(req, req.params.id);
   const input = parseIndicatorUpdate(req.body);
-  await assertIndicatorReferences(indicator.frameworkId, input);
+  const { result } = await assertIndicatorReferences(indicator.frameworkId, input);
+  const data = toIndicatorUpdateData(input);
+
+  // Level fits the result (knowledge/me-foundations.md §2 rule 5), checked whenever the update sets either.
+  if (input.level !== undefined || input.resultId !== undefined) {
+    const resultId = input.resultId === undefined ? indicator.resultId : input.resultId;
+    const resultLevel = result?.level ?? (resultId
+      ? (await prisma.resultNode.findUnique({ where: { id: resultId }, select: { level: true } }))?.level
+      : null);
+    // As on create, a newly linked result sets the level when none is sent.
+    const fit = levelForResult(input.level ?? (input.resultId === undefined ? indicator.level : undefined), resultLevel);
+    if (fit.ok === false) throw new AppError(400, fit.message);
+    if (fit.level !== undefined && fit.level !== indicator.level) data.level = fit.level;
+  }
+
+  const provenance = provenanceAfterUpdate(indicator.provenance, input.libraryId === undefined ? indicator.libraryId : input.libraryId);
+  if (provenance !== indicator.provenance) data.provenance = provenance;
 
   const updated = await prisma.indicator.update({
     where: { id: indicator.id },
-    data: toIndicatorUpdateData(input),
+    data,
     include: INDICATOR_INCLUDE,
   });
 

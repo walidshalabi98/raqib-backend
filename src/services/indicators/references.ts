@@ -36,15 +36,22 @@ export async function loadParentResult(frameworkId: string, parentId: string): P
   return parent;
 }
 
-/** 409 when another result in the framework already uses the code (case-insensitive). */
+/** True when two result codes are the same, ignoring case only ("o_1" = "O_1", but "OX1" ≠ "O_1"). */
+export function sameResultCode(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * 409 when another result in the framework already uses the code (case-insensitive).
+ * Compared exactly in code: Prisma's case-insensitive `equals` becomes ILIKE, where
+ * "_" and "%" are wildcards. A framework has tens of results, so loading the codes is cheap.
+ */
 export async function assertResultCodeFree(frameworkId: string, code: string, exceptId?: string): Promise<void> {
-  const clash = await prisma.resultNode.findFirst({
-    where: {
-      frameworkId,
-      code: { equals: code, mode: 'insensitive' },
-      ...(exceptId && { id: { not: exceptId } }),
-    },
-    select: { id: true },
+  const others = await prisma.resultNode.findMany({
+    where: { frameworkId, ...(exceptId && { id: { not: exceptId } }) },
+    select: { code: true },
   });
-  if (clash) throw new AppError(409, `A result with code "${code}" already exists in this framework`);
+  if (others.some(other => sameResultCode(other.code, code))) {
+    throw new AppError(409, `A result with code "${code}" already exists in this framework`);
+  }
 }

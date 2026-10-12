@@ -152,9 +152,15 @@ Handle `stop_reason: "max_tokens"` (retry once with a higher limit or split by r
 | Name contains a target or direction ("increase to", "by 20%", "reach", digits followed by %) | Add warning "move target out of the name", −15 |
 | Name contains " and " joining two measurements (heuristic) | Add warning "may be double-barrelled", −10 |
 | `unit = percent` with empty numerator or denominator | Add warning, −15 |
-| Indicator about people (name matches people/persons/households/women/men/children/youth/students/farmers/participants/beneficiaries, or Arabic equivalents) without `sex` or `sex_of_household_head` in disaggregation | Add `sex` automatically, add info note |
+| Linked library entry disaggregates by `sex` or `sex_of_household_head` and the suggestion does not | Add the entry's key(s) first (so household indicators get `sex_of_household_head`, not `sex`) |
+| Indicator about people (name matches people/persons/individuals/households/women/men/girls/boys/children/youth/students/pupils/learners/teachers/staff/employees/workers/officials (plural only)/members/residents/citizens/parents/caregivers/entrepreneurs/owners/farmers/participants/beneficiaries/trainees/graduates/patients/refugees/survivors, or Arabic equivalents; the shared list is `isPeopleLevelIndicator` in `src/services/ai/frameworkNormalize.ts`) without `sex` or `sex_of_household_head` in disaggregation | Add `sex` automatically, add info note |
 | `targetBasis = "document"` but the value does not appear in any `documentFacts` excerpt | Change to `method_only`, clear the value, add warning "target not found in documents" |
 | `baselineBasis = "document"` but value not found | Same treatment |
+| Document value kept | Cite the file it was found in: `(source: <fileName>)` at the end of `baselineMethod` or `targetJustification` |
+| `targetBasis = "standard_threshold"` but no library entry is linked, or the value does not appear in the linked entry's own text (definition, notes, means of verification, calculation, standard reference framework and code; whole numbers only, "4" is not found in "42") | Change to `method_only`, clear the value, add warning "standard threshold not found in the library entry"; a `standardReferenceCode` written by the model is not enough |
+| `targetBasis = "method_only"` and `targetSuggestion` does not set the target from the baseline (mentions neither "baseline" nor "خط الأساس") | Replace with the default method "Proposed method: set after the baseline survey, using comparable programmes — confirm after baseline." |
+| A library entry is linked and has a `standardReference` | `standardReferenceCode` becomes the entry's "<framework> <code>"; the model's code is kept only when the entry has none |
+| Document text after the `---AI_ANALYSIS---` marker (the parser's own AI summary appended to `Document.parsedText`) | Never used as `documentFacts` or evidence; cut with `stripAiAnalysis()` before matching |
 | Output indicator using `hh_survey` as method | Info note "outputs are usually counted from records" |
 | Impact indicator not using `secondary_data` | Info note |
 | More suggestions for one result than `maxIndicatorsPerResult` | Keep highest confidence/score, drop the rest with a framework warning |

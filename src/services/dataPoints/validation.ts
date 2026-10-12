@@ -1,12 +1,12 @@
 import { CollectionMethod, Prisma } from '@prisma/client';
 import { z } from 'zod';
-import { Breakdown, validateBreakdown } from './breakdown';
+import { Breakdown, parseNumeric, validateBreakdown } from './breakdown';
 import { dateField, enumField, formatIssues, optionalText, requiredText } from './fields';
 
 /**
  * Request-body validation for data points (POST /api/indicators/:id/data and
  * POST /api/projects/:id/data/bulk). Pure functions: the routes load the
- * indicator's unit and pass it in.
+ * indicator's unit and text and pass them in.
  */
 
 export type ParseResult<T> = { ok: true; data: T } | { ok: false; errors: string[] };
@@ -34,6 +34,12 @@ const bulkRowSchema = z.object({ ...fields, indicatorId: requiredText() }, { inv
 /** Validated fields; `breakdown` is still raw until checked against the indicator's unit. */
 export type DataPointFields = z.infer<typeof dataPointSchema>;
 export type BulkRowFields = z.infer<typeof bulkRowSchema>;
+
+/** What the breakdown rules need to know about the indicator (see breakdownRules). */
+export interface BreakdownIndicator {
+  unit: string | null | undefined;
+  indicatorText?: string | null;
+}
 
 /** Data point fields ready for prisma.dataPoint.create (without ids). */
 export interface DataPointInput {
@@ -66,20 +72,33 @@ export function parseBulkRowFields(row: unknown, index: number): ParseResult<Bul
 }
 
 /**
- * Checks the breakdown against the indicator's unit and returns the data
- * point ready to store. `prefix` is prepended to every message (e.g. "Row 3: ").
+ * A value that reads as a number ("1,200", "١٬٢٠٠", " 12.50 ") in canonical form
+ * (String(number): "1200", "12.5"), so stored values sort, chart and compare as
+ * numbers. Other values ("Yes", "12 people") are returned unchanged.
+ */
+export function normaliseValue(value: string): string {
+  const n = parseNumeric(value);
+  return n === null ? value : String(n);
+}
+
+/**
+ * Checks the breakdown against the indicator (unit, and text when it has no
+ * unit) and returns the data point ready to store, with a numeric value in
+ * canonical form. `prefix` is prepended to every message (e.g. "Row 3: ").
  */
 export function completeDataPoint(
   input: DataPointFields,
-  unit: string | null | undefined,
+  indicator: BreakdownIndicator,
   prefix = '',
 ): ParseResult<DataPointInput> {
-  const breakdown = validateBreakdown(input.breakdown, { value: input.value, unit });
+  const breakdown = validateBreakdown(input.breakdown, {
+    value: input.value, unit: indicator.unit, indicatorText: indicator.indicatorText,
+  });
   if (breakdown.ok === false) return { ok: false, errors: breakdown.errors.map(e => `${prefix}${e}`) };
   return {
     ok: true,
     data: {
-      value: input.value,
+      value: normaliseValue(input.value),
       collectionDate: input.collectionDate,
       collectionMethod: input.collectionMethod,
       dataSource: input.dataSource,

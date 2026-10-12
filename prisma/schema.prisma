@@ -337,6 +337,7 @@ model ResultNode {
   createdAt   DateTime       @default(now())
   indicators  Indicator[]
 
+  @@unique([frameworkId, code])
   @@index([frameworkId])
   @@index([parentId])
 }

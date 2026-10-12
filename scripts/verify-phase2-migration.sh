@@ -7,9 +7,10 @@
 #                 load the seed from that revision with a Prisma client generated from that schema, add a few
 #                 edge-case fixtures, snapshot row counts and checksums of every existing column of every table,
 #                 apply the SQL file with psql, then check: counts and checksums unchanged, every indicator linked
-#                 to a result, results chain placeholders follow the hierarchy rule, primary sector in sectors,
-#                 provenance, RLS on the new tables, the app's Prisma client can read the data, a second run is
-#                 refused without changes, and `prisma migrate diff` reports no drift.
+#                 to a result, results chain placeholders follow the hierarchy rule, result codes unique per
+#                 framework, primary sector in sectors, provenance (including an indicator added by hand to an
+#                 AI-generated framework later), RLS on the new tables, the app's Prisma client can read the data,
+#                 a second run is refused without changes, and `prisma migrate diff` reports no drift.
 #   3. CLEANUP    drop the throwaway databases (set KEEP_DBS=1 to keep them for inspection).
 #
 # Usage:   scripts/verify-phase2-migration.sh
@@ -18,7 +19,8 @@
 #                       (default: the local CI Postgres, postgresql://raqib:raqib@localhost:5432)
 #   BASE_REV            git revision whose schema and seed represent the current shared databases (default 022e09a)
 #   KEEP_DBS=1          keep the databases at the end
-#   VERIFY_ALLOW_NON_LOCAL=1  allow a server other than localhost (for example a CI service container)
+#   VERIFY_ALLOW_NON_LOCAL=1  allow a server other than localhost (for example a CI service container); without it,
+#                       URLs with a host= or hostaddr= parameter or a comma-separated host list are refused too
 #
 # Needs: psql, git history containing BASE_REV, `npm ci` done, Postgres with pgvector. Never point it at a shared
 # server: it only creates and drops databases whose names it generates (they always contain "test").
@@ -41,9 +43,15 @@ SEED_DB="raqib_p2verify_seed_${RUN_ID}_test"
 FRESH_URL="$PG_BASE_URL/$FRESH_DB"
 SEED_URL="$PG_BASE_URL/$SEED_DB"
 ADMIN_URL="$PG_BASE_URL/postgres"
-# For messages: the server without its password.
-SHOWN_URL="$(printf '%s' "$PG_BASE_URL" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#')"
+# For messages: the server without its password (in the user info or in a password= parameter).
+SHOWN_URL="$(printf '%s' "$PG_BASE_URL" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#; s#([?&]password=)[^&]*#\1***#g')"
 PG_HOST="$(printf '%s' "$PG_BASE_URL" | sed -E 's#^[a-z]+://([^@/]*@)?(\[[^]]*\]|[^:/]*).*$#\2#')"
+# For the localhost guard: the host list (after the user info) and the query string, percent-decoded.
+PG_HOSTS="$(printf '%s' "$PG_BASE_URL" | sed -E 's#^[a-z]+://##; s#[/?].*$##')"
+PG_HOSTS="${PG_HOSTS##*@}"
+PG_QUERY=""
+[[ "$PG_BASE_URL" == *\?* ]] && PG_QUERY="${PG_BASE_URL#*\?}"
+PG_QUERY="$(printf '%b' "${PG_QUERY//%/\\x}")"
 
 PASSES=0
 FAILURES=0
@@ -135,11 +143,22 @@ check_no_drift() {
 
 section "Preconditions"
 command -v psql >/dev/null || die "psql not found"
-case "$PG_HOST" in
-  localhost | 127.0.0.1 | "[::1]") ;;
-  *) [[ "${VERIFY_ALLOW_NON_LOCAL:-0}" == "1" ]] \
-       || die "refusing to use $SHOWN_URL: not localhost (set VERIFY_ALLOW_NON_LOCAL=1 for a throwaway server)" ;;
-esac
+# libpq connects to the host(s) of a host= or hostaddr= parameter, or tries every host of a comma-separated list,
+# whatever the first host says: such URLs count as non-local too.
+NON_LOCAL=""
+if [[ "$PG_HOSTS" == *,* ]]; then
+  NON_LOCAL="it lists several hosts"
+elif [[ "&$PG_QUERY" =~ \&(host|hostaddr)= ]]; then
+  NON_LOCAL="it has a host or hostaddr parameter"
+else
+  case "$PG_HOST" in
+    localhost | 127.0.0.1 | "[::1]") ;;
+    *) NON_LOCAL="not localhost" ;;
+  esac
+fi
+if [[ -n "$NON_LOCAL" && "${VERIFY_ALLOW_NON_LOCAL:-0}" != "1" ]]; then
+  die "refusing to use $SHOWN_URL: $NON_LOCAL (set VERIFY_ALLOW_NON_LOCAL=1 for a throwaway server)"
+fi
 [[ -x "$PRISMA" && -x "$TSX" ]] || die "node_modules missing: run npm ci first"
 [[ -f "$SQL_FILE" ]] || die "missing $SQL_FILE"
 git -C "$ROOT" cat-file -e "$BASE_REV:prisma/schema.prisma" 2>/dev/null \
@@ -185,8 +204,9 @@ run_quiet "old seed loaded (NODE_ENV=development)" \
   in_dir "$ROOT" env -u SEED_PASSWORD NODE_ENV=development DATABASE_URL="$SEED_URL" DIRECT_URL="$SEED_URL" "$TSX" "$OLD/seed.ts"
 
 # Edge cases the seed does not cover: a manual framework with only output and activity indicators, a framework
-# without aiModelUsed with outcome and activity indicators (gaps in the chain), an empty framework, and a
-# beneficiary with a service so those tables are part of the checksums. All values are synthetic.
+# without aiModelUsed with outcome and activity indicators (gaps in the chain), an empty framework, two indicators
+# added to the seed's AI-generated framework after generation (one a day later, added by hand, one exactly at the
+# one-hour limit), and a beneficiary with a service so those tables are part of the checksums. All values are synthetic.
 run_quiet "edge-case fixtures added" psql "$SEED_URL" -X -q -v ON_ERROR_STOP=1 -c "
   WITH p AS (SELECT id FROM \"Project\" ORDER BY \"createdAt\", id LIMIT 1)
   INSERT INTO \"Framework\" (id, \"projectId\", version, name, \"aiModelUsed\")
@@ -202,6 +222,12 @@ run_quiet "edge-case fixtures added" psql "$SEED_URL" -X -q -v ON_ERROR_STOP=1 -
     ('p2v-ind-3', 'p2v-fw-manual', 'Number of kits distributed (fixture)', 'output', 'document_review', 'quarterly', '[]', NULL, NULL),
     ('p2v-ind-4', 'p2v-fw-null', '% of households with acceptable FCS (fixture)', 'outcome', 'hh_survey', 'baseline_endline', '[\"baseline\"]', '41%', NULL),
     ('p2v-ind-5', 'p2v-fw-null', 'Number of awareness sessions (fixture)', 'activity', 'document_review', 'monthly', '[]', NULL, NULL);
+  INSERT INTO \"Indicator\" (id, \"frameworkId\", \"indicatorText\", level, \"dataCollectionMethod\", frequency, phases, \"createdAt\")
+  SELECT x.id, f.id, x.txt, 'output', 'document_review', 'quarterly', '[]', f.\"generatedAt\" + x.delay
+  FROM (SELECT id, \"generatedAt\" FROM \"Framework\" WHERE id NOT LIKE 'p2v-%' AND \"aiModelUsed\" IS NOT NULL AND \"aiModelUsed\" <> 'manual'
+        ORDER BY \"generatedAt\", id LIMIT 1) f,
+       (VALUES ('p2v-ind-6', 'Number of referrals made (fixture, added by hand a day after generation)', interval '1 day'),
+               ('p2v-ind-7', 'Number of follow-up visits (fixture, created at the one-hour limit)', interval '1 hour')) AS x(id, txt, delay);
   INSERT INTO \"Beneficiary\" (id, \"projectId\", \"fullName\", gender, \"ageGroup\", governorate, \"updatedAt\")
   SELECT 'p2v-ben-1', id, 'Fixture Person', 'female', 'youth_18_24', 'Hebron', now() FROM \"Project\" ORDER BY \"createdAt\", id LIMIT 1;
   INSERT INTO \"BeneficiaryService\" (id, \"beneficiaryId\", \"projectId\", \"serviceType\", \"dateProvided\", quantity, unit, \"indicatorId\")
@@ -275,10 +301,19 @@ expect_zero "$S" "every project has its primary sector in sectors (and only it)"
   'SELECT count(*) FROM "Project" WHERE "sectors" IS NULL OR NOT ("sector" = ANY ("sectors")) OR cardinality("sectors") <> 1'
 expect_zero "$S" "existing projects are not marked humanitarian" \
   'SELECT count(*) FROM "Project" WHERE humanitarian'
-expect_zero "$S" "provenance: manual when aiModelUsed is NULL or 'manual', else ai_generated with aiModel" \
+expect_zero "$S" "provenance: ai_generated with aiModel when aiModelUsed is a model id and the indicator was created within 1 hour of the framework, else manual" \
   "SELECT count(*) FROM \"Indicator\" i JOIN \"Framework\" f ON f.id = i.\"frameworkId\"
-   WHERE ((f.\"aiModelUsed\" IS NULL OR f.\"aiModelUsed\" = 'manual') AND (i.provenance <> 'manual' OR i.\"aiModel\" IS NOT NULL))
-      OR ((f.\"aiModelUsed\" IS NOT NULL AND f.\"aiModelUsed\" <> 'manual') AND (i.provenance <> 'ai_generated' OR i.\"aiModel\" IS DISTINCT FROM f.\"aiModelUsed\"))"
+   CROSS JOIN LATERAL (SELECT f.\"aiModelUsed\" IS NOT NULL AND f.\"aiModelUsed\" <> 'manual'
+                              AND i.\"createdAt\" <= f.\"generatedAt\" + interval '1 hour' AS ai) g
+   WHERE (NOT g.ai AND (i.provenance <> 'manual' OR i.\"aiModel\" IS NOT NULL))
+      OR (g.ai AND (i.provenance <> 'ai_generated' OR i.\"aiModel\" IS DISTINCT FROM f.\"aiModelUsed\"))"
+expect_eq "$S" "indicator added by hand to the AI seed framework a day after generation is manual, without aiModel" "manual|" \
+  "SELECT provenance || '|' || coalesce(\"aiModel\", '') FROM \"Indicator\" WHERE id = 'p2v-ind-6'"
+expect_eq "$S" "indicator created exactly 1 hour after the AI seed framework is ai_generated with the framework's model" "ai_generated|true" \
+  "SELECT i.provenance || '|' || (i.\"aiModel\" = f.\"aiModelUsed\") FROM \"Indicator\" i JOIN \"Framework\" f ON f.id = i.\"frameworkId\" WHERE i.id = 'p2v-ind-7'"
+expect_zero "$S" "the seed generator's own indicators stay ai_generated" \
+  "SELECT count(*) FROM \"Indicator\" i JOIN \"Framework\" f ON f.id = i.\"frameworkId\"
+   WHERE i.id NOT LIKE 'p2v-%' AND f.\"aiModelUsed\" IS NOT NULL AND f.\"aiModelUsed\" <> 'manual' AND i.provenance <> 'ai_generated'"
 expect_eq "$S" "both provenance branches exercised (manual, ai_generated)" "ai_generated,manual" \
   "SELECT string_agg(DISTINCT provenance::text, ',' ORDER BY provenance::text) FROM \"Indicator\""
 expect_zero "$S" "no reference-sheet values invented for existing indicators" \
@@ -295,6 +330,20 @@ expect_eq "$S" "new enum values present (Sector, DonorType)" "9" \
 expect_eq "$S" "legacy usaid donor type and METemplate table kept" "1|true" \
   "SELECT count(*) || '|' || (to_regclass('public.\"METemplate\"') IS NOT NULL) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'DonorType' AND e.enumlabel = 'usaid'"
 check_no_drift "$S" "no drift between the migrated database and prisma/schema.prisma"
+
+# A result code is unique within a framework (ResultNode_frameworkId_code_key): a direct write of a second "O" in a
+# framework that has the "O" placeholder is rejected. The transaction is rolled back in any case.
+DUP_SQL="BEGIN; INSERT INTO \"ResultNode\" (id, \"frameworkId\", level, code, text)
+  SELECT 'p2v-dup-code', \"frameworkId\", 'outcome', 'O', 'Duplicate code (fixture)' FROM \"ResultNode\" WHERE code = 'O' ORDER BY id LIMIT 1;
+  ROLLBACK;"
+if psql "$S" -X -q -v ON_ERROR_STOP=1 -c "$DUP_SQL" >"$WORK/dup.log" 2>&1; then
+  fail "a duplicate result code in a framework was not rejected"
+elif grep -q 'ResultNode_frameworkId_code_key' "$WORK/dup.log"; then
+  pass "a duplicate result code in a framework is rejected by the unique index"
+else
+  fail "duplicate result code insert failed for an unexpected reason:"
+  sed 's/^/        /' "$WORK/dup.log" | tail -n 20
+fi
 
 # The app's Prisma client (generated from the Phase 2 schema) can read the migrated data.
 cat >"$WORK/read-check.ts" <<'TS'

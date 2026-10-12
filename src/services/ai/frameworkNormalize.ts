@@ -14,8 +14,10 @@ import { FRAMEWORK_PROMPT_VERSION } from './prompts';
 export const TO_BE_CONFIRMED = 'To be confirmed by the M&E officer';
 
 /** Used when the model gives no target-setting method. Never a number (me-foundations.md §6). */
-export const DEFAULT_TARGET_METHOD =
-  'set the target once the baseline is measured, using results of comparable programmes and the project budget';
+export const DEFAULT_TARGET_METHOD = 'set after the baseline survey, using comparable programmes';
+
+/** Marker after which the document parser appends the model's own analysis to Document.parsedText (documentParser.ts). */
+export const AI_ANALYSIS_MARKER = '---AI_ANALYSIS---';
 
 // Field limits match the indicator and result validation of the REST API.
 const LIMITS = {
@@ -559,6 +561,28 @@ export function standardReferenceLabel(reference: unknown): string | null {
   return label ? clip(label, LIMITS.standardReferenceCode) : null;
 }
 
+/** The fields of a linked IndicatorLibraryEntry that the normaliser checks indicators against. */
+export interface LibraryEntryReference {
+  id: string;
+  definition: string;
+  notes?: string | null;
+  meansOfVerification?: string | null;
+  calculation?: unknown;
+  disaggregation: readonly string[];
+  standardReference: unknown;
+}
+
+/**
+ * The library entry's own text, the only evidence for a standard threshold: definition, notes,
+ * means of verification, the calculation fields and the standard reference (framework and code,
+ * e.g. "Sphere Water supply standard — minimum 15 l/p/d"). Never text written by the model.
+ */
+export function libraryEntryTexts(entry: LibraryEntryReference): string[] {
+  const calculation = isObject(entry.calculation) ? Object.values(entry.calculation).map(text) : [];
+  const reference = isObject(entry.standardReference) ? [text(entry.standardReference.framework), text(entry.standardReference.code)] : [];
+  return [text(entry.definition), text(entry.notes), text(entry.meansOfVerification), ...calculation, ...reference].filter(Boolean);
+}
+
 // ------------------------------------------------------- deterministic checks
 
 const DIGIT = /\d/;
@@ -574,6 +598,21 @@ function normaliseForMatch(value: string): string {
     .toLowerCase();
 }
 
+/**
+ * The document's own text: everything before the first AI analysis marker. The analysis the
+ * parser appends is model output and must never "prove" a baseline or target (me-foundations.md §6).
+ */
+export function stripAiAnalysis(parsedText: string): string {
+  const at = parsedText.indexOf(AI_ANALYSIS_MARKER);
+  return at === -1 ? parsedText : parsedText.slice(0, at).trimEnd();
+}
+
+/** A project document's file name and its own text (see stripAiAnalysis). */
+export interface SourceDocument {
+  fileName: string;
+  text: string;
+}
+
 function partOfLargerNumber(haystack: string, start: number, end: number): boolean {
   const before = haystack[start - 1] ?? '';
   const after = haystack[end] ?? '';
@@ -583,37 +622,57 @@ function partOfLargerNumber(haystack: string, start: number, end: number): boole
   return false;
 }
 
+/** The value as searched for; null when it has no digit. */
+function matchNeedle(value: string): string | null {
+  const needle = normaliseForMatch(value).trim();
+  return needle && DIGIT.test(needle) ? needle : null;
+}
+
+function containsValue(doc: string, needle: string): boolean {
+  const haystack = normaliseForMatch(stripAiAnalysis(doc));
+  for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + 1)) {
+    if (!partOfLargerNumber(haystack, i, i + needle.length)) return true;
+  }
+  return false;
+}
+
 /**
  * True when the exact value string (ignoring case, repeated spaces and Arabic-Indic
  * digits) appears in at least one document and is not part of a larger number
  * ("8" is not found in "800"). Values without a digit are never treated as found,
- * since words such as "yes" would match almost any document.
+ * since words such as "yes" would match almost any document. Text after the AI
+ * analysis marker is ignored.
  */
 export function appearsInDocuments(value: string, documentTexts: readonly string[]): boolean {
-  const needle = normaliseForMatch(value).trim();
-  if (!needle || !DIGIT.test(needle)) return false;
-  return documentTexts.some(doc => {
-    const haystack = normaliseForMatch(doc);
-    for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + 1)) {
-      if (!partOfLargerNumber(haystack, i, i + needle.length)) return true;
-    }
-    return false;
-  });
+  const needle = matchNeedle(value);
+  return needle !== null && documentTexts.some(doc => containsValue(doc, needle));
 }
 
-const PEOPLE_WORDS_EN = /\b(people|persons?|individuals?|households?|women|woman|men|man|girls?|boys?|children|child|youths?|young people|students?|farmers?|participants?|beneficiar(?:y|ies)|trainees?|graduates?|patients?|caregivers?|refugees?|survivors?)\b/i;
+/** The first document in which the value appears (same matching as appearsInDocuments), or null. */
+export function findSourceDocument(value: string, documents: readonly SourceDocument[]): SourceDocument | null {
+  const needle = matchNeedle(value);
+  return needle === null ? null : documents.find(doc => containsValue(doc.text, needle)) ?? null;
+}
 
-/** Arabic word forms (without the article or attached prepositions); hamza forms are normalised before comparing. */
-const PEOPLE_WORDS_AR = new Set([
-  'ناس', 'اشخاص', 'شخص', 'افراد', 'اسر', 'اسرة', 'اسره', 'نساء', 'امراة', 'رجال', 'اطفال', 'طفل', 'طفلة', 'فتيات', 'فتيان',
-  'شباب', 'شابات', 'طلاب', 'طالبات', 'طلبة', 'مزارعين', 'مزارعون', 'مزارعات', 'مشاركين', 'مشاركون', 'مشاركات',
-  'مستفيدين', 'مستفيدون', 'مستفيدات', 'متدربين', 'متدربون', 'متدربات', 'خريجين', 'خريجات', 'مرضى', 'لاجئين', 'لاجئون', 'ناجين', 'ناجيات',
-]);
+// "officials" only in the plural: "official" is usually an adjective ("official records").
+const PEOPLE_WORDS_EN = /\b(people|persons?|individuals?|households?|women|woman|men|man|girls?|boys?|children|child|youths?|young people|students?|pupils?|learners?|teachers?|staff|employees?|workers?|officials|members?|residents?|citizens?|parents?|caregivers?|entrepreneurs?|owners?|farmers?|participants?|beneficiar(?:y|ies)|trainees?|graduates?|patients?|refugees?|survivors?)\b/i;
 
 const normaliseArabic = (word: string) => word
   .replace(/[ً-ْـ]/g, '') // diacritics and tatweel
   .replace(/[أإآ]/g, 'ا')
   .replace(/ى/g, 'ي');
+
+/** Arabic word forms (without the article or attached prepositions), normalised like the indicator text (hamza, alif maqsura). */
+const PEOPLE_WORDS_AR = new Set([
+  'ناس', 'أشخاص', 'شخص', 'أفراد', 'أسر', 'أسرة', 'أسره', 'نساء', 'امرأة', 'رجال', 'أطفال', 'طفل', 'طفلة', 'فتيات', 'فتيان',
+  'شباب', 'شابات', 'طلاب', 'طالبات', 'طلبة', 'تلاميذ', 'تلميذ', 'تلميذات', 'متعلمين', 'متعلمون', 'متعلمات',
+  'معلم', 'معلمين', 'معلمون', 'معلمات', 'موظف', 'موظفين', 'موظفون', 'موظفات', 'عمال', 'عاملين', 'عاملون', 'عاملات',
+  'مسؤولين', 'مسؤولون', 'مسؤولات', 'أعضاء', 'سكان', 'مواطن', 'مواطنين', 'مواطنون', 'مواطنات', 'أهالي',
+  'مقدمي', 'مقدمو', 'مقدمات', 'رواد', 'رائدات', 'مالكي', 'مالكو', 'مالكات',
+  'مزارعين', 'مزارعون', 'مزارعات', 'مشاركين', 'مشاركون', 'مشاركات',
+  'مستفيدين', 'مستفيدون', 'مستفيدات', 'متدربين', 'متدربون', 'متدربات', 'خريجين', 'خريجون', 'خريجات', 'مرضى',
+  'لاجئين', 'لاجئون', 'لاجئات', 'ناجين', 'ناجون', 'ناجيات',
+].map(normaliseArabic));
 
 function arabicWordCandidates(token: string): string[] {
   const out = new Set<string>([token]);
@@ -682,6 +741,14 @@ export function normalizeDisaggregation(value: unknown): string[] {
   return keys.slice(0, LIMITS.disaggregationKeys);
 }
 
+const SEX_KEYS = ['sex', 'sex_of_household_head'] as const;
+
+/** Adds (first) the sex keys of the linked library entry (sex, sex_of_household_head) that the indicator lacks. */
+export function withLibrarySexDisaggregation(keys: string[], libraryDisaggregation: readonly string[] | null | undefined): string[] {
+  const missing = SEX_KEYS.filter(key => libraryDisaggregation?.includes(key) && !keys.includes(key));
+  return missing.length > 0 ? [...missing, ...keys].slice(0, LIMITS.disaggregationKeys) : keys;
+}
+
 /** Adds 'sex' (first) to a people-level indicator that has neither sex nor sex_of_household_head. */
 export function ensureSexDisaggregation(keys: string[], peopleLevel: boolean): string[] {
   if (!peopleLevel || keys.includes('sex') || keys.includes('sex_of_household_head')) return keys;
@@ -713,14 +780,19 @@ type TargetBasis = 'document' | 'standard_threshold' | 'method_only' | 'none';
 export interface BaselineTargetInput {
   baselineValue: string;
   baselineBasis: string;
+  /** The model's baseline method; the document is cited in it when the baseline is kept. */
+  baselineMethod?: string;
   targetValue: string;
   targetBasis: string;
   targetJustification: string;
   standardReferenceCode: string | null;
+  /** The linked library entry: its own text is the only evidence for a standard threshold. */
+  libraryEntry?: LibraryEntryReference | null;
 }
 
 export interface BaselineTargetResult {
   baselineValue: string | null;
+  baselineMethod: string;
   targetValue: string | null;
   targetJustification: string;
 }
@@ -734,17 +806,36 @@ function methodText(justification: string, fallback: string): string {
   return cleaned || fallback;
 }
 
+/** A target-setting method sets the target from the baseline ("baseline + 10 percentage points", "بعد خط الأساس"). */
+function describesTargetMethod(method: string): boolean {
+  return /\bbaseline/i.test(method) || /خط\s*الاساس/.test(normaliseArabic(method));
+}
+
+/** "Target stated in the proposal (source: proposal.pdf)": the text (or the fallback) without its final full stop, then the citation. */
+function withSource(value: string, fallback: string, fileName: string, max: number): string {
+  const suffix = ` (source: ${fileName})`;
+  const base = (value.trim() || fallback).replace(/[.\s]+$/, '');
+  return clip(`${clip(base, Math.max(0, max - suffix.length))}${suffix}`, max);
+}
+
+const sentence = (value: string) => /[.!?]$/.test(value) ? value : `${value}.`;
+
 /**
  * Applies me-foundations.md §6 (the AI never invents baselines or targets):
  * - a baseline is kept only with basis 'document' and when the exact value
- *   appears in a document;
- * - a target is kept with basis 'document' when it appears in a document, or with
- *   basis 'standard_threshold' when a standard reference is known; it is cleared
- *   for 'method_only', 'none', unknown bases and unverified values;
+ *   appears in a document; the document is cited in baselineMethod
+ *   ("… (source: proposal.pdf)");
+ * - a target is kept with basis 'document' when it appears in a document (cited in
+ *   targetJustification), or with basis 'standard_threshold' when it appears in the
+ *   linked library entry's own text (see libraryEntryTexts; a standardReferenceCode
+ *   written by the model is not enough); it is cleared for 'method_only', 'none',
+ *   unknown bases and unverified values;
  * - whenever the target is cleared, targetJustification holds the proposed
- *   method: "Proposed method: … — confirm after baseline."
+ *   method: "Proposed method: … — confirm after baseline." The model's text is used
+ *   only when it sets the target from the baseline (so a removed target's
+ *   justification cannot carry the invented number), otherwise DEFAULT_TARGET_METHOD.
  */
-export function resolveBaselineAndTarget(input: BaselineTargetInput, documentTexts: readonly string[]): BaselineTargetResult {
+export function resolveBaselineAndTarget(input: BaselineTargetInput, documents: readonly SourceDocument[]): BaselineTargetResult {
   const baselineBasis = matchEnum<BaselineBasis>(input.baselineBasis, ['document', 'none']) ?? 'none';
   const targetBasis = matchEnum<TargetBasis>(input.targetBasis, ['document', 'standard_threshold', 'method_only', 'none'], {
     standard: 'standard_threshold',
@@ -752,39 +843,57 @@ export function resolveBaselineAndTarget(input: BaselineTargetInput, documentTex
     method: 'method_only',
   }) ?? 'none';
   const notes: string[] = [];
+  const modelBaselineMethod = input.baselineMethod?.trim() ?? '';
 
   let baselineValue: string | null = null;
+  let baselineMethod = clip(modelBaselineMethod, LIMITS.baselineMethod) || TO_BE_CONFIRMED;
   if (baselineBasis === 'document' && input.baselineValue) {
-    if (appearsInDocuments(input.baselineValue, documentTexts)) baselineValue = input.baselineValue;
-    else notes.push('The baseline proposed by the AI was not found in the project documents and was removed (pending baseline).');
+    const source = findSourceDocument(input.baselineValue, documents);
+    if (source) {
+      baselineValue = input.baselineValue;
+      baselineMethod = withSource(modelBaselineMethod, 'Baseline taken from the project documents', source.fileName, LIMITS.baselineMethod);
+    } else {
+      notes.push('The baseline proposed by the AI was not found in the project documents and was removed (pending baseline).');
+    }
   }
 
   let targetValue: string | null = null;
   let justification: string;
-  const verifiedDocumentTarget = targetBasis === 'document' && input.targetValue !== '' && appearsInDocuments(input.targetValue, documentTexts);
-  const standardTarget = targetBasis === 'standard_threshold' && input.targetValue !== '' && !!input.standardReferenceCode;
+  const targetSource = targetBasis === 'document' && input.targetValue !== '' ? findSourceDocument(input.targetValue, documents) : null;
+  const standardEntry = targetBasis === 'standard_threshold' && input.targetValue !== '' && input.libraryEntry
+    && appearsInDocuments(input.targetValue, libraryEntryTexts(input.libraryEntry))
+    ? input.libraryEntry : null;
 
-  if (verifiedDocumentTarget) {
+  if (targetSource) {
     targetValue = input.targetValue;
-    justification = input.targetJustification || 'Target taken from the project documents.';
-  } else if (standardTarget) {
+    justification = withSource(input.targetJustification, 'Target taken from the project documents', targetSource.fileName, LIMITS.targetJustification);
+  } else if (standardEntry) {
     targetValue = input.targetValue;
     const why = input.targetJustification.replace(/[.\s]+$/, '');
-    justification = `Proposed standard threshold (${input.standardReferenceCode})${why ? `: ${why}` : ''} — confirm it applies to this project.`;
+    const reference = input.standardReferenceCode ?? `library entry ${standardEntry.id}`;
+    justification = `Proposed standard threshold (${reference})${why ? `: ${why}` : ''} — confirm it applies to this project.`;
+  } else if (targetBasis === 'method_only') {
+    // A method the model wrote in the target field (e.g. "baseline + 10 percentage points") counts as the method too.
+    const methodInValue = input.targetValue !== '' && !BARE_NUMBER.test(input.targetValue) ? input.targetValue : '';
+    const method = [input.targetJustification, methodInValue].map(t => methodText(t, '')).find(describesTargetMethod);
+    justification = `Proposed method: ${method ?? DEFAULT_TARGET_METHOD} — confirm after baseline.`;
   } else {
-    // A method the model wrote in the target field (e.g. "baseline + 10 percentage points") is kept as the method.
-    const methodInValue = targetBasis === 'method_only' && input.targetValue !== '' && !BARE_NUMBER.test(input.targetValue)
-      ? input.targetValue : '';
-    justification = `Proposed method: ${methodText(input.targetJustification || methodInValue, DEFAULT_TARGET_METHOD)} — confirm after baseline.`;
+    // The model's justification of a removed target may quote the invented number; keep it only when it is a method.
+    const method = methodText(input.targetJustification, '');
+    justification = `Proposed method: ${describesTargetMethod(method) ? method : DEFAULT_TARGET_METHOD} — confirm after baseline.`;
     if (targetBasis === 'document' && input.targetValue) {
       notes.push('The target proposed by the AI was not found in the project documents and was removed.');
+    }
+    if (targetBasis === 'standard_threshold' && input.targetValue) {
+      notes.push('The standard threshold proposed by the AI was not found in the linked library entry and was removed.');
     }
   }
 
   return {
     baselineValue,
+    baselineMethod,
     targetValue,
-    targetJustification: clip([justification, ...notes].join(' '), LIMITS.targetJustification),
+    targetJustification: clip(notes.length > 0 ? [sentence(justification), ...notes].join(' ') : justification, LIMITS.targetJustification),
   };
 }
 
@@ -796,10 +905,14 @@ export interface NormalizeIndicatorsContext {
   resultNodes: ReadonlyArray<{ id: string; code: string; level: IndicatorLevel; parentId?: string | null }>;
   /** Ids of the IndicatorLibraryEntry rows offered to (or known by) the model. */
   knownLibraryIds: ReadonlySet<string>;
-  /** Library id → standard reference label ("EU GERF 2.38"), used when the model leaves standardReferenceCode empty. */
-  libraryStandardCodes?: ReadonlyMap<string, string>;
-  /** Parsed text of the project's documents: the only source of baseline and target values. */
-  documentTexts: readonly string[];
+  /**
+   * Library entries by id, including every entry an indicator links to: their standard reference
+   * replaces the model's standardReferenceCode, their sex disaggregation is kept, and their own
+   * text is the only evidence for a standard threshold.
+   */
+  libraryEntries?: ReadonlyMap<string, LibraryEntryReference>;
+  /** The project's documents (own text only, see stripAiAnalysis): the only source of baseline and target values, cited by file name. */
+  documents: readonly SourceDocument[];
   /** Model id used for the call (stored in Indicator.aiModel). */
   aiModel: string;
   promptVersion?: string;
@@ -879,6 +992,13 @@ function normalizeCalculation(raw: Json, percent: boolean): Record<string, strin
 
 const normalisedName = (name: string) => name.toLowerCase().replace(/[^\p{L}\p{N}%]+/gu, ' ').trim();
 
+const rawLibraryId = (raw: Json) => pick(raw, 'libraryId').toUpperCase();
+
+/** The library ids the model's indicators link to (upper case, unique), so entries that were not candidates can be loaded. */
+export function linkedLibraryIds(parsed: unknown): string[] {
+  return Array.from(new Set(extractIndicatorList(parsed).filter(isObject).map(rawLibraryId).filter(Boolean)));
+}
+
 /**
  * Normalises one indicator from the model into a create payload; null when it
  * has no indicator text. See normalizeIndicators for the rules.
@@ -894,15 +1014,17 @@ export function normalizeIndicator(raw: unknown, sortOrder: number, ctx: Normali
   const result = resolveResult(pick(raw, 'resultCode', 'resultId'), claimedLevel, ctx.resultNodes);
   const level: IndicatorLevel = result && result.level !== 'activity' ? result.level : claimedLevel;
 
-  const libraryIdRaw = pick(raw, 'libraryId').toUpperCase();
+  const libraryIdRaw = rawLibraryId(raw);
   const libraryId = libraryIdRaw && ctx.knownLibraryIds.has(libraryIdRaw) ? clip(libraryIdRaw, LIMITS.libraryId) : null;
-  const standardReferenceCode = orNull(clip(pick(raw, 'standardReferenceCode'), LIMITS.standardReferenceCode))
-    ?? (libraryId ? ctx.libraryStandardCodes?.get(libraryId) ?? null : null);
+  const libraryEntry = libraryId ? ctx.libraryEntries?.get(libraryId) ?? null : null;
+  // The linked entry's standard reference is authoritative; the model's code is kept only when there is none.
+  const standardReferenceCode = (libraryEntry ? standardReferenceLabel(libraryEntry.standardReference) : null)
+    ?? orNull(clip(pick(raw, 'standardReferenceCode'), LIMITS.standardReferenceCode));
 
   const unit = clip(pick(raw, 'unit'), LIMITS.unit);
   const percent = isPercentUnit(unit, indicatorText);
   const disaggregation = ensureSexDisaggregation(
-    normalizeDisaggregation(raw.disaggregation),
+    withLibrarySexDisaggregation(normalizeDisaggregation(raw.disaggregation), libraryEntry?.disaggregation),
     isPeopleLevelIndicator(indicatorText, indicatorTextAr),
   );
 
@@ -910,11 +1032,13 @@ export function normalizeIndicator(raw: unknown, sortOrder: number, ctx: Normali
   const values = resolveBaselineAndTarget({
     baselineValue: clip(text(raw.baselineValue), LIMITS.value),
     baselineBasis: text(raw.baselineBasis),
+    baselineMethod: pick(raw, 'baselineMethod'),
     targetValue: clip(text(raw.targetValue), LIMITS.value),
     targetBasis: text(raw.targetBasis),
     targetJustification: pick(raw, 'targetJustification'),
     standardReferenceCode,
-  }, ctx.documentTexts);
+    libraryEntry,
+  }, ctx.documents);
 
   const phases = textList(raw.phases, LIMITS.phases).map(p => clip(p, LIMITS.phase));
   const startDate = parseDate(raw.startDate);
@@ -937,7 +1061,7 @@ export function normalizeIndicator(raw: unknown, sortOrder: number, ctx: Normali
     disaggregation,
     meansOfVerification: meansRaw && !isGenericMeansOfVerification(meansRaw) ? meansRaw : TO_BE_CONFIRMED,
     baselineValue: values.baselineValue,
-    baselineMethod: clip(pick(raw, 'baselineMethod'), LIMITS.baselineMethod) || TO_BE_CONFIRMED,
+    baselineMethod: values.baselineMethod,
     targetValue: values.targetValue,
     targetJustification: values.targetJustification,
     assumptions: orNull(clip(pick(raw, 'assumptions'), LIMITS.assumptions)),
@@ -971,9 +1095,12 @@ export function extractIndicatorList(parsed: unknown): unknown[] {
  * - enums matched case-insensitively with synonyms; unknown method/frequency fall
  *   back to the level's usual choice; level 'activity' or unknown → output;
  * - resultCode → ResultNode id (else the first node of the same level, else null);
- * - libraryId kept only when it is a known library id;
- * - 'sex' added to people-level indicators that lack sex / sex_of_household_head;
- * - baselines and targets per resolveBaselineAndTarget (never invented);
+ * - libraryId kept only when it is a known library id; the linked entry's standard
+ *   reference replaces the model's standardReferenceCode;
+ * - the linked entry's sex keys (sex, sex_of_household_head) are kept, and 'sex' is
+ *   added to people-level indicators that lack sex / sex_of_household_head;
+ * - baselines and targets per resolveBaselineAndTarget (never invented; document
+ *   values cite the document);
  * - empty definition, means of verification (or a generic one such as "project
  *   reports") and baseline method → "To be confirmed by the M&E officer";
  * - provenance ai_generated with the model and prompt version;

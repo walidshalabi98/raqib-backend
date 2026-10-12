@@ -6,6 +6,14 @@
  *
  * Every dimension of a count indicator must add up to the value. Pure functions
  * only: no database access, so the rules are unit-tested (CLAUDE.md rule 7).
+ *
+ * Which rules apply (breakdownRules):
+ *   - a count unit (number, people, households…): every dimension adds up to the value;
+ *   - a percent unit: every category is between 0 and 100, no sum check;
+ *   - no unit: inferred from the indicator text ("% of…", "proportion", "rate",
+ *     نسبة, معدل… → percent rules), otherwise no sum check, because a blank
+ *     unit does not tell us the indicator counts something;
+ *   - any other unit (score, currency…): no sum check.
  */
 
 export type Breakdown = Record<string, Record<string, number>>;
@@ -34,12 +42,12 @@ function normaliseUnit(unit: string | null | undefined): string {
 }
 
 /**
- * True when the indicator counts something, so each breakdown dimension must add
- * up to the value. An indicator without a unit is treated as a count.
+ * True when the unit says the indicator counts something, so each breakdown
+ * dimension must add up to the value. A blank unit is not a count (see breakdownRules).
  */
 export function isCountUnit(unit: string | null | undefined): boolean {
   const u = normaliseUnit(unit);
-  return u === '' || COUNT_UNITS.has(u) || u.startsWith('number');
+  return u !== '' && (COUNT_UNITS.has(u) || u.startsWith('number'));
 }
 
 /** True for '%', 'percent', 'percentage' (and forms such as "% of households"). */
@@ -47,6 +55,32 @@ export function isPercentUnit(unit: string | null | undefined): boolean {
   const u = normaliseUnit(unit);
   return u.startsWith('%') || u.startsWith('percent');
 }
+
+const PERCENT_WORDS = /\b(percent|percentage|proportion|share|rate)\b/i;
+// \b does not work with Arabic letters, so these match anywhere (also with a prefix: النسبة، بنسبة).
+const ARABIC_PERCENT_WORDS = /نسبة|معدل/;
+
+/**
+ * True when the indicator text reads as a percentage: it starts with '%' or uses
+ * percent, percentage, proportion, share or rate (or نسبة / معدل). Used only when
+ * the indicator has no unit.
+ */
+export function isPercentIndicatorText(text: string | null | undefined): boolean {
+  const t = (text ?? '').trim();
+  return t.startsWith('%') || PERCENT_WORDS.test(t) || ARABIC_PERCENT_WORDS.test(t);
+}
+
+export type BreakdownRules = 'count' | 'percent' | 'none';
+
+/** Which breakdown rules apply to an indicator; see the comment at the top of this file. */
+export function breakdownRules(unit: string | null | undefined, indicatorText?: string | null): BreakdownRules {
+  if (normaliseUnit(unit) === '') return isPercentIndicatorText(indicatorText) ? 'percent' : 'none';
+  if (isCountUnit(unit)) return 'count';
+  if (isPercentUnit(unit)) return 'percent';
+  return 'none';
+}
+
+export const COUNT_VALUE_NOT_NUMERIC = 'value must be a number to record a breakdown for a count indicator';
 
 const NUMERIC = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 const WITH_THOUSANDS = /^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$/;
@@ -56,6 +90,7 @@ const WITH_THOUSANDS = /^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$/;
  * including Arabic-Indic digits (١٢٠), the Arabic decimal separator (٫) and
  * thousands separators ("1,200"). Returns null for anything else
  * ("", "12 people", "N/A", "0x10", Infinity).
+ * raqib-frontend src/lib/numbers.ts has a copy for form validation; change both together.
  */
 export function parseNumeric(input: unknown): number | null {
   if (typeof input === 'number') return Number.isFinite(input) ? input : null;
@@ -102,16 +137,17 @@ function shorten(text: string, max = 30): string {
  * - Dimension keys match /^[a-z][a-z0-9_]*$/; category names are trimmed,
  *   non-empty and at most 60 characters; at most 10 dimensions and 1–50
  *   categories per dimension.
- * - Count units (see isCountUnit) with a numeric value: every dimension must
- *   add up to the value (tolerance 1e-6).
- * - Percent units: every category must be between 0 and 100; no sum check.
- * - Other units (score, currency, litres…): no sum check.
+ * - Count units (see isCountUnit): the value must be a number and every
+ *   dimension must add up to it (tolerance 1e-6).
+ * - Percent units, or no unit and a percentage-like indicator text: every
+ *   category must be between 0 and 100; no sum check.
+ * - No unit and any other text, or other units (score, currency, litres…): no sum check.
  *
  * All problems are reported together.
  */
 export function validateBreakdown(
   breakdown: unknown,
-  opts: { value: string; unit: string | null | undefined },
+  opts: { value: string; unit: string | null | undefined; indicatorText?: string | null },
 ): BreakdownValidation {
   if (breakdown === null || breakdown === undefined) return { ok: true, breakdown: null };
   if (!isPlainObject(breakdown)) {
@@ -130,9 +166,11 @@ export function validateBreakdown(
     errors.push(`breakdown can have at most ${maxDimensions} dimensions (got ${dimensions.length})`);
   }
 
-  const count = isCountUnit(opts.unit);
-  const percent = !count && isPercentUnit(opts.unit);
-  const total = count ? parseNumeric(opts.value) : null;
+  const rules = breakdownRules(opts.unit, opts.indicatorText);
+  const percent = rules === 'percent';
+  const total = rules === 'count' ? parseNumeric(opts.value) : null;
+  // A count breakdown is only meaningful against a numeric value; never skip the sum check silently.
+  if (rules === 'count' && total === null) errors.push(COUNT_VALUE_NOT_NUMERIC);
 
   // Built with Map + Object.fromEntries so a key such as "__proto__" stays an ordinary property.
   const result = new Map<string, Record<string, number>>();

@@ -132,6 +132,9 @@ CREATE INDEX "ResultNode_frameworkId_idx" ON "ResultNode"("frameworkId");
 CREATE INDEX "ResultNode_parentId_idx" ON "ResultNode"("parentId");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "ResultNode_frameworkId_code_key" ON "ResultNode"("frameworkId", "code");
+
+-- CreateIndex
 CREATE INDEX "IndicatorLibraryEntry_sector_idx" ON "IndicatorLibraryEntry"("sector");
 
 -- CreateIndex
@@ -207,16 +210,21 @@ WHERE r."frameworkId" = i."frameworkId"
   AND r."level" = i."level"
   AND i."resultId" IS NULL;
 
--- 3c. Provenance: frameworks created by hand store aiModelUsed = 'manual' (or nothing); all others were generated
--- by the AI framework generator, whose model id is kept on the indicator.
+-- 3c. Provenance: 'ai_generated' (with the framework's model id in aiModel) only for the AI framework generator's own
+-- indicators, i.e. the framework stores a model id in aiModelUsed (frameworks created by hand store 'manual' or
+-- nothing) AND the indicator was created at most one hour after the framework (the generator creates all its
+-- indicators right after the framework). Everything else is 'manual', including indicators that people added by hand
+-- to an AI-generated framework later.
 UPDATE "Indicator" i
 SET "provenance" = CASE
-                     WHEN f."aiModelUsed" IS NULL OR f."aiModelUsed" = 'manual' THEN 'manual'::"IndicatorProvenance"
-                     ELSE 'ai_generated'::"IndicatorProvenance"
+                     WHEN f."aiModelUsed" IS NOT NULL AND f."aiModelUsed" <> 'manual'
+                      AND i."createdAt" <= f."generatedAt" + interval '1 hour' THEN 'ai_generated'::"IndicatorProvenance"
+                     ELSE 'manual'::"IndicatorProvenance"
                    END,
     "aiModel" = CASE
-                  WHEN f."aiModelUsed" IS NULL OR f."aiModelUsed" = 'manual' THEN NULL
-                  ELSE f."aiModelUsed"
+                  WHEN f."aiModelUsed" IS NOT NULL AND f."aiModelUsed" <> 'manual'
+                   AND i."createdAt" <= f."generatedAt" + interval '1 hour' THEN f."aiModelUsed"
+                  ELSE NULL
                 END
 FROM "Framework" f
 WHERE f."id" = i."frameworkId";
@@ -260,6 +268,19 @@ BEGIN
                 ('activity'::"IndicatorLevel", 'output'::"IndicatorLevel"))));
   IF n > 0 THEN
     RAISE EXCEPTION 'Phase 2 self-check failed: % result node(s) break the hierarchy rule', n;
+  END IF;
+
+  -- Provenance (3c): aiModel is set exactly for 'ai_generated', and only for indicators of a framework with a model
+  -- id that were created within one hour of the framework.
+  SELECT count(*) INTO n
+  FROM "Indicator" i
+  JOIN "Framework" f ON f."id" = i."frameworkId"
+  WHERE i."provenance" NOT IN ('manual', 'ai_generated')
+     OR (i."provenance" = 'ai_generated') <> (i."aiModel" IS NOT NULL)
+     OR (i."provenance" = 'ai_generated' AND (i."aiModel" IS DISTINCT FROM f."aiModelUsed" OR f."aiModelUsed" = 'manual'
+                                               OR i."createdAt" > f."generatedAt" + interval '1 hour'));
+  IF n > 0 THEN
+    RAISE EXCEPTION 'Phase 2 self-check failed: % indicator(s) with inconsistent provenance', n;
   END IF;
 END
 $$;

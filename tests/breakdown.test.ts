@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  BREAKDOWN_LIMITS, formatNumber, isCountUnit, isPercentUnit, parseNumeric, validateBreakdown,
+  BREAKDOWN_LIMITS, breakdownRules, formatNumber, isCountUnit, isPercentIndicatorText, isPercentUnit, parseNumeric,
+  validateBreakdown,
 } from '../src/services/dataPoints/breakdown';
 
 /** Runs validateBreakdown and returns its errors (fails the test when it passes). */
@@ -23,18 +24,58 @@ function categories(n: number, each = 1): Record<string, number> {
 
 describe('isCountUnit', () => {
   it.each([
-    null, undefined, '', '   ', 'number', 'Number', ' NUMBER ', 'count', '#', 'people', 'persons', 'individuals',
+    'number', 'Number', ' NUMBER ', 'count', '#', 'people', 'persons', 'individuals',
     'households', 'Beneficiaries', 'participants', 'number of people', 'number_of_households', 'numbers',
   ])('treats %j as a count', unit => {
-    expect(isCountUnit(unit as string | null | undefined)).toBe(true);
+    expect(isCountUnit(unit)).toBe(true);
   });
 
-  it.each(['percent', '%', 'score', 'currency_ils', 'litres_per_person_per_day', 'hectares', 'yes_no', 'days', 'USD'])(
-    'does not treat %j as a count',
-    unit => {
-      expect(isCountUnit(unit)).toBe(false);
-    },
-  );
+  it.each([
+    null, undefined, '', '   ', 'percent', '%', 'score', 'currency_ils', 'litres_per_person_per_day', 'hectares', 'yes_no', 'days', 'USD',
+  ])('does not treat %j as a count (a blank unit is not a count)', unit => {
+    expect(isCountUnit(unit as string | null | undefined)).toBe(false);
+  });
+});
+
+describe('isPercentIndicatorText', () => {
+  it.each([
+    '% of households with acceptable Food Consumption Score',
+    '  %age of girls enrolled',
+    'Percentage of children vaccinated',
+    'Percent of trainees employed after six months',
+    'Proportion of women in leadership roles',
+    'Share of income spent on food',
+    'Primary school completion rate',
+    'Rate of GBV cases referred within 24 hours',
+    'نسبة الأسر ذات درجة استهلاك غذائي مقبولة',
+    'النسبة المئوية للأطفال الملتحقين',
+    'معدل إتمام المرحلة الأساسية',
+  ])('reads %j as a percentage', text => {
+    expect(isPercentIndicatorText(text)).toBe(true);
+  });
+
+  it.each([
+    null, undefined, '', 'Number of youth completing vocational training', 'Households reached with cash assistance',
+    'Number of accurate reports submitted', 'Number of shared water points rehabilitated', 'Average coping strategy score',
+    'عدد الشباب الذين أكملوا التدريب المهني',
+  ])('does not read %j as a percentage', text => {
+    expect(isPercentIndicatorText(text as string | null | undefined)).toBe(false);
+  });
+});
+
+describe('breakdownRules', () => {
+  it('uses the unit when there is one', () => {
+    expect(breakdownRules('people', '% of households')).toBe('count');
+    expect(breakdownRules('percent', 'Number of youth')).toBe('percent');
+    expect(breakdownRules('score', '% of households')).toBe('none');
+  });
+
+  it('infers percent rules from the text when the unit is blank, and otherwise applies no sum check', () => {
+    expect(breakdownRules(null, '% of households with acceptable FCS')).toBe('percent');
+    expect(breakdownRules('  ', 'نسبة الأسر')).toBe('percent');
+    expect(breakdownRules(undefined, 'Number of youth trained')).toBe('none');
+    expect(breakdownRules('', undefined)).toBe('none');
+  });
 });
 
 describe('isPercentUnit', () => {
@@ -191,7 +232,7 @@ describe('validateBreakdown: count units add up to the value', () => {
     expect(errors).toEqual(['disability: categories add up to 212 but the value is 218']);
   });
 
-  it.each([null, '', 'number', 'people', 'households', 'Number of participants'])('applies the check for the unit %j', unit => {
+  it.each(['number', 'people', 'households', 'Number of participants'])('applies the check for the unit %j', unit => {
     expect(errorsOf({ sex: { female: 1, male: 1 } }, '3', unit)).toEqual(['sex: categories add up to 2 but the value is 3']);
   });
 
@@ -206,9 +247,39 @@ describe('validateBreakdown: count units add up to the value', () => {
     expect(breakdownOf({ sex: { female: 120, male: 98 } }, '٢١٨')).toEqual({ sex: { female: 120, male: 98 } });
   });
 
-  it('skips the sum check when the value is not a number', () => {
-    expect(breakdownOf({ sex: { female: 1, male: 1 } }, 'pending')).toEqual({ sex: { female: 1, male: 1 } });
-    expect(breakdownOf({ sex: { female: 1, male: 1 } }, '12 people')).toEqual({ sex: { female: 1, male: 1 } });
+  it('requires a numeric value instead of silently skipping the sum check', () => {
+    const message = 'value must be a number to record a breakdown for a count indicator';
+    expect(errorsOf({ sex: { female: 1, male: 1 } }, 'pending')).toEqual([message]);
+    expect(errorsOf({ sex: { female: 1, male: 1 } }, '12 people', 'people')).toEqual([message]);
+    // Reported once, together with the other problems.
+    expect(errorsOf({ sex: { female: 'x' }, age: { all: 1 } }, 'Yes')).toEqual([message, 'sex: "female" must be a number (got "x")']);
+  });
+
+  it('accepts a non-numeric value without a breakdown', () => {
+    expect(validateBreakdown(undefined, { value: 'pending', unit: 'people' })).toEqual({ ok: true, breakdown: null });
+    expect(validateBreakdown({}, { value: 'pending', unit: 'people' })).toEqual({ ok: true, breakdown: null });
+  });
+});
+
+describe('validateBreakdown: indicators without a unit', () => {
+  it.each([null, '', '   '])('applies no sum check for the unit %j when the text is not a percentage', unit => {
+    const result = validateBreakdown({ sex: { female: 4, male: 5 } }, { value: '10', unit, indicatorText: 'Number of youth trained' });
+    expect(result).toEqual({ ok: true, breakdown: { sex: { female: 4, male: 5 } } });
+    // Nor without any text, and a non-numeric value is fine.
+    expect(validateBreakdown({ sex: { female: 4 } }, { value: 'pending', unit })).toEqual({ ok: true, breakdown: { sex: { female: 4 } } });
+  });
+
+  it('applies the percent rules when the text reads as a percentage', () => {
+    const opts = { value: '61', unit: null, indicatorText: '% of households with acceptable FCS' };
+    expect(validateBreakdown({ sex: { female: 64.5, male: 58 } }, opts)).toEqual({ ok: true, breakdown: { sex: { female: 64.5, male: 58 } } });
+    expect(validateBreakdown({ sex: { female: 120, male: 58 } }, opts)).toEqual({
+      ok: false, errors: ['sex: "female" must be between 0 and 100 for a percentage (got 120)'],
+    });
+    expect(validateBreakdown({ sex: { female: 101 } }, { value: '61', unit: '', indicatorText: 'نسبة الأسر' }).ok).toBe(false);
+  });
+
+  it('lets an explicit unit win over the text', () => {
+    expect(validateBreakdown({ sex: { female: 120, male: 98 } }, { value: '218', unit: 'people', indicatorText: '% of households' }).ok).toBe(true);
   });
 });
 

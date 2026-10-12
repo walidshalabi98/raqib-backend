@@ -1,16 +1,23 @@
+import fs from 'fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  AI_ANALYSIS_MARKER,
   DEFAULT_TARGET_METHOD,
   LibraryCandidate,
+  LibraryEntryReference,
   NormalizeIndicatorsContext,
+  SourceDocument,
   TO_BE_CONFIRMED,
   appearsInDocuments,
   buildStructureFromMetadata,
   ensureSexDisaggregation,
   extractIndicatorList,
+  findSourceDocument,
   isGenericMeansOfVerification,
   isPeopleLevelIndicator,
+  libraryEntryTexts,
   librarySectorsFor,
+  linkedLibraryIds,
   normalizeDirection,
   normalizeDisaggregation,
   normalizeFrequency,
@@ -24,10 +31,13 @@ import {
   resolveResult,
   selectLibraryCandidates,
   standardReferenceLabel,
+  stripAiAnalysis,
   structureForPrompt,
+  withLibrarySexDisaggregation,
 } from '../src/services/ai/frameworkNormalize';
 import { FRAMEWORK_PROMPT_VERSION, extractProjectStructurePrompt, generateFrameworkPrompt } from '../src/services/ai/prompts';
 import { prisma } from '../src/config/prisma';
+import { DEFAULT_LIBRARY_PATH } from '../src/services/library/load';
 import { hasTestDatabase, resetDatabase } from './helpers';
 
 // tests/setup.ts mocks the generator for every other test file; this file tests the real one
@@ -60,13 +70,43 @@ const DOCS = [
   + 'Budget line 1.5 covers 1,200 training kits.',
 ];
 
+const SOURCES: SourceDocument[] = [{ fileName: 'proposal.pdf', text: DOCS[0] }];
+
+/** What documentParser.ts appends to Document.parsedText: model output, never evidence. */
+const AI_ANALYSIS = `\n\n${AI_ANALYSIS_MARKER}\n{"targets_mentioned":[{"indicator":"employment","target":"95%"}],"baseline":"41%","summary":"Kits: 2,500"}`;
+
+/** The seed library (knowledge/indicator-library.json). */
+const LIBRARY_FILE = JSON.parse(fs.readFileSync(DEFAULT_LIBRARY_PATH, 'utf8')) as {
+  indicators: Array<LibraryEntryReference & { name: string; nameAr: string }>;
+};
+const seedEntry = (id: string) => {
+  const entry = LIBRARY_FILE.indicators.find(e => e.id === id);
+  if (!entry) throw new Error(`${id} is not in the seed library`);
+  return entry;
+};
+
+function libEntry(id: string, overrides: Partial<LibraryEntryReference> = {}): LibraryEntryReference {
+  return {
+    id, definition: `Definition of ${id}`, notes: null, meansOfVerification: 'Registers', calculation: null,
+    disaggregation: [], standardReference: null, ...overrides,
+  };
+}
+
+const LIBRARY = new Map<string, LibraryEntryReference>([
+  ['LV-01', libEntry('LV-01', { disaggregation: ['sex', 'age'] })],
+  ['LV-02', libEntry('LV-02', { standardReference: { framework: 'EU GERF', code: '2.14' }, disaggregation: ['sex'] })],
+  ['AC-01', libEntry('AC-01', { standardReference: { framework: 'Core Humanitarian Standard (2024)', code: 'Commitment 5 (aligned)' } })],
+  ['FS-01', seedEntry('FS-01')],
+  ['WA-01', seedEntry('WA-01')],
+]);
+
 function ctx(overrides: Partial<NormalizeIndicatorsContext> = {}): NormalizeIndicatorsContext {
   return {
     frameworkId: 'fw-1',
     resultNodes: NODES,
-    knownLibraryIds: new Set(['LV-01', 'LV-02', 'AC-01']),
-    libraryStandardCodes: new Map([['LV-02', 'EU GERF 2.14']]),
-    documentTexts: DOCS,
+    knownLibraryIds: new Set(['LV-01', 'LV-02', 'AC-01', 'FS-01', 'WA-01', 'ED-04', 'ED-05', 'GV-03']),
+    libraryEntries: LIBRARY,
+    documents: SOURCES,
     aiModel: MODEL,
     promptVersion: FRAMEWORK_PROMPT_VERSION,
     ...overrides,
@@ -306,6 +346,29 @@ describe('frameworkNormalize: document matching', () => {
     expect(appearsInDocuments('', DOCS)).toBe(false);
     expect(appearsInDocuments('22%', [])).toBe(false);
   });
+
+  it('ignores the AI analysis the document parser appends after its marker', () => {
+    const parsed = DOCS[0] + AI_ANALYSIS;
+    expect(stripAiAnalysis(parsed)).toBe(DOCS[0]);
+    expect(stripAiAnalysis(DOCS[0])).toBe(DOCS[0]);
+    expect(stripAiAnalysis(`${AI_ANALYSIS_MARKER}\n{"summary":"only the analysis"}`)).toBe('');
+    // Text after a second marker is cut as well: everything from the first marker onward is model output.
+    expect(stripAiAnalysis(`A 10%${AI_ANALYSIS}${AI_ANALYSIS}`)).toBe('A 10%');
+    expect(appearsInDocuments('95%', [parsed])).toBe(false);
+    expect(appearsInDocuments('2,500', [parsed])).toBe(false);
+    expect(appearsInDocuments('22%', [parsed])).toBe(true);
+  });
+
+  it('finds the first document containing a value, for the citation', () => {
+    const docs: SourceDocument[] = [
+      { fileName: 'proposal.pdf', text: DOCS[0] },
+      { fileName: 'baseline-report.docx', text: 'The baseline survey found 41% of households food insecure; 800 households were sampled.' },
+    ];
+    expect(findSourceDocument('41%', docs)?.fileName).toBe('baseline-report.docx');
+    expect(findSourceDocument('800', docs)?.fileName).toBe('proposal.pdf');
+    expect(findSourceDocument('80', docs)).toBeNull();
+    expect(findSourceDocument('95%', [{ fileName: 'proposal.pdf', text: DOCS[0] + AI_ANALYSIS }])).toBeNull();
+  });
 });
 
 describe('frameworkNormalize: people-level disaggregation', () => {
@@ -318,6 +381,57 @@ describe('frameworkNormalize: people-level disaggregation', () => {
     expect(isPeopleLevelIndicator('Volume', 'نسبة النساء المشاركات')).toBe(true);
     expect(isPeopleLevelIndicator('Volume', 'للأطفال')).toBe(true);
     expect(isPeopleLevelIndicator('Megawatts installed', 'قدرة الطاقة المتجددة المركبة')).toBe(false);
+  });
+
+  it('recognises the wider list of people nouns in English and Arabic', () => {
+    for (const name of [
+      'Number of teachers trained', 'Number of health staff trained', 'Number of committee members trained', '% of residents satisfied',
+      '% of citizens who trust the council', 'Number of patients treated', 'Number of caregivers reached', '% of parents engaged',
+      'Number of entrepreneurs supported', 'Number of business owners supported', '% of learners passing', 'Number of pupils enrolled',
+      'Number of local officials trained', 'Number of survivors assisted', 'Number of workers employed', 'Number of employees retained',
+      'Number of trainees certified', '% of graduates employed', 'Number of refugees assisted', 'Number of people reached',
+    ]) expect(isPeopleLevelIndicator(name), name).toBe(true);
+    expect(isPeopleLevelIndicator('Number of official documents issued')).toBe(false);
+    expect(isPeopleLevelIndicator('Membership fee collected')).toBe(false);
+
+    for (const nameAr of [
+      'عدد المعلمين المدربين', 'عدد المعلمات', 'عدد الموظفين', 'عدد أعضاء اللجان', 'نسبة السكان الراضين', 'نسبة المواطنين',
+      'نسبة المرضى الراضين', 'عدد مقدمي الرعاية', 'نسبة الأهالي المشاركين في المجالس', 'عدد رواد الأعمال', 'عدد مالكي المنشآت',
+      'نسبة المتعلمين', 'عدد التلاميذ', 'عدد المسؤولين المدربين', 'عدد الناجين', 'عدد العمال', 'عدد المتدربين', 'عدد الخريجين',
+      'عدد اللاجئين', 'عدد الأشخاص',
+    ]) expect(isPeopleLevelIndicator('Volume', nameAr), nameAr).toBe(true);
+  });
+
+  it('gives the library entries ED-04, ED-05 and GV-03 sex disaggregation', () => {
+    for (const id of ['ED-04', 'ED-05', 'GV-03']) {
+      const entry = seedEntry(id);
+      expect(entry.disaggregation).toContain('sex');
+      expect(isPeopleLevelIndicator(entry.name), entry.name).toBe(true);
+      expect(isPeopleLevelIndicator('Volume', entry.nameAr), entry.nameAr).toBe(true);
+
+      // By the people noun alone (no library link) …
+      const [unlinked] = normalizeIndicators([aiIndicator({ indicatorText: entry.name, indicatorTextAr: '', libraryId: null, disaggregation: ['location'] })], ctx());
+      expect(unlinked.disaggregation, entry.name).toEqual(['sex', 'location']);
+
+      // … and by the linked library entry, whatever the wording.
+      const [linked] = normalizeIndicators([aiIndicator({ indicatorText: 'Coverage rate', indicatorTextAr: '', libraryId: id, disaggregation: [] })],
+        ctx({ libraryEntries: new Map([[id, entry]]) }));
+      expect(linked.disaggregation, id).toEqual(['sex']);
+    }
+  });
+
+  it('keeps the sex keys of the linked library entry', () => {
+    expect(withLibrarySexDisaggregation(['location'], ['sex_of_household_head', 'location'])).toEqual(['sex_of_household_head', 'location']);
+    expect(withLibrarySexDisaggregation(['age'], ['sex', 'age'])).toEqual(['sex', 'age']);
+    expect(withLibrarySexDisaggregation(['sex'], ['sex'])).toEqual(['sex']);
+    expect(withLibrarySexDisaggregation(['location'], ['location'])).toEqual(['location']);
+    expect(withLibrarySexDisaggregation(['location'], undefined)).toEqual(['location']);
+
+    // A household indicator linked to FS-01 gets sex_of_household_head, not sex.
+    const [fcs] = normalizeIndicators([aiIndicator({
+      indicatorText: '% of households with an acceptable Food Consumption Score', indicatorTextAr: '', libraryId: 'FS-01', disaggregation: ['location'],
+    })], ctx());
+    expect(fcs.disaggregation).toEqual(['sex_of_household_head', 'location']);
   });
 
   it('normalises keys and synonyms, dropping invalid and duplicate keys', () => {
@@ -346,19 +460,38 @@ describe('frameworkNormalize: people-level disaggregation', () => {
 describe('frameworkNormalize: baselines and targets (never invented)', () => {
   const base = { baselineValue: '', baselineBasis: 'none', targetValue: '', targetBasis: 'none', targetJustification: '', standardReferenceCode: null };
 
-  it('keeps document values that appear in a document', () => {
-    const r = resolveBaselineAndTarget({ ...base, baselineValue: '22%', baselineBasis: 'document', targetValue: '60%', targetBasis: 'document' }, DOCS);
+  it('keeps document values that appear in a document and cites the document', () => {
+    const r = resolveBaselineAndTarget({ ...base, baselineValue: '22%', baselineBasis: 'document', targetValue: '60%', targetBasis: 'document' }, SOURCES);
     expect(r.baselineValue).toBe('22%');
+    expect(r.baselineMethod).toBe('Baseline taken from the project documents (source: proposal.pdf)');
     expect(r.targetValue).toBe('60%');
-    expect(r.targetJustification).toBe('Target taken from the project documents.');
+    expect(r.targetJustification).toBe('Target taken from the project documents (source: proposal.pdf)');
+
+    const own = resolveBaselineAndTarget({
+      ...base, baselineValue: '41%', baselineBasis: 'document', baselineMethod: 'Baseline survey, March 2026.',
+      targetValue: '800', targetBasis: 'document', targetJustification: 'Output target in the proposal budget.',
+    }, [...SOURCES, { fileName: 'baseline-report.docx', text: 'The baseline survey found 41% food insecure households.' }]);
+    expect(own.baselineMethod).toBe('Baseline survey, March 2026 (source: baseline-report.docx)');
+    expect(own.targetJustification).toBe('Output target in the proposal budget (source: proposal.pdf)');
+  });
+
+  it('never accepts a value found only in the AI analysis appended to a document', () => {
+    const r = resolveBaselineAndTarget({
+      ...base, baselineValue: '41%', baselineBasis: 'document', targetValue: '95%', targetBasis: 'document',
+    }, [{ fileName: 'proposal.pdf', text: DOCS[0] + AI_ANALYSIS }]);
+    expect(r.baselineValue).toBeNull();
+    expect(r.baselineMethod).toBe(TO_BE_CONFIRMED);
+    expect(r.targetValue).toBeNull();
+    expect(r.targetJustification).toMatch(/target proposed by the AI was not found/);
   });
 
   it('clears document values not found in any document and notes it in the justification', () => {
     const r = resolveBaselineAndTarget({
       ...base, baselineValue: '30%', baselineBasis: 'document', targetValue: '75%', targetBasis: 'document',
       targetJustification: 'baseline + 15 percentage points',
-    }, DOCS);
+    }, SOURCES);
     expect(r.baselineValue).toBeNull();
+    expect(r.baselineMethod).toBe(TO_BE_CONFIRMED);
     expect(r.targetValue).toBeNull();
     expect(r.targetJustification).toMatch(/^Proposed method: baseline \+ 15 percentage points — confirm after baseline\./);
     expect(r.targetJustification).toMatch(/target proposed by the AI was not found/);
@@ -367,37 +500,99 @@ describe('frameworkNormalize: baselines and targets (never invented)', () => {
   });
 
   it('clears target values with basis none or method_only and keeps the method', () => {
-    const none = resolveBaselineAndTarget({ ...base, targetValue: '500', targetBasis: 'none' }, DOCS);
+    const none = resolveBaselineAndTarget({ ...base, targetValue: '500', targetBasis: 'none' }, SOURCES);
     expect(none.targetValue).toBeNull();
     expect(none.targetJustification).toBe(`Proposed method: ${DEFAULT_TARGET_METHOD} — confirm after baseline.`);
+    expect(none.targetJustification).toBe('Proposed method: set after the baseline survey, using comparable programmes — confirm after baseline.');
 
-    const method = resolveBaselineAndTarget({ ...base, targetValue: 'baseline + 10 percentage points', targetBasis: 'method_only' }, DOCS);
+    const method = resolveBaselineAndTarget({ ...base, targetValue: 'baseline + 10 percentage points', targetBasis: 'method_only' }, SOURCES);
     expect(method.targetValue).toBeNull();
     expect(method.targetJustification).toBe('Proposed method: baseline + 10 percentage points — confirm after baseline.');
 
     const prefixed = resolveBaselineAndTarget({
-      ...base, targetValue: '80%', targetBasis: 'METHOD_ONLY', targetJustification: 'Proposed method: match the national rate — confirm after baseline.',
-    }, DOCS);
+      ...base, targetValue: '80%', targetBasis: 'METHOD_ONLY',
+      targetJustification: 'Proposed method: baseline + 5 percentage points — confirm after baseline.',
+    }, SOURCES);
     expect(prefixed.targetValue).toBeNull();
-    expect(prefixed.targetJustification).toBe('Proposed method: match the national rate — confirm after baseline.');
+    expect(prefixed.targetJustification).toBe('Proposed method: baseline + 5 percentage points — confirm after baseline.');
+  });
+
+  it('does not carry an invented number in the justification of a removed target', () => {
+    for (const targetBasis of ['none', 'document', 'standard_threshold']) {
+      const r = resolveBaselineAndTarget({
+        ...base, targetValue: '85%', targetBasis, targetJustification: 'Reach 85% of households by year two',
+      }, SOURCES);
+      expect(r.targetValue).toBeNull();
+      expect(r.targetJustification).toMatch(new RegExp(`^Proposed method: ${DEFAULT_TARGET_METHOD} — confirm after baseline\\.`));
+      expect(r.targetJustification).not.toContain('85');
+    }
+  });
+
+  it('keeps the model\'s method_only text only when it sets the target from the baseline', () => {
+    const resolve = (targetJustification: string, targetValue = '') =>
+      resolveBaselineAndTarget({ ...base, targetBasis: 'method_only', targetValue, targetJustification }, SOURCES);
+    const DEFAULT = 'Proposed method: set after the baseline survey, using comparable programmes — confirm after baseline.';
+
+    expect(resolve('Set after the baseline survey using the national average').targetJustification)
+      .toBe('Proposed method: Set after the baseline survey using the national average — confirm after baseline.');
+    expect(resolve('خط الأساس + 10 نقاط مئوية').targetJustification).toBe('Proposed method: خط الأساس + 10 نقاط مئوية — confirm after baseline.');
+    expect(resolve('يحدد بعد خط الاساس').targetJustification).toBe('Proposed method: يحدد بعد خط الاساس — confirm after baseline.');
+
+    // Not a method: a justification, an activity plan, a target in disguise, or our own boilerplate only.
+    for (const text of ['Target stated in the proposal.', 'two sessions per week', '75% of participants', 'match the national rate',
+      'Proposed method: match the national rate — confirm after baseline.', '']) {
+      const r = resolve(text, '75%');
+      expect(r.targetValue, text).toBeNull();
+      expect(r.targetJustification, text).toBe(DEFAULT);
+    }
+
+    // A method written in the target field is used when the justification is not one.
+    expect(resolve('Consistent with similar programmes', 'baseline + 10 percentage points').targetJustification)
+      .toBe('Proposed method: baseline + 10 percentage points — confirm after baseline.');
   });
 
   it('never keeps a baseline without a document basis, even when the value appears in a document', () => {
-    expect(resolveBaselineAndTarget({ ...base, baselineValue: '22%', baselineBasis: 'none' }, DOCS).baselineValue).toBeNull();
-    expect(resolveBaselineAndTarget({ ...base, baselineValue: '22%', baselineBasis: 'estimate' }, DOCS).baselineValue).toBeNull();
+    expect(resolveBaselineAndTarget({ ...base, baselineValue: '22%', baselineBasis: 'none' }, SOURCES).baselineValue).toBeNull();
+    expect(resolveBaselineAndTarget({ ...base, baselineValue: '22%', baselineBasis: 'estimate' }, SOURCES).baselineValue).toBeNull();
   });
 
-  it('keeps a standard threshold only with a standard reference', () => {
+  it('keeps a standard threshold only when the linked library entry\'s own text contains it', () => {
+    const wa01 = seedEntry('WA-01');
     const sphere = resolveBaselineAndTarget({
       ...base, targetValue: '15', targetBasis: 'standard_threshold', targetJustification: 'Sphere minimum of 15 l/p/d.',
-      standardReferenceCode: 'Sphere Water supply standard',
+      standardReferenceCode: standardReferenceLabel(wa01.standardReference), libraryEntry: wa01,
     }, []);
     expect(sphere.targetValue).toBe('15');
-    expect(sphere.targetJustification).toBe('Proposed standard threshold (Sphere Water supply standard): Sphere minimum of 15 l/p/d — confirm it applies to this project.');
+    expect(sphere.targetJustification).toBe(
+      'Proposed standard threshold (Sphere Water supply standard — minimum 15 l/p/d (aim for 20)): Sphere minimum of 15 l/p/d — confirm it applies to this project.',
+    );
 
-    const unreferenced = resolveBaselineAndTarget({ ...base, targetValue: '95%', targetBasis: 'standard_threshold' }, []);
-    expect(unreferenced.targetValue).toBeNull();
-    expect(unreferenced.targetJustification).toMatch(/^Proposed method:/);
+    // Notes, means of verification and calculation fields count too (case-insensitive, whole numbers only).
+    const entry = libEntry('ED-04', {
+      notes: 'Define completed as AT LEAST 80% of sessions.', meansOfVerification: 'Attendance sheets for all 12 sessions',
+      calculation: { numerator: 'Score of 42 or more', formula: 'numerator ÷ denominator × 100' },
+    });
+    const threshold = (targetValue: string, libraryEntry: LibraryEntryReference | null = entry, standardReferenceCode: string | null = null) =>
+      resolveBaselineAndTarget({ ...base, targetValue, targetBasis: 'standard_threshold', standardReferenceCode, libraryEntry }, []);
+    expect(threshold('at least 80%').targetValue).toBe('at least 80%');
+    expect(threshold('12').targetValue).toBe('12');
+    expect(threshold('42').targetValue).toBe('42');
+    expect(threshold('42').targetJustification).toBe('Proposed standard threshold (library entry ED-04) — confirm it applies to this project.');
+    expect(threshold('4').targetValue).toBeNull(); // part of 42
+    expect(libraryEntryTexts(entry)).toEqual([
+      'Definition of ED-04', 'Define completed as AT LEAST 80% of sessions.', 'Attendance sheets for all 12 sessions',
+      'Score of 42 or more', 'numerator ÷ denominator × 100',
+    ]);
+
+    // A free-text standard reference is no longer enough, nor is a value missing from the linked entry.
+    for (const r of [
+      threshold('95%', null, 'Sphere Water supply standard'),
+      threshold('95%', entry, 'Sphere Water supply standard'),
+      resolveBaselineAndTarget({ ...base, targetValue: '20', targetBasis: 'standard_threshold', targetJustification: 'Sphere aims for 20 l/p/d' }, []),
+    ]) {
+      expect(r.targetValue).toBeNull();
+      expect(r.targetJustification).toMatch(/^Proposed method: .* — confirm after baseline\. The standard threshold proposed by the AI was not found in the linked library entry/);
+    }
   });
 });
 
@@ -439,8 +634,9 @@ describe('frameworkNormalize: indicators', () => {
       calculation: { numerator: 'Trainees employed at six months', denominator: 'Trainees reached by the tracer survey', formula: 'numerator ÷ denominator × 100' },
       meansOfVerification: 'Phone tracer survey of all graduates six months after completion',
       baselineValue: null,
+      baselineMethod: 'Not applicable for a new cohort; first measured at the six-month tracer survey',
       targetValue: '60%',
-      targetJustification: 'Target stated in the proposal.',
+      targetJustification: 'Target stated in the proposal (source: proposal.pdf)',
       libraryId: 'LV-01',
       standardReferenceCode: null,
       assumptions: 'Labour market conditions do not deteriorate sharply.',
@@ -450,23 +646,62 @@ describe('frameworkNormalize: indicators', () => {
       sortOrder: 0,
       provenance: 'ai_generated',
       aiModel: MODEL,
-      promptVersion: 'framework-v2',
+      promptVersion: 'framework-v3',
     });
     expect(p.startDate).toEqual(new Date('2026-07-01T00:00:00.000Z'));
     expect(p.milestones).toEqual([{ label: 'First tracer survey', date: '2026-12-15', completed: false }]);
   });
 
-  it('keeps libraryId only when known, and fills the standard reference from the library', () => {
-    const [unknown, known, lower] = normalizeIndicators([
-      aiIndicator({ libraryId: 'IM-99', indicatorText: 'A' }),
+  it('keeps libraryId only when known, and takes the standard reference from the linked library entry', () => {
+    const [unknown, known, lower, overridden, custom, none] = normalizeIndicators([
+      aiIndicator({ libraryId: 'IM-99', indicatorText: 'A', standardReferenceCode: 'IASC MHPSS O5.4' }),
       aiIndicator({ libraryId: 'LV-02', indicatorText: 'B' }),
       aiIndicator({ libraryId: 'ac-01', indicatorText: 'C', standardReferenceCode: 'CHS Commitment 5' }),
+      aiIndicator({ libraryId: 'LV-02', indicatorText: 'D', standardReferenceCode: 'EU GERF 9.99' }),
+      aiIndicator({ libraryId: 'LV-01', indicatorText: 'E', standardReferenceCode: 'SDG 8.5.2' }),
+      aiIndicator({ libraryId: null, indicatorText: 'F', standardReferenceCode: '' }),
     ], ctx());
-    expect(unknown.libraryId).toBeNull();
-    expect(known.libraryId).toBe('LV-02');
-    expect(known.standardReferenceCode).toBe('EU GERF 2.14');
-    expect(lower.libraryId).toBe('AC-01');
-    expect(lower.standardReferenceCode).toBe('CHS Commitment 5');
+    expect(unknown).toMatchObject({ libraryId: null, standardReferenceCode: 'IASC MHPSS O5.4' });
+    expect(known).toMatchObject({ libraryId: 'LV-02', standardReferenceCode: 'EU GERF 2.14' });
+    // The library's standard reference is authoritative over the model's code …
+    expect(lower).toMatchObject({ libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)' });
+    expect(overridden.standardReferenceCode).toBe('EU GERF 2.14');
+    // … and the model's code is kept only when the linked entry has no standard reference.
+    expect(custom).toMatchObject({ libraryId: 'LV-01', standardReferenceCode: 'SDG 8.5.2' });
+    expect(none.standardReferenceCode).toBeNull();
+  });
+
+  it('keeps a standard-threshold target only when the linked library entry contains it', () => {
+    const [sphere, unlinked, invented] = normalizeIndicators([
+      aiIndicator({
+        resultCode: 'O2', indicatorText: 'Average litres of water per person per day', libraryId: 'WA-01', unit: 'litres_per_person_per_day',
+        targetValue: '15', targetBasis: 'standard_threshold', standardReferenceCode: 'Sphere', targetJustification: 'Sphere minimum.',
+      }),
+      aiIndicator({
+        resultCode: 'O2', indicatorText: 'Water quality', libraryId: null, unit: 'percent',
+        targetValue: '100%', targetBasis: 'standard_threshold', standardReferenceCode: 'Sphere water quality', targetJustification: 'Sphere.',
+      }),
+      aiIndicator({
+        resultCode: 'O2', indicatorText: 'Water use', libraryId: 'WA-01', unit: 'litres_per_person_per_day',
+        targetValue: '50', targetBasis: 'standard_threshold', targetJustification: '',
+      }),
+    ], ctx());
+    expect(sphere).toMatchObject({ targetValue: '15', standardReferenceCode: 'Sphere Water supply standard — minimum 15 l/p/d (aim for 20)' });
+    expect(sphere.targetJustification).toMatch(/^Proposed standard threshold \(Sphere Water supply standard/);
+    expect(unlinked.targetValue).toBeNull();
+    expect(unlinked.targetJustification).toMatch(/^Proposed method: /);
+    expect(invented.targetValue).toBeNull();
+    expect(invented.targetJustification).toMatch(/^Proposed method: set after the baseline survey, using comparable programmes — confirm after baseline\. /);
+  });
+
+  it('cites the document in baselineMethod and targetJustification when a value is kept', () => {
+    const [p] = normalizeIndicators([aiIndicator({
+      baselineValue: '22%', baselineBasis: 'document', baselineMethod: '', targetValue: '60%', targetBasis: 'document', targetJustification: '',
+    })], ctx({ documents: [{ fileName: 'annex.pdf', text: 'Unrelated annex.' }, ...SOURCES] }));
+    expect(p).toMatchObject({
+      baselineValue: '22%', baselineMethod: 'Baseline taken from the project documents (source: proposal.pdf)',
+      targetValue: '60%', targetJustification: 'Target taken from the project documents (source: proposal.pdf)',
+    });
   });
 
   it('turns activity indicators into output indicators linked to the activity\'s output', () => {
@@ -520,8 +755,8 @@ describe('frameworkNormalize: indicators', () => {
     const [p] = normalizeIndicators([aiIndicator({ baselineValue: '40%', baselineBasis: 'document', targetValue: '90%', targetBasis: 'document' })], ctx());
     expect(p.baselineValue).toBeNull();
     expect(p.targetValue).toBeNull();
-    expect(p.targetJustification).toMatch(/^Proposed method: Target stated in the proposal — confirm after baseline\./);
-    const [noDocs] = normalizeIndicators([aiIndicator()], ctx({ documentTexts: [] }));
+    expect(p.targetJustification).toMatch(new RegExp(`^Proposed method: ${DEFAULT_TARGET_METHOD} — confirm after baseline\\.`));
+    const [noDocs] = normalizeIndicators([aiIndicator()], ctx({ documents: [] }));
     expect(noDocs.targetValue).toBeNull();
   });
 
@@ -538,6 +773,15 @@ describe('frameworkNormalize: indicators', () => {
     expect(list.map(p => [p.resultId, p.sortOrder])).toEqual([['n-o1', 0], ['n-o2', 1]]);
     expect(extractIndicatorList('nope')).toEqual([]);
     expect(normalizeIndicators(null, ctx())).toEqual([]);
+  });
+
+  it('lists the library ids the indicators link to', () => {
+    expect(linkedLibraryIds([
+      aiIndicator({ libraryId: 'he-03' }), aiIndicator({ libraryId: 'LV-01' }), aiIndicator({ libraryId: 'HE-03' }),
+      aiIndicator({ libraryId: null }), aiIndicator({ libraryId: '' }), 'not an object',
+    ])).toEqual(['HE-03', 'LV-01']);
+    expect(linkedLibraryIds({ indicators: [{ libraryId: 'WA-01' }] })).toEqual(['WA-01']);
+    expect(linkedLibraryIds(null)).toEqual([]);
   });
 
   it('accepts the KPI-assistant field names (name, nameAr, method, rationale)', () => {
@@ -584,6 +828,8 @@ describe('framework prompts', () => {
     expect(prompt).toContain('LV-01 [output]');
     expect(prompt).toContain('standard: EU GERF 2.14');
     expect(prompt).toContain('never invent numbers');
+    expect(prompt).toContain('a standard threshold written in the linked library candidate');
+    expect(prompt).toContain('how the target will be set from the baseline');
     expect(prompt).not.toMatch(/Suggest baseline and target values where possible/i);
     expect(prompt).toContain('Do not write activity indicators');
     expect(prompt).toContain('No project documents were provided');
@@ -603,11 +849,11 @@ async function loadGenerator() {
 }
 
 describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', () => {
-  const libraryEntry = (id: string, sector: any, level: any, name: string, standardReference: any = null) => ({
+  const libraryEntry = (id: string, sector: any, level: any, name: string, standardReference: any = null, extra: { notes?: string; disaggregation?: string[] } = {}) => ({
     id, sector, level, name, nameAr: 'اسم', tags: [], definition: `Definition of ${id}`, unit: 'number', direction: 'increase' as const,
-    disaggregation: ['sex'], methods: ['document_review' as const], frequency: 'quarterly' as const, meansOfVerification: 'Registers',
+    disaggregation: extra.disaggregation ?? ['sex'], methods: ['document_review' as const], frequency: 'quarterly' as const, meansOfVerification: 'Registers',
     isStandard: !!standardReference, version: '1.0.0', standardReference: standardReference ?? undefined,
-    standardFramework: standardReference?.framework ?? null,
+    standardFramework: standardReference?.framework ?? null, notes: extra.notes ?? null,
   });
 
   async function setup(opts: { humanitarian: boolean; sector: any; sectors: any[]; donorType: any; documentText?: string }) {
@@ -643,7 +889,8 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
         libraryEntry('LV-01', 'livelihoods', 'outcome', '% of trainees employed six months after training'),
         libraryEntry('LV-02', 'livelihoods', 'output', 'Number of people benefiting from vocational training', { framework: 'EU GERF', code: '2.14' }),
         libraryEntry('AC-01', 'other', 'outcome', '% of assisted people who know how to give feedback', { framework: 'Core Humanitarian Standard (2024)', code: 'Commitment 5 (aligned)' }),
-        libraryEntry('HE-03', 'health', 'output', 'Number of consultations provided'),
+        libraryEntry('HE-03', 'health', 'output', 'Number of consultations provided', null, { notes: 'Facilities aim for at least 1,500 consultations per quarter.' }),
+        libraryEntry('FS-01', 'food_security', 'outcome', '% of households with an acceptable FCS', { framework: 'WFP', code: 'Food Consumption Score' }, { disaggregation: ['sex_of_household_head', 'location'] }),
       ],
     });
   });
@@ -721,15 +968,17 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
     // Indicators
     const indicators = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
     expect(indicators).toHaveLength(6);
-    expect(indicators.every(i => i.provenance === 'ai_generated' && i.aiModel === MODEL && i.promptVersion === 'framework-v2')).toBe(true);
+    expect(indicators.every(i => i.provenance === 'ai_generated' && i.aiModel === MODEL && i.promptVersion === 'framework-v3')).toBe(true);
     expect(indicators.every(i => i.level !== 'activity' && i.resultId !== null)).toBe(true);
 
     const [impact, employed, trained, sessions, skills, feedback] = indicators;
     expect(impact).toMatchObject({ resultId: byCode.G.id, level: 'impact', baselineValue: '22%', targetValue: null, libraryId: null, dataCollectionMethod: 'secondary_data' });
+    expect(impact.baselineMethod).toBe('Not applicable for a new cohort; first measured at the six-month tracer survey (source: proposal.pdf)');
     expect(impact.targetJustification).toMatch(/^Proposed method: .* — confirm after baseline\. The target proposed by the AI was not found/);
 
     expect(employed).toMatchObject({
       resultId: byCode.O1.id, level: 'outcome', targetValue: '60%', libraryId: 'LV-01', meansOfVerification: TO_BE_CONFIRMED, direction: 'increase',
+      targetJustification: 'Target stated in the proposal (source: proposal.pdf)',
     });
     expect(employed.disaggregation).toEqual(['sex', 'age']);
     expect(employed.calculation).toMatchObject({ numerator: 'Trainees employed at six months' });
@@ -738,7 +987,7 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
       resultId: byCode['O1.1'].id, level: 'output', targetValue: '800', libraryId: 'LV-02', standardReferenceCode: 'EU GERF 2.14',
     });
     expect(sessions).toMatchObject({ resultId: byCode['O1.1'].id, level: 'output', targetValue: null });
-    expect(sessions.targetJustification).toBe('Proposed method: two sessions per week — confirm after baseline.');
+    expect(sessions.targetJustification).toBe(`Proposed method: ${DEFAULT_TARGET_METHOD} — confirm after baseline.`);
     expect(skills).toMatchObject({ targetValue: null, targetJustification: 'Proposed method: baseline + 10 percentage points — confirm after baseline.' });
     expect(feedback).toMatchObject({ libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)' });
 
@@ -752,6 +1001,75 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
     // A retried job does not duplicate the framework.
     await expect(generateFramework(framework.id, project.id)).rejects.toThrow(/already has results or indicators/);
     expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(7);
+  });
+
+  it('never uses the AI analysis appended to a document as prompt text or evidence', async () => {
+    const { project, framework } = await setup({
+      humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu', documentText: DOCS[0] + AI_ANALYSIS,
+    });
+    createMessage
+      .mockResolvedValueOnce(reply({
+        goal: { code: 'G', text: 'Improved economic participation of young people' },
+        outcomes: [{ code: 'O1', text: 'Graduates secure decent work', outputs: [{ code: 'O1.1', text: 'Youth trained', activities: ['Train'] }] }],
+        documentFigures: [
+          { resultCode: 'O1', kind: 'target', value: '95%', quote: 'from the AI analysis' },
+          { resultCode: 'O1', kind: 'target', value: '60%', quote: '60% of graduates are expected to be employed' },
+        ],
+      }))
+      .mockResolvedValueOnce(reply([
+        aiIndicator({ baselineValue: '41%', baselineBasis: 'document', targetValue: '95%', targetBasis: 'document', targetJustification: '' }),
+        aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of training kits distributed', libraryId: null, unit: 'number', calculation: null,
+          targetValue: '2,500', targetBasis: 'document', targetJustification: '' }),
+        aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: null, unit: 'number', calculation: null,
+          targetValue: '800', targetBasis: 'document', targetJustification: '' }),
+      ]));
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+
+    // The structure prompt holds the document's own text only.
+    const structurePrompt: string = createMessage.mock.calls[0][0].messages[0].content;
+    expect(structurePrompt).toContain('Budget line 1.5 covers 1,200 training kits.');
+    expect(structurePrompt).not.toContain(AI_ANALYSIS_MARKER);
+    expect(structurePrompt).not.toContain('95%');
+    expect(structurePrompt).not.toContain('2,500');
+    // Figures found only in the AI analysis are dropped before the indicator prompt.
+    const indicatorPrompt: string = createMessage.mock.calls[1][0].messages[0].content;
+    expect(indicatorPrompt).toContain('"value": "60%"');
+    expect(indicatorPrompt).not.toContain('95%');
+
+    const [employed, kits, trained] = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
+    expect(employed).toMatchObject({ baselineValue: null, targetValue: null });
+    expect(employed.targetJustification).toMatch(/target proposed by the AI was not found/);
+    expect(employed.targetJustification).toMatch(/baseline proposed by the AI was not found/);
+    expect(kits).toMatchObject({ targetValue: null });
+    expect(trained).toMatchObject({ targetValue: '800', targetJustification: 'Target taken from the project documents (source: proposal.pdf)' });
+  });
+
+  it('checks indicators against their linked library entries, including entries that were not candidates', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
+    createMessage.mockResolvedValueOnce(reply([
+      // HE-03 (health) is not a candidate for a livelihoods project; its notes hold the threshold.
+      aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of consultations provided', libraryId: 'he-03', unit: 'number', calculation: null,
+        disaggregation: [], targetValue: '1,500', targetBasis: 'standard_threshold', standardReferenceCode: 'WHO 1500', targetJustification: 'Library threshold' }),
+      // A free-text standard reference does not make an invented threshold acceptable; the library's reference replaces it.
+      aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of people benefiting from vocational training', libraryId: 'LV-02', unit: 'number',
+        calculation: null, targetValue: '900', targetBasis: 'standard_threshold', standardReferenceCode: 'EU GERF 9.99', targetJustification: '' }),
+      aiIndicator({ resultCode: 'O1', indicatorText: 'Food Consumption Score', libraryId: 'FS-01', disaggregation: ['location'], targetValue: '', targetBasis: 'none' }),
+    ]));
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+    const prompt: string = createMessage.mock.calls[0][0].messages[0].content;
+    expect(prompt).not.toContain('HE-03');
+    expect(prompt).not.toContain('FS-01');
+
+    const [consultations, vocational, fcs] = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
+    expect(consultations).toMatchObject({ libraryId: 'HE-03', targetValue: '1,500', standardReferenceCode: 'WHO 1500', disaggregation: ['sex'] });
+    expect(consultations.targetJustification).toBe('Proposed standard threshold (WHO 1500): Library threshold — confirm it applies to this project.');
+    expect(vocational).toMatchObject({ libraryId: 'LV-02', targetValue: null, standardReferenceCode: 'EU GERF 2.14' });
+    expect(vocational.targetJustification).toMatch(/^Proposed method: .* The standard threshold proposed by the AI was not found in the linked library entry/);
+    expect(fcs).toMatchObject({ libraryId: 'FS-01', standardReferenceCode: 'WFP Food Consumption Score', disaggregation: ['sex_of_household_head', 'location'] });
   });
 
   it('builds a coded results chain from metadata when there are no documents and keeps no document values', async () => {

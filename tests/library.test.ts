@@ -421,4 +421,13 @@ describe.skipIf(!hasTestDatabase)('indicator library routes', () => {
     expect(missing.status).toBe(404);
     expect(missing.body.message).toBe('Library entry not found');
   });
+
+  it('finds an entry whatever the case of the id, like libraryId on indicators', async () => {
+    const lower = await request(app).get('/api/indicator-library/fs-01').set('Authorization', auth);
+    expect(lower.status).toBe(200);
+    expect(lower.body.id).toBe('FS-01');
+    const padded = await request(app).get(`/api/indicator-library/${encodeURIComponent(' wa-01 ')}`).set('Authorization', auth);
+    expect(padded.status).toBe(200);
+    expect(padded.body.id).toBe('WA-01');
+  });
 });

@@ -21,13 +21,17 @@ Goal (impact)
 | `frameworkId` | the framework the node belongs to (deleting a framework deletes its nodes) |
 | `parentId` | the node one level up, or empty |
 | `level` | `impact`, `outcome`, `output` or `activity` |
-| `code` | short label shown in the logframe, e.g. `Goal`, `O1`, `O1.1` |
+| `code` | short label shown in the logframe, e.g. `Goal`, `O1`, `O1.1`; unique within a framework (the API rejects duplicates ignoring case with 409; the unique index `ResultNode_frameworkId_code_key` also stops races and direct writes, answered with the same 409 "A result with that code already exists in this framework") |
 | `text`, `textAr` | the result statement in English and Arabic |
 | `sortOrder` | order among siblings |
 
 **Hierarchy rule** (enforced by the API, `src/services/indicators/hierarchy.ts`): a parent is optional; when present it is in the same framework and exactly one level up — an outcome's parent is an impact, an output's parent an outcome, an activity's parent an output. An impact never has a parent.
 
 Each indicator can point to the result it measures (`Indicator.resultId`). A node with children cannot be deleted (409); deleting a node without children unlinks its indicators (`ON DELETE SET NULL`).
+
+**Level fits the result** (`knowledge/me-foundations.md` §2 rule 5): a linked indicator has its result's level. On create, and on a PATCH that sets `level` or `resultId`, the API answers 400 `level must match the result it measures (<level>)` when they differ; linking a result without sending a level takes the result's level. A PATCH that touches neither field does not re-check older data. Changing a result's level (PATCH /api/results/:id) moves its linked indicators to the new level in the same transaction; the response adds `updatedIndicators` (how many moved, 0 when the level did not change).
+
+The project export (GET /api/projects/:id/export) includes the results chain as `frameworks[].resultNodes` (`id`, `code`, `level`, `text`, `textAr`, `parentId`, in display order) and every reference-sheet field below on each indicator, with its `resultCode`.
 
 **Existing frameworks.** The old framework generator never stored the results chain, so the migration gives every framework one placeholder node per level its indicators use and links each indicator to it:
 
@@ -38,7 +42,7 @@ Each indicator can point to the result it measures (`Indicator.resultId`). A nod
 | output | `OP` | Output indicators (results chain to be completed) — مؤشرات المخرجات (سلسلة النتائج قيد الاستكمال) |
 | activity | `A` | Activity indicators (results chain to be completed) — مؤشرات الأنشطة (سلسلة النتائج قيد الاستكمال) |
 
-Placeholders are chained so the hierarchy rule holds (the outcome placeholder's parent is the framework's impact placeholder if there is one, and so on). M&E officers replace them with the real results in the framework editor. The Arabic texts are drafts for review by a native-speaking M&E specialist.
+Placeholders are chained so the hierarchy rule holds (the outcome placeholder's parent is the framework's impact placeholder if there is one, and so on). A framework gets at most one placeholder per level and the four codes differ (also ignoring case), so they never clash with the unique code index. M&E officers replace them with the real results in the framework editor. The Arabic texts are drafts for review by a native-speaking M&E specialist.
 
 ## 2. Indicator reference sheet
 
@@ -56,7 +60,7 @@ New optional fields on `Indicator` (`knowledge/me-foundations.md` §3). Existing
 | `intermediateTargets` | `[{ "date": "YYYY-MM-DD", "value": "..." }]` | with the existing final `targetValue` |
 | `targetJustification` | text | why the target is realistic |
 | `assumptions` | text | assumptions and data limitations |
-| `libraryId` | library id or null | the library entry it came from, e.g. `FS-01` |
+| `libraryId` | library id or null | the library entry it came from, e.g. `FS-01`; trimmed and upper-cased by the API (`fs-01` finds `FS-01`, also in GET /api/indicator-library/:id) |
 | `standardReferenceCode` | text | framework code, e.g. `GERF 2.38`, `IASC MHPSS O5.4` |
 | `provenance`, `aiModel`, `promptVersion` | see below | |
 
@@ -72,7 +76,9 @@ Where an indicator came from:
 | `ai_generated` | created by the AI framework generator (`aiModel`, `promptVersion` set) |
 | `ai_suggested` | accepted from a KPI Assistant suggestion (Phase 4) |
 
-Clients may set only `manual`, `library` or `imported`; the `ai_*` values are set by the server (the API answers 400 otherwise). The migration marks indicators of frameworks whose `aiModelUsed` is empty or `manual` as `manual`, and all others as `ai_generated` with `aiModel` = the framework's `aiModelUsed`.
+Provenance is accepted on create only: `manual`, `library` or `imported` (the `ai_*` values are set by the server; the API answers 400 for them), and a `libraryId` sent without provenance means `library`. On PATCH a `provenance` field is ignored and the server works it out: a `manual` or `library` indicator follows its library link (`library` while `libraryId` is set, `manual` when it is empty); `ai_generated`, `ai_suggested` and `imported` never change. Approving a framework (PATCH /api/frameworks/:id/approve) approves all its indicators in the same transaction, so their "AI suggested — review before approval" label goes away with it.
+
+The migration marks an existing indicator `ai_generated`, with `aiModel` = the framework's `aiModelUsed`, only when the framework's `aiModelUsed` is a model id (not empty, not `manual`) **and** the indicator was created at most one hour after the framework (`createdAt <= generatedAt + 1 hour`; the old generator created all its indicators right after the framework). Everything else is `manual`, including indicators that people added by hand to an AI-generated framework later.
 
 ## 4. Disaggregated data (`DataPoint.breakdown`)
 
@@ -85,7 +91,15 @@ A data point can carry its value broken down by group, one object per dimension:
 }
 ```
 
-Values are numbers. When the indicator counts people or things, each dimension's categories must add up to the data point's `value` (here 218); otherwise the API answers 400 with a clear message. `breakdown` is optional and empty for all existing data points.
+Values are numbers. The rules follow the indicator's unit (`src/services/dataPoints/breakdown.ts`); an explicit unit always wins:
+
+- **Count** (number, people, households, …): the data point's `value` must be a number, and each dimension's categories must add up to it (here 218).
+- **Percentage**: each category is a rate from 0 to 100; categories do not add up.
+- **No unit**: percentage rules when the indicator text reads as a percentage (starts with `%`, or says percent, percentage, proportion, share, rate, نسبة or معدل); otherwise no sum check. A blank unit is no longer treated as a count.
+
+Every problem in a data point is reported together in one 400 (bulk import prefixes each message with its row number). `breakdown` is optional and empty for all existing data points.
+
+Numeric values are stored in canonical form, `String(number)`: `"١٬٢٠٠"`, `"1,200"` and `"1200.0"` become `"1200"`, in `DataPoint.value` and in `Indicator.currentValue`, and also for data arriving through the KoboToolbox and Manasati webhooks. Other values (`"Yes"`) are stored as sent. Single entry sets `currentValue` to the value just recorded; bulk import sets each imported indicator's `currentValue` to its most recent data point by collection date. Recording data (single and bulk) is open to org admins and M&E officers; donor viewers get 403.
 
 ## 5. Projects and enums
 
@@ -111,7 +125,7 @@ Locally, `npx prisma db push` is enough. Shared databases get the reviewed SQL f
 
 Steps (CLAUDE.md rule 8: test on a development branch first and show the SQL before touching a shared database). `DIRECT_URL` is the shared database's direct connection (port 5432, not the pooler); `BRANCH_URL` / `BRANCH_DIRECT_URL` are the branch's.
 
-1. **Prove it locally.** `scripts/verify-phase2-migration.sh` must end with `PASS`. It runs the file on a fresh database and on a copy of the old seed and checks row counts, checksums, links, the hierarchy rule, provenance, RLS, a refused second run and that `prisma migrate diff` reports no drift.
+1. **Prove it locally.** `scripts/verify-phase2-migration.sh` must end with `PASS`. It runs the file on a fresh database and on a copy of the old seed and checks row counts, checksums, links, the hierarchy rule, unique result codes, provenance (including an indicator added by hand to the AI-generated seed framework a day later, which must stay `manual`), RLS, a refused second run and that `prisma migrate diff` reports no drift. It only runs against localhost and refuses URLs with a `host=`/`hostaddr=` parameter or a comma-separated host list unless `VERIFY_ALLOW_NON_LOCAL=1`.
 2. **Check the starting point and back up** (resume the Supabase project if it is paused). The file expects the Phase 0 schema: if `psql "$DIRECT_URL" -Atc 'SELECT to_regclass($$public."WebhookToken"$$)'` prints nothing, apply `prisma/sql/2026-10-11_phase0_webhook_tokens.sql` first (same branch-first procedure). Then:
    `pg_dump "$DIRECT_URL" --schema=public -Fc --no-owner --no-privileges -f raqib-before-phase2.dump`
    `pg_dump "$DIRECT_URL" --schema=public --data-only -Fc -f raqib-data-before-phase2.dump`

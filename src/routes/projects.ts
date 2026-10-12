@@ -4,6 +4,7 @@ import { assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { validationErrorBody } from '../services/dataPoints/fields';
+import { sortResultNodes } from '../services/indicators/hierarchy';
 import { parseProjectCreate, parseProjectUpdate } from '../services/projects/validation';
 
 const router = Router();
@@ -87,9 +88,13 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
       frameworks: {
         orderBy: { version: 'desc' },
         include: {
+          resultNodes: {
+            select: { id: true, code: true, level: true, text: true, textAr: true, parentId: true, sortOrder: true },
+          },
           indicators: {
             orderBy: { sortOrder: 'asc' },
             include: {
+              result: { select: { code: true } },
               dataPoints: { orderBy: { collectionDate: 'desc' } },
             },
           },
@@ -108,7 +113,22 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
 
   if (!project) throw new AppError(404, 'Project not found');
 
-  // Flatten indicators with their data points for easy spreadsheet mapping
+  // Each framework with its results chain (impact > outcome > output > activity, in display order)
+  const frameworks = project.frameworks.map(fw => ({
+    id: fw.id,
+    version: fw.version,
+    status: fw.status,
+    resultNodes: sortResultNodes(fw.resultNodes).map(node => ({
+      id: node.id,
+      code: node.code,
+      level: node.level,
+      text: node.text,
+      textAr: node.textAr,
+      parentId: node.parentId,
+    })),
+  }));
+
+  // Flatten indicators with their reference sheets and data points for easy spreadsheet mapping
   const indicators = project.frameworks.flatMap(fw =>
     fw.indicators.map(ind => ({
       frameworkVersion: fw.version,
@@ -124,6 +144,23 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
       currentValue: ind.currentValue,
       unit: ind.unit,
       status: ind.status,
+      // Reference sheet (knowledge/me-foundations.md §3)
+      frameworkId: fw.id,
+      resultId: ind.resultId,
+      resultCode: ind.result?.code ?? null,
+      definition: ind.definition,
+      calculation: ind.calculation,
+      direction: ind.direction,
+      disaggregation: ind.disaggregation,
+      meansOfVerification: ind.meansOfVerification,
+      baselineDate: ind.baselineDate,
+      baselineMethod: ind.baselineMethod,
+      targetJustification: ind.targetJustification,
+      intermediateTargets: ind.intermediateTargets,
+      assumptions: ind.assumptions,
+      libraryId: ind.libraryId,
+      standardReferenceCode: ind.standardReferenceCode,
+      provenance: ind.provenance,
       dataPoints: ind.dataPoints.map(dp => ({
         id: dp.id,
         value: dp.value,
@@ -182,6 +219,7 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
       geographicScope: project.geographicScope,
       status: project.status,
     },
+    frameworks,
     indicators,
     beneficiaries,
     assessments: project.assessments,

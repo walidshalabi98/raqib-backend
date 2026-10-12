@@ -37,6 +37,23 @@ export function parentLevelProblem(child: IndicatorLevel, parent: IndicatorLevel
   return `An ${child} result must sit under an ${expected} result, not under an ${parent} result.`;
 }
 
+/**
+ * "Level fits the result" (knowledge/me-foundations.md §2 rule 5): an indicator
+ * linked to a result has that result's level. `requested` is the level the
+ * indicator would have (undefined: not chosen), `resultLevel` the level of the
+ * result it measures (null/undefined: not linked). Returns the level to use
+ * (the result's when none was chosen; undefined when there is no result and no
+ * level) or the 400 message when they differ.
+ */
+export function levelForResult(
+  requested: IndicatorLevel | undefined,
+  resultLevel: IndicatorLevel | null | undefined,
+): { ok: true; level: IndicatorLevel | undefined } | { ok: false; message: string } {
+  if (!resultLevel) return { ok: true, level: requested };
+  if (requested === undefined || requested === resultLevel) return { ok: true, level: resultLevel };
+  return { ok: false, message: `level must match the result it measures (${resultLevel})` };
+}
+
 type Sortable = { level: IndicatorLevel; sortOrder: number; code: string };
 
 /** Order: level (impact, outcome, output, activity), then sortOrder, then code (O2 before O10). */

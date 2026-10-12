@@ -381,7 +381,7 @@ Paste the matching prompt at the start of a session (in the repository named).
 |---|---|---|---|
 | 0 Safety | Merged (SQL pending) | backend #2, frontend #2 | `WebhookToken` SQL not yet applied to Supabase (project paused); the storage module missing from backend #2 is added in backend #3. |
 | 1 Build | Done | backend #3, frontend #3 | Frontend `npm audit` keeps 5 high findings in Tailwind 3's file-watcher chain (no patched `braces` exists; `lovable-tagger` needs Tailwind 3) — decision needed. Lint has 62 `no-explicit-any` warnings until typed API models (Phase 2). |
-| 2 Data model | In progress | | |
+| 2 Data model | In review | backend #4, frontend #4 | `prisma/sql/2026-10-11_phase2_data_model.sql` not yet applied to Supabase (project paused; verified locally with `npm run verify:migration`). Arabic strings need native-speaker review. |
 | 3 AI foundation | Not started | | |
 | 4 KPI Assistant | Not started | | |
 | 5 Active Monitoring | Not started | | |

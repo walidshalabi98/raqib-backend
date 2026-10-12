@@ -4,9 +4,10 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
 import { AppError } from '../src/middleware/errorHandler';
+import { levelForResult } from '../src/services/indicators/hierarchy';
 import {
-  DEFAULT_PHASES, indicatorCreateSchema, parseIndicatorCreate, parseIndicatorUpdate, parseIsoDate,
-  toIndicatorCreateData, toIndicatorUpdateData,
+  DEFAULT_PHASES, indicatorCreateSchema, isLegacyDate, parseIndicatorCreate, parseIndicatorUpdate, parseIsoDate,
+  provenanceAfterUpdate, toIndicatorCreateData, toIndicatorUpdateData,
 } from '../src/services/indicators/validation';
 import { bearer, createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
 
@@ -107,13 +108,23 @@ describe('indicator payload validation', () => {
     expect(messageOf(() => parseIndicatorUpdate({ startDate: 'next week' }))).toContain('startDate must be a real date in YYYY-MM-DD format');
   });
 
+  it('rejects impossible dates in ISO date-time form instead of rolling them over', () => {
+    for (const bad of ['2026-02-30T00:00:00Z', '2026-02-29T10:00:00.000Z', '2026-04-31T12:00+03:00', '2026-13-01T00:00:00Z', '2026-02-01T25:00:00Z']) {
+      expect(isLegacyDate(bad), bad).toBe(false);
+      expect(messageOf(() => parseIndicatorUpdate({ endDate: bad }))).toContain('endDate must be a real date in YYYY-MM-DD format');
+    }
+    expect(isLegacyDate('2028-02-29T10:00:00+03:00')).toBe(true);
+    expect(isLegacyDate('2026-02-28T23:59:59.999Z')).toBe(true);
+    expect(isLegacyDate('2026-02-28')).toBe(true);
+    expect(parseIndicatorUpdate({ actualEndDate: '2028-02-29T00:00:00Z' }).actualEndDate).toEqual(new Date('2028-02-29T00:00:00.000Z'));
+  });
+
   it('parses a full reference sheet', () => {
-    const parsed = parseIndicatorUpdate({ ...referenceSheet, provenance: 'library', libraryId: 'FS-01', resultId: 'r-1' });
+    const parsed = parseIndicatorUpdate({ ...referenceSheet, libraryId: 'FS-01', resultId: 'r-1' });
     expect(parsed).toMatchObject({
       direction: 'increase',
       disaggregation: ['sex_of_household_head', 'location', 'displacement_status'],
       calculation: referenceSheet.calculation,
-      provenance: 'library',
       libraryId: 'FS-01',
       resultId: 'r-1',
       standardReferenceCode: 'WFP CRF',
@@ -183,12 +194,44 @@ describe('indicator payload validation', () => {
     }
   });
 
-  it('lets clients set only manual, library or imported provenance', () => {
-    for (const ok of ['manual', 'library', 'imported']) expect(parseIndicatorUpdate({ provenance: ok }).provenance).toBe(ok);
-    expect(messageOf(() => parseIndicatorUpdate({ provenance: 'ai_suggested' })))
+  it('lets clients set only manual, library or imported provenance, and only on create', () => {
+    for (const ok of ['manual', 'library', 'imported']) expect(parseIndicatorCreate({ provenance: ok }).provenance).toBe(ok);
+    expect(messageOf(() => parseIndicatorCreate({ provenance: 'ai_suggested' })))
       .toBe("Invalid indicator: provenance ai_suggested is set only by Raqib's AI features; use one of: manual, library, imported");
     expect(messageOf(() => parseIndicatorCreate({ provenance: 'ai_generated' }))).toContain('ai_generated is set only by');
-    expect(messageOf(() => parseIndicatorUpdate({ provenance: 'copied' }))).toContain('provenance must be one of: manual, library, imported');
+    expect(messageOf(() => parseIndicatorCreate({ provenance: 'copied' }))).toContain('provenance must be one of: manual, library, imported');
+    // On update it is stripped like any unknown key: the server works it out (provenanceAfterUpdate).
+    for (const sent of ['manual', 'library', 'imported', 'ai_suggested', 'ai_generated', 'copied']) {
+      expect(parseIndicatorUpdate({ provenance: sent, indicatorText: 'Kept' })).toEqual({ indicatorText: 'Kept' });
+    }
+  });
+
+  it('works out provenance after an update from the library link, never changing AI or imported provenance', () => {
+    expect(provenanceAfterUpdate('manual', 'FS-01')).toBe('library');
+    expect(provenanceAfterUpdate('library', 'FS-01')).toBe('library');
+    expect(provenanceAfterUpdate('library', null)).toBe('manual');
+    expect(provenanceAfterUpdate('manual', null)).toBe('manual');
+    for (const fixed of ['ai_generated', 'ai_suggested', 'imported'] as const) {
+      expect(provenanceAfterUpdate(fixed, 'FS-01')).toBe(fixed);
+      expect(provenanceAfterUpdate(fixed, null)).toBe(fixed);
+    }
+  });
+
+  it('trims and upper-cases library ids', () => {
+    expect(parseIndicatorUpdate({ libraryId: ' fs-01 ' }).libraryId).toBe('FS-01');
+    expect(parseIndicatorCreate({ libraryId: 'fs-01' }).libraryId).toBe('FS-01');
+    expect(parseIndicatorUpdate({ libraryId: '  ' }).libraryId).toBeNull();
+    expect(toIndicatorCreateData('fw-1', parseIndicatorCreate({ libraryId: 'fs-01' }), { sortOrder: 0 })).toMatchObject({
+      libraryId: 'FS-01', provenance: 'library',
+    });
+  });
+
+  it('requires the level of a linked indicator to match its result', () => {
+    expect(levelForResult(undefined, 'outcome')).toEqual({ ok: true, level: 'outcome' });
+    expect(levelForResult('outcome', 'outcome')).toEqual({ ok: true, level: 'outcome' });
+    expect(levelForResult('output', 'outcome')).toEqual({ ok: false, message: 'level must match the result it measures (outcome)' });
+    expect(levelForResult('impact', null)).toEqual({ ok: true, level: 'impact' });
+    expect(levelForResult(undefined, undefined)).toEqual({ ok: true, level: undefined });
   });
 
   it('validates enums with the allowed values', () => {
@@ -224,6 +267,7 @@ describe('indicator payload validation', () => {
   it('strips unknown and AI-only keys', () => {
     const parsed = parseIndicatorUpdate({
       indicatorText: 'Kept', id: 'other', frameworkId: 'other', isApproved: true, aiModel: 'm', promptVersion: 'v9', createdAt: 'x',
+      provenance: 'manual',
     });
     expect(parsed).toEqual({ indicatorText: 'Kept' });
   });
@@ -359,7 +403,8 @@ describe.skipIf(!hasTestDatabase)('indicator reference sheet API', () => {
     expect(updated.status).toBe(200);
     expect(updated.body).toMatchObject({
       direction: 'maintain', disaggregation: ['sex', 'age', 'disability'], baselineDate: '2026-02-01T00:00:00.000Z',
-      calculation: { formula: 'count' }, intermediateTargets: [{ date: '2026-09-30', value: '52' }], provenance: 'manual',
+      calculation: { formula: 'count' }, intermediateTargets: [{ date: '2026-09-30', value: '52' }],
+      provenance: 'library', // clients cannot set it; still linked to TS-01
       definition: referenceSheet.definition, // untouched
       result: { id: a.result.id, code: 'O1', level: 'outcome', text: 'Outcome a' },
     });
@@ -372,6 +417,7 @@ describe.skipIf(!hasTestDatabase)('indicator reference sheet API', () => {
     expect(cleared.body).toMatchObject({
       resultId: null, result: null, libraryId: null, calculation: null, disaggregation: null, intermediateTargets: null,
       baselineDate: null, direction: null, definition: null, assumptions: null,
+      provenance: 'manual', // unlinked from the library
     });
     const row = await prisma.$queryRaw<{ calculation: unknown }[]>`SELECT "calculation" FROM "Indicator" WHERE id = ${createdId}`;
     expect(row[0].calculation).toBeNull(); // SQL NULL, not JSON null
@@ -401,13 +447,16 @@ describe.skipIf(!hasTestDatabase)('indicator reference sheet API', () => {
     expect(res.body.message).toBe('libraryId "XX-00" is not in the indicator library');
   });
 
-  it('rejects AI provenance from clients', async () => {
+  it('rejects AI provenance from clients on create and ignores provenance on update', async () => {
     const created = await create({ indicatorText: 'AI?', provenance: 'ai_generated' });
     expect(created.status).toBe(400);
     expect(created.body.message).toContain("ai_generated is set only by Raqib's AI features");
 
-    const patched = await patch(createdId, { provenance: 'ai_suggested' });
-    expect(patched.status).toBe(400);
+    for (const provenance of ['ai_suggested', 'library', 'imported']) {
+      const patched = await patch(createdId, { provenance });
+      expect(patched.status).toBe(200);
+      expect(patched.body.provenance).toBe('manual');
+    }
     expect((await prisma.indicator.findUniqueOrThrow({ where: { id: createdId } })).provenance).toBe('manual');
   });
 
@@ -418,12 +467,47 @@ describe.skipIf(!hasTestDatabase)('indicator reference sheet API', () => {
         frequency: 'monthly', phases: ['ongoing'], provenance: 'ai_generated', aiModel: 'claude-sonnet-5-5', promptVersion: 'framework-v2',
       },
     });
-    const res = await patch(ai.id, { indicatorText: 'Edited AI indicator', aiModel: 'forged', promptVersion: 'forged' });
+    const res = await patch(ai.id, {
+      indicatorText: 'Edited AI indicator', aiModel: 'forged', promptVersion: 'forged', provenance: 'manual', aiRationale: 'Reviewed by M&E',
+    });
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
       indicatorText: 'Edited AI indicator', provenance: 'ai_generated', aiModel: 'claude-sonnet-5-5', promptVersion: 'framework-v2',
+      aiRationale: 'Reviewed by M&E', // still writable
     });
+
+    // Linking and unlinking a library entry does not change AI provenance either.
+    expect((await patch(ai.id, { libraryId: 'TS-01' })).body).toMatchObject({ libraryId: 'TS-01', provenance: 'ai_generated' });
+    expect((await patch(ai.id, { libraryId: null })).body).toMatchObject({ libraryId: null, provenance: 'ai_generated' });
     await prisma.indicator.delete({ where: { id: ai.id } });
+  });
+
+  it('flips provenance between manual and library as a library entry is linked and unlinked (ids in any case)', async () => {
+    const manual = await create({ indicatorText: 'Manual indicator' });
+    expect(manual.body).toMatchObject({ provenance: 'manual', libraryId: null });
+
+    const linked = await patch(manual.body.id, { libraryId: ' ts-01 ' });
+    expect(linked.status).toBe(200);
+    expect(linked.body).toMatchObject({ libraryId: 'TS-01', provenance: 'library' });
+
+    // Other edits keep the link and the provenance.
+    expect((await patch(manual.body.id, { definition: 'Edited' })).body).toMatchObject({ libraryId: 'TS-01', provenance: 'library' });
+
+    const unlinked = await patch(manual.body.id, { libraryId: null });
+    expect(unlinked.status).toBe(200);
+    expect(unlinked.body).toMatchObject({ libraryId: null, provenance: 'manual' });
+
+    // Imported provenance never changes.
+    const imported = await create({ indicatorText: 'Imported indicator', provenance: 'imported' });
+    expect((await patch(imported.body.id, { libraryId: 'TS-01' })).body).toMatchObject({ libraryId: 'TS-01', provenance: 'imported' });
+    expect((await patch(imported.body.id, { libraryId: null })).body).toMatchObject({ libraryId: null, provenance: 'imported' });
+
+    // Create: a lower-case id links the entry, and a library id without provenance means library.
+    const fromLibrary = await create({ indicatorText: 'From library', libraryId: 'ts-01' });
+    expect(fromLibrary.status).toBe(201);
+    expect(fromLibrary.body).toMatchObject({ libraryId: 'TS-01', provenance: 'library' });
+
+    await prisma.indicator.deleteMany({ where: { id: { in: [manual.body.id, imported.body.id, fromLibrary.body.id] } } });
   });
 
   it('reports invalid fields with a 400 and changes nothing', async () => {
@@ -454,10 +538,11 @@ describe.skipIf(!hasTestDatabase)('indicator reference sheet API', () => {
   });
 
   it('still accepts the current frontend edit payload', async () => {
-    const res = await patch(a.indicator.id, legacyEditPayload);
+    // The fixture indicator measures the outcome O1, so the dialog shows (and sends back) level outcome.
+    const res = await patch(a.indicator.id, { ...legacyEditPayload, level: 'outcome' });
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
-      indicatorText: legacyEditPayload.indicatorText, level: 'output', dataCollectionMethod: 'document_review', status: 'on_track',
+      indicatorText: legacyEditPayload.indicatorText, level: 'outcome', dataCollectionMethod: 'document_review', status: 'on_track',
       targetValue: '500', baselineValue: null, currentValue: null, responsibility: null,
       startDate: '2026-02-01T00:00:00.000Z', endDate: null, actualStartDate: null, actualEndDate: null,
       resultId: a.result.id, // untouched
@@ -468,6 +553,75 @@ describe.skipIf(!hasTestDatabase)('indicator reference sheet API', () => {
     const res = await create({ indicatorText: 'Linked', resultId: a.result.id });
     expect(res.status).toBe(201);
     expect(res.body.level).toBe('outcome');
+  });
+
+  describe('level fits the result', () => {
+    let outputResultId: string;
+
+    beforeAll(async () => {
+      outputResultId = (await prisma.resultNode.create({
+        data: { frameworkId: a.framework.id, parentId: a.result.id, level: 'output', code: 'O1.1', text: 'Output a' },
+      })).id;
+    });
+
+    it('refuses to create an indicator whose level differs from its result', async () => {
+      const before = await prisma.indicator.count({ where: { frameworkId: a.framework.id } });
+      const res = await create({ indicatorText: 'Mismatch', level: 'output', resultId: a.result.id });
+      expect(res.status).toBe(400);
+      expect(res.body.message).toBe('level must match the result it measures (outcome)');
+      expect(await prisma.indicator.count({ where: { frameworkId: a.framework.id } })).toBe(before);
+
+      const matching = await create({ indicatorText: 'Match', level: 'output', resultId: outputResultId });
+      expect(matching.status).toBe(201);
+      expect(matching.body).toMatchObject({ level: 'output', result: { code: 'O1.1' } });
+      await prisma.indicator.delete({ where: { id: matching.body.id } });
+    });
+
+    it('checks the level and result that a PATCH leaves', async () => {
+      const ind = await create({ indicatorText: 'Moving indicator', resultId: a.result.id });
+      expect(ind.body.level).toBe('outcome');
+
+      // A new level against the stored result.
+      const wrongLevel = await patch(ind.body.id, { level: 'output' });
+      expect(wrongLevel.status).toBe(400);
+      expect(wrongLevel.body.message).toBe('level must match the result it measures (outcome)');
+
+      // A new result against an explicit level.
+      const wrongPair = await patch(ind.body.id, { resultId: outputResultId, level: 'outcome' });
+      expect(wrongPair.status).toBe(400);
+      expect(wrongPair.body.message).toBe('level must match the result it measures (output)');
+      expect(await prisma.indicator.findUniqueOrThrow({ where: { id: ind.body.id } })).toMatchObject({ level: 'outcome', resultId: a.result.id });
+
+      // A new result without a level takes the result's level, as on create.
+      const moved = await patch(ind.body.id, { resultId: outputResultId });
+      expect(moved.status).toBe(200);
+      expect(moved.body).toMatchObject({ level: 'output', resultId: outputResultId });
+
+      // Level and result changed together.
+      const back = await patch(ind.body.id, { resultId: a.result.id, level: 'outcome' });
+      expect(back.status).toBe(200);
+      expect(back.body).toMatchObject({ level: 'outcome', resultId: a.result.id });
+
+      // Unlinked, any level is fine.
+      const unlinked = await patch(ind.body.id, { resultId: null, level: 'impact' });
+      expect(unlinked.status).toBe(200);
+      expect(unlinked.body).toMatchObject({ level: 'impact', resultId: null });
+      expect((await patch(ind.body.id, { level: 'activity' })).status).toBe(200);
+
+      await prisma.indicator.delete({ where: { id: ind.body.id } });
+    });
+
+    it('lets a result level change carry its indicators along', async () => {
+      const ind = await create({ indicatorText: 'Follows its result', resultId: outputResultId });
+      const otherInd = await create({ indicatorText: 'Measures the outcome', resultId: a.result.id });
+      const res = await request(app).patch(`/api/results/${outputResultId}`).set('Authorization', a.adminAuth).send({ level: 'activity', parentId: null });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ level: 'activity', updatedIndicators: 1 });
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id: ind.body.id } })).level).toBe('activity');
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id: otherInd.body.id } })).level).toBe('outcome');
+      await prisma.indicator.deleteMany({ where: { id: { in: [ind.body.id, otherInd.body.id] } } });
+      await prisma.resultNode.delete({ where: { id: outputResultId } });
+    });
   });
 
   it('lets donor viewers read but not write indicators', async () => {
@@ -503,5 +657,27 @@ describe.skipIf(!hasTestDatabase)('indicator reference sheet API', () => {
     expect(approved.body.status).toBe('approved');
     expect(approved.body.resultNodes).toHaveLength(1);
     expect(approved.body.indicators.every((i: any) => 'result' in i)).toBe(true);
+  });
+
+  it('approves every indicator of a framework when the framework is approved', async () => {
+    const fw = await prisma.framework.create({ data: { projectId: a.project.id, version: -3 } });
+    const make = (frameworkId: string, indicatorText: string) => prisma.indicator.create({
+      data: { frameworkId, indicatorText, level: 'output', dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: ['baseline'] },
+    });
+    const first = await make(fw.id, 'First');
+    const second = await make(fw.id, 'Second');
+    const elsewhere = await make(a.framework.id, 'Other framework');
+
+    const res = await request(app).patch(`/api/frameworks/${fw.id}/approve`).set('Authorization', a.adminAuth);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('approved');
+    expect(res.body.indicators.map((i: any) => [i.indicatorText, i.isApproved])).toEqual([['First', true], ['Second', true]]);
+    const stored = await prisma.indicator.findMany({ where: { id: { in: [first.id, second.id] } } });
+    expect(stored.every(i => i.isApproved)).toBe(true);
+    expect((await prisma.indicator.findUniqueOrThrow({ where: { id: elsewhere.id } })).isApproved).toBe(false);
+    expect((await prisma.indicator.findUniqueOrThrow({ where: { id: b.indicator.id } })).isApproved).toBe(false);
+
+    await prisma.indicator.deleteMany({ where: { id: { in: [first.id, second.id, elsewhere.id] } } });
+    await prisma.framework.delete({ where: { id: fw.id } });
   });
 });

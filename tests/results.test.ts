@@ -6,6 +6,7 @@ import { prisma } from '../src/config/prisma';
 import {
   compareResultNodes, isValidParentLevel, LEVEL_RANK, LEVELS_TOP_DOWN, parentLevelOf, parentLevelProblem, sortResultNodes,
 } from '../src/services/indicators/hierarchy';
+import { sameResultCode } from '../src/services/indicators/references';
 import { describeIssues, parseResultCreate, parseResultUpdate, resultCreateSchema } from '../src/services/indicators/validation';
 import { AppError } from '../src/middleware/errorHandler';
 import { bearer, createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
@@ -65,6 +66,16 @@ describe('results-chain hierarchy', () => {
     expect(sortResultNodes(nodes).map(n => n.code)).toEqual(['Goal', 'O3', 'O2', 'O10', 'O1.2', 'O1.1', 'A1']);
     expect(nodes[0].code).toBe('O10'); // input untouched
     expect(compareResultNodes(nodes[2], nodes[0])).toBeLessThan(0);
+  });
+});
+
+describe('sameResultCode', () => {
+  it('ignores case only; "_" and "%" are ordinary characters', () => {
+    expect(sameResultCode('O1', 'o1')).toBe(true);
+    expect(sameResultCode('O_1', 'o_1')).toBe(true);
+    expect(sameResultCode('O_1', 'OX1')).toBe(false);
+    expect(sameResultCode('O%', 'O1.1')).toBe(false);
+    expect(sameResultCode('O1', 'O1.1')).toBe(false);
   });
 });
 
@@ -219,6 +230,29 @@ describe.skipIf(!hasTestDatabase)('results chain API', () => {
     expect(elsewhere.status).toBe(201);
   });
 
+  it('checks duplicate codes exactly, ignoring case only ("_" and "%" are not wildcards)', async () => {
+    const fw = await prisma.framework.create({ data: { projectId: a.project.id, version: -2 } });
+    const create = (code: string) => post({ level: 'outcome', code, text: code }, a.adminAuth, fw.id);
+    expect((await create('O_1')).status).toBe(201);
+    expect((await create('OX1')).status).toBe(201);
+    const clash = await create('o_1');
+    expect(clash.status).toBe(409);
+    expect(clash.body.message).toBe('A result with code "o_1" already exists in this framework');
+
+    // A new code with "_" or "%" must not match other existing codes as a pattern.
+    expect((await create('A1B')).status).toBe(201);
+    expect((await create('A_B')).status).toBe(201);
+    expect((await create('P1')).status).toBe(201);
+    const percent = await create('P%');
+    expect(percent.status).toBe(201);
+    // On update too.
+    expect((await patch(percent.body.id, { code: 'O%' })).status).toBe(200);
+    expect((await patch(percent.body.id, { code: 'ox1' })).status).toBe(409);
+
+    await prisma.resultNode.deleteMany({ where: { frameworkId: fw.id } });
+    await prisma.framework.delete({ where: { id: fw.id } });
+  });
+
   it('lets donor viewers read but not write', async () => {
     expect((await post({ level: 'impact', code: 'V', text: 'x' }, viewerAuth)).status).toBe(403);
     expect((await patch(ids.goal, { text: 'x' }, viewerAuth)).status).toBe(403);
@@ -239,7 +273,9 @@ describe.skipIf(!hasTestDatabase)('results chain API', () => {
   it('updates text, Arabic text, code and sort order', async () => {
     const res = await patch(ids.o22, { text: '  Learning kits delivered ', textAr: 'توزيع حقائب تعليمية', code: 'O2.3', sortOrder: 7 });
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ text: 'Learning kits delivered', textAr: 'توزيع حقائب تعليمية', code: 'O2.3', sortOrder: 7, parentId: ids.o2 });
+    expect(res.body).toMatchObject({
+      text: 'Learning kits delivered', textAr: 'توزيع حقائب تعليمية', code: 'O2.3', sortOrder: 7, parentId: ids.o2, updatedIndicators: 0,
+    });
 
     const cleared = await patch(ids.o22, { textAr: '' });
     expect(cleared.body.textAr).toBeNull();
@@ -285,15 +321,35 @@ describe.skipIf(!hasTestDatabase)('results chain API', () => {
     const wrongParent = await patch(ids.o22, { parentId: ids.goal });
     expect(wrongParent.status).toBe(400);
 
-    // Leaf activity becomes an output under an outcome: valid.
+    // Leaf activity becomes an output under an outcome: valid, and its indicators follow it.
+    const linked = await prisma.indicator.create({
+      data: {
+        frameworkId: a.framework.id, resultId: ids.a211, indicatorText: 'Workshops held', level: 'activity',
+        dataCollectionMethod: 'document_review', frequency: 'monthly', phases: ['ongoing'],
+      },
+    });
     const promoted = await patch(ids.a211, { level: 'output', parentId: ids.o2 });
     expect(promoted.status).toBe(200);
-    expect(promoted.body).toMatchObject({ level: 'output', parentId: ids.o2 });
+    expect(promoted.body).toMatchObject({ level: 'output', parentId: ids.o2, updatedIndicators: 1 });
+    expect((await prisma.indicator.findUniqueOrThrow({ where: { id: linked.id } })).level).toBe('output');
 
     // ...and back down under an output.
     const demoted = await patch(ids.a211, { level: 'activity', parentId: ids.o21 });
     expect(demoted.status).toBe(200);
-    expect(demoted.body).toMatchObject({ level: 'activity', parentId: ids.o21 });
+    expect(demoted.body).toMatchObject({ level: 'activity', parentId: ids.o21, updatedIndicators: 1 });
+    expect((await prisma.indicator.findUniqueOrThrow({ where: { id: linked.id } })).level).toBe('activity');
+    await prisma.indicator.delete({ where: { id: linked.id } });
+
+    // A refused level change leaves its indicators alone (O2.1 still has the activity child).
+    const underO21 = await prisma.indicator.create({
+      data: {
+        frameworkId: a.framework.id, resultId: ids.o21, indicatorText: 'Teachers trained', level: 'output',
+        dataCollectionMethod: 'document_review', frequency: 'monthly', phases: ['ongoing'],
+      },
+    });
+    expect((await patch(ids.o21, { level: 'outcome', parentId: ids.goal })).status).toBe(400);
+    expect((await prisma.indicator.findUniqueOrThrow({ where: { id: underO21.id } })).level).toBe('output');
+    await prisma.indicator.delete({ where: { id: underO21.id } });
 
     // Changing a level is fine when every child still fits (the goal's children are outcomes).
     expect((await patch(ids.goal, { text: 'Goal text only' })).status).toBe(200);

@@ -3,10 +3,10 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { assertFrameworkAccess, assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
-import { asyncHandler } from '../middleware/errorHandler';
+import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { generateFramework } from '../services/ai/frameworkGenerator';
-import { sortResultNodes } from '../services/indicators/hierarchy';
+import { levelForResult, sortResultNodes } from '../services/indicators/hierarchy';
 import { assertIndicatorReferences } from '../services/indicators/references';
 import { INDICATOR_INCLUDE, INDICATOR_LIST_INCLUDE, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
 import { parseIndicatorCreate, toIndicatorCreateData } from '../services/indicators/validation';
@@ -96,25 +96,31 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
   });
 }));
 
-// PATCH /api/frameworks/:id/approve
+// PATCH /api/frameworks/:id/approve — approving the framework approves its indicators
 router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const framework = await assertFrameworkAccess(req, req.params.id);
 
-  const updated = await prisma.framework.update({
-    where: { id: req.params.id },
-    data: {
-      status: 'approved',
-      approvedAt: new Date(),
-      approvedBy: req.user!.id,
-    },
-    include: FRAMEWORK_DETAIL_INCLUDE,
-  });
-
-  // Update project status
-  await prisma.project.update({
-    where: { id: framework.projectId },
-    data: { status: 'active' },
-  });
+  // One transaction; the indicators are approved first so the response shows them approved.
+  const [, updated] = await prisma.$transaction([
+    prisma.indicator.updateMany({
+      where: { frameworkId: framework.id },
+      data: { isApproved: true },
+    }),
+    prisma.framework.update({
+      where: { id: framework.id },
+      data: {
+        status: 'approved',
+        approvedAt: new Date(),
+        approvedBy: req.user!.id,
+      },
+      include: FRAMEWORK_DETAIL_INCLUDE,
+    }),
+    // Update project status
+    prisma.project.update({
+      where: { id: framework.projectId },
+      data: { status: 'active' },
+    }),
+  ]);
 
   res.json(withOrderedResults(updated));
 }));
@@ -147,6 +153,9 @@ router.post('/frameworks/:id/indicators', authenticate, authorize('org_admin', '
   const framework = await assertFrameworkAccess(req, req.params.id);
   const input = parseIndicatorCreate(req.body);
   const { result } = await assertIndicatorReferences(framework.id, input);
+  // Level fits the result (knowledge/me-foundations.md §2 rule 5): without a level it takes the result's.
+  const fit = levelForResult(input.level, result?.level);
+  if (fit.ok === false) throw new AppError(400, fit.message);
 
   // Get next sort order
   const lastIndicator = await prisma.indicator.findFirst({

@@ -62,6 +62,15 @@ const calendarDate = z.string({ invalid_type_error: DATE_MESSAGE, required_error
 const dateOnly = z.preprocess(blankToNull, calendarDate.transform(v => parseIsoDate(v) as Date).nullable());
 
 /**
+ * True for "YYYY-MM-DD" or an ISO date-time whose date part is a real calendar
+ * date: "2026-02-30T00:00:00Z" is rejected instead of rolling over to March.
+ */
+export function isLegacyDate(value: string): boolean {
+  if (parseIsoDate(value) !== null) return true;
+  return ISO_DATETIME.test(value) && parseIsoDate(value.slice(0, 10)) !== null && !Number.isNaN(Date.parse(value));
+}
+
+/**
  * Nullable date for the older schedule fields (startDate, endDate, ...): "YYYY-MM-DD"
  * or a full ISO date-time, as the current frontend sends; '' and null clear it.
  */
@@ -69,7 +78,7 @@ const legacyDate = z.preprocess(
   blankToNull,
   z.string({ invalid_type_error: DATE_MESSAGE })
     .trim()
-    .refine(v => parseIsoDate(v) !== null || (ISO_DATETIME.test(v) && !Number.isNaN(Date.parse(v))), DATE_MESSAGE)
+    .refine(isLegacyDate, DATE_MESSAGE)
     .transform(v => new Date(v))
     .nullable(),
 );
@@ -98,6 +107,17 @@ const provenance = z.string({ invalid_type_error: `must be one of: ${CLIENT_PROV
     ctx.addIssue({ code: z.ZodIssueCode.custom, message });
   })
   .transform(v => v as ClientProvenance);
+
+/**
+ * Provenance after a PATCH, worked out by the server (clients cannot set it on
+ * update): a manual or library indicator follows its library link (library
+ * when `libraryId` is set after the update, manual when it is empty); AI and
+ * imported provenance never change.
+ */
+export function provenanceAfterUpdate(stored: IndicatorProvenance, libraryId: string | null): IndicatorProvenance {
+  if (stored !== 'manual' && stored !== 'library') return stored;
+  return libraryId ? 'library' : 'manual';
+}
 
 const CALCULATION_KEYS = ['numerator', 'denominator', 'formula', 'rounding'] as const;
 export type IndicatorCalculation = Partial<Record<(typeof CALCULATION_KEYS)[number], string>>;
@@ -211,14 +231,15 @@ const indicatorFields = {
   targetJustification: optionalText(2000),
   intermediateTargets,
   assumptions: optionalText(5000),
-  libraryId: optionalText(50),
+  // Library ids are upper-case ("FS-01"); "fs-01" finds the same entry.
+  libraryId: optionalText(50).transform(v => (typeof v === 'string' ? v.toUpperCase() : v)),
   standardReferenceCode: optionalText(100),
-  provenance,
+  // provenance is accepted on create only (see indicatorCreateSchema); on update the server sets it.
 };
 
 const BODY_MESSAGE = 'the request body must be a JSON object';
 
-/** PATCH /api/indicators/:id — any subset of the fields. */
+/** PATCH /api/indicators/:id — any subset of the fields. `provenance` is not one of them (stripped like other unknown keys). */
 export const indicatorUpdateSchema = z.object(indicatorFields, { invalid_type_error: BODY_MESSAGE }).partial();
 
 /** Fields that have a default on create: '' and null mean "use the default", as before Phase 2. */
@@ -233,6 +254,7 @@ export const indicatorCreateSchema = indicatorUpdateSchema.extend({
   status: withDefault(indicatorFields.status),
   phases: withDefault(indicatorFields.phases),
   sortOrder: withDefault(indicatorFields.sortOrder),
+  provenance: provenance.optional(),
 });
 
 export type IndicatorUpdateInput = z.infer<typeof indicatorUpdateSchema>;

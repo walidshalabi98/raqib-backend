@@ -192,6 +192,74 @@ describe.skipIf(!hasTestDatabase)('projects API: sectors, humanitarian and donor
     expect(exported.body.project).toMatchObject({ sectors: ['mhpss', 'protection', 'education'], humanitarian: true });
   });
 
+  it('exports the results chain of each framework and every reference-sheet field of each indicator', async () => {
+    await prisma.indicatorLibraryEntry.create({
+      data: {
+        id: 'TS-02', sector: 'education', tags: [], level: 'outcome', name: 'Test indicator', nameAr: 'مؤشر اختبار', definition: 'Test',
+        unit: 'percent', direction: 'increase', disaggregation: ['sex'], methods: ['hh_survey'], frequency: 'annual',
+        meansOfVerification: 'Survey', isStandard: true, version: 'test',
+      },
+    });
+    const goal = await prisma.resultNode.create({
+      data: { frameworkId: a.framework.id, level: 'impact', code: 'Goal', text: 'Improved learning', textAr: 'تحسين التعلم' },
+    });
+    await prisma.resultNode.update({ where: { id: a.result.id }, data: { parentId: goal.id } });
+    const sheet = {
+      definition: 'Learners scoring at least 50% on the standard test',
+      calculation: { numerator: 'Learners >= 50%', denominator: 'Learners tested' },
+      direction: 'increase' as const,
+      disaggregation: ['sex', 'disability'],
+      meansOfVerification: 'Learning assessment, EGRA module',
+      baselineDate: new Date('2026-01-15'),
+      baselineMethod: 'Baseline learning assessment',
+      targetJustification: 'Baseline + 15 points, as in similar programmes',
+      intermediateTargets: [{ date: '2026-12-31', value: '45' }],
+      assumptions: 'Schools stay open',
+      libraryId: 'TS-02',
+      standardReferenceCode: 'GERF 2.1',
+      provenance: 'library' as const,
+    };
+    await prisma.indicator.update({ where: { id: a.indicator.id }, data: sheet });
+
+    const res = await request(app).get(`/api/projects/${a.project.id}/export`).set('Authorization', a.adminAuth);
+    expect(res.status).toBe(200);
+    expect(res.body.frameworks).toEqual([{
+      id: a.framework.id,
+      version: 1,
+      status: 'draft',
+      resultNodes: [
+        { id: goal.id, code: 'Goal', level: 'impact', text: 'Improved learning', textAr: 'تحسين التعلم', parentId: null },
+        { id: a.result.id, code: 'O1', level: 'outcome', text: 'Outcome a', textAr: null, parentId: goal.id },
+      ],
+    }]);
+    const exported = res.body.indicators.find((i: any) => i.indicatorId === a.indicator.id);
+    expect(exported).toEqual({
+      frameworkVersion: 1,
+      frameworkStatus: 'draft',
+      indicatorId: a.indicator.id,
+      indicatorText: 'Indicator a',
+      indicatorTextAr: null,
+      level: 'outcome',
+      collectionMethod: 'hh_survey',
+      frequency: 'quarterly',
+      baselineValue: null,
+      targetValue: null,
+      currentValue: null,
+      unit: null,
+      status: 'not_started',
+      frameworkId: a.framework.id,
+      resultId: a.result.id,
+      resultCode: 'O1',
+      ...sheet,
+      baselineDate: '2026-01-15T00:00:00.000Z',
+      dataPoints: [expect.objectContaining({ id: a.dataPoint.id, value: '10' })],
+    });
+    // Everything exported before is still there.
+    expect(Object.keys(res.body)).toEqual(
+      expect.arrayContaining(['project', 'frameworks', 'indicators', 'beneficiaries', 'assessments', 'qualitativeEntries', 'exportedAt']),
+    );
+  });
+
   it('defaults sectors to the primary sector and humanitarian to false', async () => {
     const res = await request(app)
       .post('/api/projects')

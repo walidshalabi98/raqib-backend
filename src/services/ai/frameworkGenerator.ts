@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { IndicatorLevel } from '@prisma/client';
+import { IndicatorLevel, Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { env } from '../../config/env';
 import {
@@ -10,16 +10,19 @@ import {
   generateFrameworkPrompt,
 } from './prompts';
 import {
+  LibraryEntryReference,
   ProjectStructure,
+  SourceDocument,
   buildStructureFromMetadata,
   extractIndicatorList,
   librarySectorsFor,
+  linkedLibraryIds,
   normalizeIndicators,
   normalizeProjectStructure,
   planResultNodes,
   projectSectors,
   selectLibraryCandidates,
-  standardReferenceLabel,
+  stripAiAnalysis,
   structureForPrompt,
 } from './frameworkNormalize';
 
@@ -29,6 +32,12 @@ const anthropic = new Anthropic({ apiKey: env.anthropicApiKey });
 export const FRAMEWORK_MODEL = 'claude-sonnet-4-20250514';
 
 const LEVEL_ORDER: IndicatorLevel[] = ['impact', 'outcome', 'output', 'activity'];
+
+/** Library entry fields used for the prompt candidates and for checking the model's indicators against linked entries. */
+const LIBRARY_ENTRY_SELECT = {
+  id: true, sector: true, name: true, definition: true, unit: true, level: true, methods: true, frequency: true,
+  disaggregation: true, standardReference: true, isStandard: true, notes: true, meansOfVerification: true, calculation: true,
+} satisfies Prisma.IndicatorLibraryEntrySelect;
 
 function responseText(response: Anthropic.Messages.Message): string {
   return response.content
@@ -57,10 +66,13 @@ export async function generateFramework(frameworkId: string, projectId: string):
     throw new Error(`Framework ${frameworkId} already has results or indicators; generate a new framework version instead`);
   }
 
-  // Parsed document text is redacted by the document parser (no phone or ID numbers).
-  const documentTexts = project.documents
-    .map(d => d.parsedText)
-    .filter((t): t is string => !!t);
+  // Parsed document text is redacted by the document parser (no phone or ID numbers). The parser appends its own
+  // AI analysis after a marker; only the document's own text is used (prompts and evidence), so model output never
+  // "proves" a baseline or target.
+  const documents: SourceDocument[] = project.documents
+    .map(d => ({ fileName: d.fileName, text: stripAiAnalysis(d.parsedText ?? '') }))
+    .filter(d => d.text.trim() !== '');
+  const documentTexts = documents.map(d => d.text);
 
   const sectors = projectSectors(project);
   const projectInfo: FrameworkProjectInfo = {
@@ -112,21 +124,13 @@ export async function generateFramework(frameworkId: string, projectId: string):
         ...(project.humanitarian ? [{ id: { startsWith: 'AC-' } }] : []),
       ],
     },
-    select: {
-      id: true, sector: true, name: true, definition: true, unit: true, level: true, methods: true,
-      frequency: true, disaggregation: true, standardReference: true, isStandard: true,
-    },
+    select: LIBRARY_ENTRY_SELECT,
   });
   const candidates = selectLibraryCandidates(libraryRows, { sectors, humanitarian: project.humanitarian });
 
   // Every library id is accepted (not only the candidates): the model may know a better-fitting entry.
-  const libraryIndex = await prisma.indicatorLibraryEntry.findMany({ select: { id: true, standardReference: true } });
+  const libraryIndex = await prisma.indicatorLibraryEntry.findMany({ select: { id: true } });
   const knownLibraryIds = new Set(libraryIndex.map(e => e.id));
-  const libraryStandardCodes = new Map<string, string>();
-  for (const entry of libraryIndex) {
-    const label = standardReferenceLabel(entry.standardReference);
-    if (label) libraryStandardCodes.set(entry.id, label);
-  }
 
   // Step 3: Generate the indicator set
   console.log(`[FrameworkGenerator] Step 3: Generating indicators (${candidates.length} library candidates)`);
@@ -154,6 +158,15 @@ export async function generateFramework(frameworkId: string, projectId: string):
 
   if (extractIndicatorList(parsedIndicators).length === 0) {
     throw new Error('AI returned empty or invalid indicator set');
+  }
+
+  // Linked library entries (standard reference, sex disaggregation, standard thresholds): the loaded rows,
+  // plus any linked entry outside the candidate sectors.
+  const libraryEntries = new Map<string, LibraryEntryReference>(libraryRows.map(e => [e.id, e]));
+  const missingLibraryIds = linkedLibraryIds(parsedIndicators).filter(id => knownLibraryIds.has(id) && !libraryEntries.has(id));
+  if (missingLibraryIds.length > 0) {
+    const linkedRows = await prisma.indicatorLibraryEntry.findMany({ where: { id: { in: missingLibraryIds } }, select: LIBRARY_ENTRY_SELECT });
+    for (const entry of linkedRows) libraryEntries.set(entry.id, entry);
   }
 
   // Step 4: Create the results chain and the indicators together, so a failure leaves no partial framework
@@ -188,8 +201,8 @@ export async function generateFramework(frameworkId: string, projectId: string):
       frameworkId,
       resultNodes: nodes,
       knownLibraryIds,
-      libraryStandardCodes,
-      documentTexts,
+      libraryEntries,
+      documents,
       aiModel: FRAMEWORK_MODEL,
       promptVersion: FRAMEWORK_PROMPT_VERSION,
     });

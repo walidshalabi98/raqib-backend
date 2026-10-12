@@ -1,15 +1,35 @@
 import request from 'supertest';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
+import { errorHandler } from '../src/middleware/errorHandler';
 import { formatIssues, parseDateInput, summariseErrors, validationErrorBody } from '../src/services/dataPoints/fields';
 import {
-  completeDataPoint, parseBulkRowFields, parseDataPointFields,
+  completeDataPoint, normaliseValue, parseBulkRowFields, parseDataPointFields,
 } from '../src/services/dataPoints/validation';
-import { createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
+import { bearer, createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
 
 const VALID = { value: '218', collectionDate: '2026-04-01', collectionMethod: 'hh_survey' };
+
+/** Runs the error handler on `err` (console output silenced) and returns the status and body it sent. */
+function handleError(err: Error): { statusCode: number; body: unknown } {
+  const res = {
+    statusCode: 200,
+    body: undefined as unknown,
+    status(code: number) { this.statusCode = code; return this; },
+    json(body: unknown) { this.body = body; return this; },
+  };
+  const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    errorHandler(err, {} as Request, res as unknown as Response, () => {});
+  } finally {
+    spy.mockRestore();
+  }
+  return { statusCode: res.statusCode, body: res.body };
+}
 
 function errorsOf<T>(result: { ok: true; data: T } | { ok: false; errors: string[] }): string[] {
   if (result.ok === true) throw new Error('expected validation errors');
@@ -96,20 +116,71 @@ describe('parseBulkRowFields and completeDataPoint', () => {
   it('prefixes breakdown problems with the row and stores a normalised breakdown', () => {
     const row = parseBulkRowFields({ ...VALID, indicatorId: 'x', breakdown: { sex: { female: '120', male: 90 } } }, 2);
     if (row.ok === false) throw new Error(row.errors.join('; '));
-    expect(errorsOf(completeDataPoint(row.data, 'people', 'Row 3: '))).toEqual([
+    expect(errorsOf(completeDataPoint(row.data, { unit: 'people' }, 'Row 3: '))).toEqual([
       'Row 3: sex: categories add up to 210 but the value is 218',
     ]);
-    const ok = completeDataPoint({ ...row.data, breakdown: { sex: { female: '120', male: 98 } } }, 'people');
+    const ok = completeDataPoint({ ...row.data, breakdown: { sex: { female: '120', male: 98 } } }, { unit: 'people' });
     expect(ok).toMatchObject({ ok: true, data: { breakdown: { sex: { female: 120, male: 98 } } } });
   });
 
   it('drops null attachments and keeps other JSON', () => {
     const fields = parseDataPointFields({ ...VALID, attachments: null });
     if (fields.ok === false) throw new Error(fields.errors.join('; '));
-    expect(completeDataPoint(fields.data, null)).toMatchObject({ ok: true, data: { attachments: undefined, breakdown: null } });
+    expect(completeDataPoint(fields.data, { unit: null })).toMatchObject({ ok: true, data: { attachments: undefined, breakdown: null } });
     const withFiles = parseDataPointFields({ ...VALID, attachments: ['photo-1'] });
     if (withFiles.ok === false) throw new Error(withFiles.errors.join('; '));
-    expect(completeDataPoint(withFiles.data, null)).toMatchObject({ ok: true, data: { attachments: ['photo-1'] } });
+    expect(completeDataPoint(withFiles.data, { unit: null })).toMatchObject({ ok: true, data: { attachments: ['photo-1'] } });
+  });
+
+  it('checks the breakdown of an indicator without a unit against its text', () => {
+    const fields = parseDataPointFields({ ...VALID, value: '61', breakdown: { sex: { female: 120, male: 58 } } });
+    if (fields.ok === false) throw new Error(fields.errors.join('; '));
+    expect(errorsOf(completeDataPoint(fields.data, { unit: null, indicatorText: 'Proportion of girls enrolled' }, 'Row 2: '))).toEqual([
+      'Row 2: sex: "female" must be between 0 and 100 for a percentage (got 120)',
+    ]);
+    expect(completeDataPoint(fields.data, { unit: null, indicatorText: 'Girls enrolled' }).ok).toBe(true);
+  });
+
+  it('stores numeric values in canonical form and leaves other values unchanged', () => {
+    const fields = parseDataPointFields({ ...VALID, value: '١٬٢٠٠', breakdown: { sex: { female: 600, male: 600 } } });
+    if (fields.ok === false) throw new Error(fields.errors.join('; '));
+    expect(completeDataPoint(fields.data, { unit: 'people' })).toMatchObject({ ok: true, data: { value: '1200' } });
+  });
+});
+
+describe('normaliseValue', () => {
+  it.each([
+    ['1,200', '1200'], ['١٬٢٠٠', '1200'], ['١٢٠', '120'], ['١٢٫٥', '12.5'], [' 12.50 ', '12.5'], ['+4', '4'], ['.5', '0.5'],
+    ['1e3', '1000'], ['007', '7'], ['218', '218'], ['-3', '-3'],
+  ])('stores %j as %j', (input, expected) => {
+    expect(normaliseValue(input)).toBe(expected);
+  });
+
+  it.each(['Yes', 'No', '12 people', 'N/A', '1,20', 'pending'])('leaves %j unchanged', input => {
+    expect(normaliseValue(input)).toBe(input);
+  });
+});
+
+describe('errorHandler', () => {
+  const clientVersion = Prisma.prismaVersion.client;
+
+  it('answers 400 for a foreign key violation (P2003)', () => {
+    const res = handleError(new Prisma.PrismaClientKnownRequestError('Foreign key constraint violated', { code: 'P2003', clientVersion }));
+    expect(res).toEqual({ statusCode: 400, body: { message: 'A related record does not exist (it may have been deleted).' } });
+  });
+
+  it('names a duplicate result code (P2002 on ResultNode frameworkId + code)', () => {
+    const meta = { modelName: 'ResultNode', target: ['frameworkId', 'code'] };
+    const res = handleError(new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion, meta }));
+    expect(res).toEqual({ statusCode: 409, body: { message: 'A result with that code already exists in this framework' } });
+    const other = handleError(new Prisma.PrismaClientKnownRequestError('x', { code: 'P2002', clientVersion, meta: { modelName: 'User', target: ['email'] } }));
+    expect(other).toEqual({ statusCode: 409, body: { message: 'A record with that value already exists' } });
+  });
+
+  it('keeps the other Prisma mappings', () => {
+    expect(handleError(new Prisma.PrismaClientKnownRequestError('x', { code: 'P2002', clientVersion })).statusCode).toBe(409);
+    expect(handleError(new Prisma.PrismaClientKnownRequestError('x', { code: 'P2025', clientVersion })).statusCode).toBe(404);
+    expect(handleError(new Prisma.PrismaClientKnownRequestError('x', { code: 'P2010', clientVersion })).statusCode).toBe(500);
   });
 });
 
@@ -131,6 +202,10 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
     return indicator.id;
   }
 
+  let unitlessPercentId: string;
+  let unitlessArabicId: string;
+  let viewerAuth: string;
+
   beforeAll(async () => {
     await resetDatabase();
     a = await createOrgFixture('a');
@@ -138,6 +213,28 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
     peopleId = await createIndicator(a, 'Number of youth completing vocational training', 'people');
     percentId = await createIndicator(a, '% of households with acceptable food consumption', 'percent');
     scoreId = await createIndicator(a, 'Average coping strategy score', 'score');
+    unitlessPercentId = await createIndicator(a, 'Proportion of girls enrolled in secondary school', null);
+    unitlessArabicId = await createIndicator(a, 'نسبة الأسر ذات درجة استهلاك غذائي مقبولة', null);
+    const viewer = await prisma.user.create({
+      data: { organizationId: a.org.id, email: 'viewer-data@example.org', passwordHash: 'x', fullName: 'Viewer', role: 'donor_viewer' },
+    });
+    viewerAuth = bearer(viewer);
+  });
+
+  it('lets donor viewers read data points but not record them (403)', async () => {
+    const before = await prisma.dataPoint.count({ where: { projectId: a.project.id } });
+    const single = await request(app).post(`/api/indicators/${peopleId}/data`).set('Authorization', viewerAuth).send(VALID);
+    expect(single.status).toBe(403);
+    const bulk = await request(app)
+      .post(`/api/projects/${a.project.id}/data/bulk`)
+      .set('Authorization', viewerAuth)
+      .send({ dataPoints: [{ ...VALID, indicatorId: peopleId }] });
+    expect(bulk.status).toBe(403);
+    expect(await prisma.dataPoint.count({ where: { projectId: a.project.id } })).toBe(before);
+    expect((await prisma.indicator.findUniqueOrThrow({ where: { id: peopleId } })).currentValue).toBeNull();
+
+    const list = await request(app).get(`/api/indicators/${peopleId}/data`).set('Authorization', viewerAuth);
+    expect(list.status).toBe(200);
   });
 
   it('stores a valid breakdown and returns it from GET', async () => {
@@ -179,13 +276,59 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
     expect(await prisma.dataPoint.count({ where: { indicatorId: peopleId } })).toBe(before);
   });
 
-  it('treats an indicator without a unit as a count', async () => {
+  it('does not treat an indicator without a unit as a count', async () => {
     const res = await request(app)
       .post(`/api/indicators/${a.indicator.id}/data`)
       .set('Authorization', a.officerAuth)
       .send({ ...VALID, value: 10, breakdown: { sex: { female: 4, male: 5 } } });
+    expect(res.status).toBe(201);
+    expect(res.body.breakdown).toEqual({ sex: { female: 4, male: 5 } });
+  });
+
+  it('applies percent rules to an indicator without a unit whose text is a percentage (English or Arabic)', async () => {
+    for (const id of [unitlessPercentId, unitlessArabicId]) {
+      const tooHigh = await request(app)
+        .post(`/api/indicators/${id}/data`)
+        .set('Authorization', a.officerAuth)
+        .send({ ...VALID, value: '61', breakdown: { sex: { female: 120, male: 58 } } });
+      expect(tooHigh.status).toBe(400);
+      expect(tooHigh.body.message).toBe('sex: "female" must be between 0 and 100 for a percentage (got 120)');
+
+      const ok = await request(app)
+        .post(`/api/indicators/${id}/data`)
+        .set('Authorization', a.officerAuth)
+        .send({ ...VALID, value: '61', breakdown: { sex: { female: 64, male: 58 } } });
+      expect(ok.status).toBe(201);
+    }
+  });
+
+  it('requires a numeric value to record a breakdown for a count indicator', async () => {
+    const before = await prisma.dataPoint.count({ where: { indicatorId: peopleId } });
+    const res = await request(app)
+      .post(`/api/indicators/${peopleId}/data`)
+      .set('Authorization', a.officerAuth)
+      .send({ ...VALID, value: 'about 200', breakdown: { sex: { female: 1, male: 1 } } });
     expect(res.status).toBe(400);
-    expect(res.body.message).toBe('sex: categories add up to 9 but the value is 10');
+    expect(res.body.message).toBe('value must be a number to record a breakdown for a count indicator');
+    expect(await prisma.dataPoint.count({ where: { indicatorId: peopleId } })).toBe(before);
+  });
+
+  it('stores numeric values (Arabic-Indic digits, thousands separators) in canonical form, and other values unchanged', async () => {
+    for (const value of ['١٬٢٠٠', '1,200']) {
+      const res = await request(app)
+        .post(`/api/indicators/${peopleId}/data`)
+        .set('Authorization', a.officerAuth)
+        .send({ ...VALID, value, breakdown: { sex: { female: 600, male: 600 } } });
+      expect(res.status).toBe(201);
+      expect(res.body.value).toBe('1200');
+      expect((await prisma.dataPoint.findUniqueOrThrow({ where: { id: res.body.id } })).value).toBe('1200');
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id: peopleId } })).currentValue).toBe('1200');
+    }
+
+    const yes = await request(app).post(`/api/indicators/${scoreId}/data`).set('Authorization', a.officerAuth).send({ ...VALID, value: 'Yes' });
+    expect(yes.status).toBe(201);
+    expect(yes.body.value).toBe('Yes');
+    expect((await prisma.indicator.findUniqueOrThrow({ where: { id: scoreId } })).currentValue).toBe('Yes');
   });
 
   it('rejects a malformed breakdown', async () => {
@@ -272,6 +415,65 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
       expect(latest.breakdown).toEqual({ sex: { female: 118, male: 100 } });
     });
 
+    it("sets each indicator's current value to its most recent data point", async () => {
+      const id = await createIndicator(a, 'Number of community sessions held', 'number');
+      const res = await request(app)
+        .post(`/api/projects/${a.project.id}/data/bulk`)
+        .set('Authorization', a.officerAuth)
+        .send({
+          dataPoints: [
+            { ...VALID, indicatorId: id, value: '40', collectionDate: '2026-09-30' },
+            { ...VALID, indicatorId: id, value: '15', collectionDate: '2026-03-31' },
+          ],
+        });
+      expect(res.status).toBe(201);
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id } })).currentValue).toBe('40');
+
+      // An older row imported later does not replace the latest value.
+      await request(app)
+        .post(`/api/projects/${a.project.id}/data/bulk`)
+        .set('Authorization', a.officerAuth)
+        .send({ dataPoints: [{ ...VALID, indicatorId: id, value: '9', collectionDate: '2026-01-31' }] });
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id } })).currentValue).toBe('40');
+    });
+
+    it('stores numeric values in canonical form', async () => {
+      const res = await request(app)
+        .post(`/api/projects/${a.project.id}/data/bulk`)
+        .set('Authorization', a.officerAuth)
+        .send({
+          dataPoints: [
+            { ...VALID, indicatorId: scoreId, value: '١٬٢٠٠', collectionDate: '2026-07-01' },
+            { ...VALID, indicatorId: scoreId, value: '1,200', collectionDate: '2026-07-02' },
+            { ...VALID, indicatorId: scoreId, value: 'Yes', collectionDate: '2026-07-03' },
+          ],
+        });
+      expect(res.status).toBe(201);
+      const stored = await prisma.dataPoint.findMany({
+        where: { indicatorId: scoreId, collectionDate: { gte: new Date('2026-07-01'), lte: new Date('2026-07-03') } },
+        orderBy: { collectionDate: 'asc' },
+      });
+      expect(stored.map(dp => dp.value)).toEqual(['1200', '1200', 'Yes']);
+    });
+
+    it('checks breakdowns of indicators without a unit against their text, with the row number', async () => {
+      const res = await request(app)
+        .post(`/api/projects/${a.project.id}/data/bulk`)
+        .set('Authorization', a.officerAuth)
+        .send({
+          dataPoints: [
+            { ...VALID, indicatorId: a.indicator.id, value: '10', breakdown: { sex: { female: 4, male: 5 } } },
+            { ...VALID, indicatorId: unitlessPercentId, value: '61', breakdown: { sex: { female: 120 } } },
+            { ...VALID, indicatorId: peopleId, value: 'n/a', breakdown: { sex: { female: 1 } } },
+          ],
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.errors).toEqual([
+        'Row 2: sex: "female" must be between 0 and 100 for a percentage (got 120)',
+        'Row 3: value must be a number to record a breakdown for a count indicator',
+      ]);
+    });
+
     it('reports breakdown problems with the row number and stores nothing', async () => {
       const before = await prisma.dataPoint.count({ where: { projectId: a.project.id } });
       const res = await request(app)
@@ -334,6 +536,32 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
       expect(res.status).toBe(400);
       expect(res.body.message).toBe('One or more indicators do not belong to this project');
       expect(await prisma.dataPoint.count({ where: { indicatorId: b.indicator.id } })).toBe(1);
+    });
+  });
+
+  it('maps a real foreign key violation from the database to a 400', async () => {
+    const err = await prisma.dataPoint.create({
+      data: {
+        indicatorId: '00000000-0000-0000-0000-000000000000', projectId: a.project.id, value: '1',
+        collectionDate: new Date('2026-04-01'), collectionMethod: 'hh_survey', createdBy: a.officer.id,
+      },
+    }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Prisma.PrismaClientKnownRequestError);
+    expect((err as Prisma.PrismaClientKnownRequestError).code).toBe('P2003');
+    expect(handleError(err as Error)).toEqual({
+      statusCode: 400, body: { message: 'A related record does not exist (it may have been deleted).' },
+    });
+  });
+
+  it('maps a duplicate result code rejected by the database to a 409 that names it', async () => {
+    // The fixture framework already has a result "O1"; the unique index catches what the API check misses in a race.
+    const err = await prisma.resultNode.create({
+      data: { frameworkId: a.framework.id, level: 'outcome', code: 'O1', text: 'Duplicate' },
+    }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Prisma.PrismaClientKnownRequestError);
+    expect((err as Prisma.PrismaClientKnownRequestError).code).toBe('P2002');
+    expect(handleError(err as Error)).toEqual({
+      statusCode: 409, body: { message: 'A result with that code already exists in this framework' },
     });
   });
 });

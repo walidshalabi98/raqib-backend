@@ -24,10 +24,10 @@ router.get('/', authenticate, asyncHandler(async (req: Request, res: Response) =
   res.json(filters.q ? entries.filter(e => matchesLibrarySearch(e, filters.q)) : entries);
 }));
 
-// GET /api/indicator-library/:id
+// GET /api/indicator-library/:id — ids are upper case ("FS-01"); " fs-01 " finds the same entry, as libraryId does on indicators.
 router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const entry = await prisma.indicatorLibraryEntry.findUnique({
-    where: { id: req.params.id },
+    where: { id: req.params.id.trim().toUpperCase() },
     select: LIBRARY_ENTRY_SELECT,
   });
   if (!entry) throw new AppError(404, 'Library entry not found');
