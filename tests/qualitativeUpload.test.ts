@@ -150,6 +150,25 @@ describe.skipIf(!hasTestDatabase)('qualitative transcript upload', () => {
     expect(await prisma.document.count({ where: { projectId: a.project.id } })).toBe(before);
   });
 
+  it('refuses an unknown entry type, participants or date before storing the file', async () => {
+    const before = await prisma.document.count({ where: { projectId: a.project.id } });
+    const cases: [string, string, string][] = [
+      ['entryType', 'interview', 'entryType must be one of:'],
+      ['participants', 'twelve', 'participants must be a whole number from 0 to 100000'],
+      ['dateConducted', 'last week', 'dateConducted must be a date'],
+    ];
+    for (const [field, value, message] of cases) {
+      const res = await request(app)
+        .post(`/api/projects/${a.project.id}/qualitative/upload`)
+        .set('Authorization', a.officerAuth)
+        .field(field, value)
+        .attach('file', TRANSCRIPT, { filename: 'fgd.pdf', contentType: 'application/pdf' });
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain(message);
+    }
+    expect(await prisma.document.count({ where: { projectId: a.project.id } })).toBe(before);
+  });
+
   it('creates no entry when the file cannot be parsed', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     vi.spyOn(console, 'error').mockImplementation(() => undefined);

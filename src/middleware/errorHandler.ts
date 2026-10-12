@@ -22,11 +22,25 @@ export function asyncHandler(fn: (req: Request, res: Response, next: NextFunctio
   };
 }
 
-export function errorHandler(err: Error, _req: Request, res: Response, _next: NextFunction): void {
-  console.error('Error:', err.message);
-  if (process.env.NODE_ENV !== 'production') {
-    console.error(err.stack);
+/**
+ * What the error handler logs. AppError messages are written by the API and safe to log. Any other
+ * error is logged by class name and code only, and outside production with its stack frames: the
+ * message is left out because database and library errors quote the values they were given (a
+ * Prisma validation error prints the whole record, names and notes included; CLAUDE.md rules 3 and 5).
+ */
+export function errorLogLines(err: Error, production = process.env.NODE_ENV === 'production'): string[] {
+  if (err instanceof AppError) return [`Error: ${err.message}`];
+  const code = (err as { code?: unknown }).code;
+  const lines = [`Error: ${err.name || 'Error'}${typeof code === 'string' ? ` (${code})` : ''}`];
+  if (!production && err.stack) {
+    const frames = err.stack.split('\n').filter(line => /^\s+at /.test(line));
+    if (frames.length > 0) lines.push(frames.join('\n'));
   }
+  return lines;
+}
+
+export function errorHandler(err: Error, _req: Request, res: Response, _next: NextFunction): void {
+  for (const line of errorLogLines(err)) console.error(line);
 
   if (err instanceof AppError) {
     res.status(err.statusCode).json({ message: err.message });

@@ -131,7 +131,7 @@ export async function generateAutoAssessment(
         data: {
           projectId,
           type: 'assessment_report', // for every assessment type, midterm included
-          title: `AI ${capitalise(assessmentType)} Assessment — ${input.project.name}`,
+          title: `AI ${assessmentTypeLabel(assessmentType)} Assessment — ${input.project.name}`,
           aiNarrative: html,
           status: 'draft',
         },
@@ -147,7 +147,7 @@ export async function generateAutoAssessment(
           userId: admin.id,
           type: 'assessment_ready' as const,
           title: `Assessment Complete: ${input.project.name}`,
-          message: `AI ${assessmentType} assessment has been generated with ${input.indicators.length} indicators analyzed.`,
+          message: `AI ${assessmentTypeLabel(assessmentType)} assessment has been generated with ${input.indicators.length} indicators analyzed.`,
           link: `/projects/${projectId}/assessments`,
         })),
       });
@@ -321,8 +321,22 @@ function isoDate(date: Date): string {
   return date.toISOString().split('T')[0];
 }
 
-function capitalise(text: string): string {
-  return text.charAt(0).toUpperCase() + text.slice(1);
+const ASSESSMENT_TYPE_LABELS: Readonly<Record<string, string>> = {
+  baseline: 'Baseline',
+  midterm: 'Midterm',
+  endline: 'Endline',
+  fgd_round: 'FGD round',
+  kii_round: 'KII round',
+  observation_round: 'Observation round',
+  survey_round: 'Survey round',
+};
+
+/** The assessment type as people read it in titles ("FGD round", not "Fgd_round"). */
+export function assessmentTypeLabel(type: string): string {
+  const known = ASSESSMENT_TYPE_LABELS[type];
+  if (known) return known;
+  const words = type.replace(/_/g, ' ').trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 function countStatuses(indicators: ReadonlyArray<{ status: string }>): StatusCounts {
@@ -499,7 +513,7 @@ h3{color:#374151;margin-top:20px}
 .footer{margin-top:40px;text-align:center;color:#6b7280;font-size:12px;border-top:1px solid #e5e7eb;padding-top:20px}
 </style></head><body>
 <div class="header">
-<h1>AI ${escapeHtml(capitalise(input.assessmentType))} Assessment</h1>
+<h1>AI ${escapeHtml(assessmentTypeLabel(input.assessmentType))} Assessment</h1>
 <p><strong>Project:</strong> ${escapeHtml(project.name)} | <strong>Sector:</strong> ${escapeHtml(project.sector)} | <strong>Donor:</strong> ${escapeHtml(project.donor)}</p>
 <p><strong>Generated:</strong> ${escapeHtml(generated)}</p>
 <p class="ai-label">AI suggested — review before approval</p>

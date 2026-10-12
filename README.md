@@ -50,7 +50,7 @@ Optional AI settings (defaults in brackets):
 | `AI_REQUEST_TIMEOUT_MS` | timeout per AI request, at least 1000 [`60000`]; framework and report calls use longer ones |
 | `AI_MAX_RETRIES` | retries after rate limits, overloads, server and network errors, 0–10 [`3`] |
 | `AI_REFUSAL_FALLBACK` | `default`: a refused request is re-run on Anthropic's fallback model (Sonnet 5.5, Opus 5, Opus 5.5); `off`: refusals are errors [`default`] |
-| `AI_CALL_RETENTION_MONTHS` | months an AiCall log row is kept, 1–120; the worker deletes older rows every night at 02:30 Asia/Hebron [`24`] |
+| `AI_CALL_RETENTION_MONTHS` | months an AiCall log row is kept, 1–120; the worker deletes older rows every night at 03:30 Asia/Hebron [`24`] |
 | `VOYAGE_API_KEY` | embeddings for the indicator library; without it search uses keywords [empty] |
 | `VOYAGE_MODEL` | Voyage embedding model [`voyage-4`] |
 

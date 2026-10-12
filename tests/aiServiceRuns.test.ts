@@ -659,7 +659,9 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
       const reports = await prisma.report.findMany({ where: { projectId: seed.project.id, id: { not: earlier.id } } });
       expect(reports).toHaveLength(types.length);
       expect(reports.map(r => r.type)).toEqual(types.map(() => 'assessment_report'));
-      expect(reports.map(r => r.title)).toEqual(expect.arrayContaining(['Baseline', 'Midterm', 'Endline'].map(t => `AI ${t} Assessment — ${seed.project.name}`)));
+      const labels = ['Baseline', 'Midterm', 'Endline', 'FGD round', 'KII round', 'Observation round', 'Survey round'];
+      expect(reports.map(r => r.title).sort()).toEqual(labels.map(t => `AI ${t} Assessment — ${seed.project.name}`).sort());
+      for (const report of reports) expect(report.aiNarrative).toMatch(/<h1>AI (Baseline|Midterm|Endline|FGD round|KII round|Observation round|Survey round) Assessment<\/h1>/);
       expect(await prisma.report.findUniqueOrThrow({ where: { id: earlier.id } })).toMatchObject({ type: 'quarterly_summary', title: earlier.title });
     });
 

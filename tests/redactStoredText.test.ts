@@ -248,10 +248,10 @@ const untouchable = new Proxy({}, {
 }) as PrismaClient;
 
 /**
- * The shared test client, except that `meanwhile` runs once, right after the first batch of `table`
- * is read: as if a user or the parser wrote the row between the backfill's read and its write.
+ * The shared test client, except that `meanwhile` runs once, right after the backfill has read row `id`
+ * of `table`: as if a user or the parser wrote the row between the backfill's read and its write.
  */
-function writesAfterFirstRead(table: 'Document' | 'QualitativeEntry', meanwhile: () => Promise<unknown>): PrismaClient {
+function writesAfterRowRead(table: 'Document' | 'QualitativeEntry', id: string, meanwhile: () => Promise<unknown>): PrismaClient {
   let done = false;
   const once = async <T>(rows: T): Promise<T> => {
     if (!done) {
@@ -269,13 +269,16 @@ function writesAfterFirstRead(table: 'Document' | 'QualitativeEntry', meanwhile:
       if (table === 'Document' && prop === '$queryRaw') {
         return (query: TemplateStringsArray, ...values: unknown[]) => {
           const result = target.$queryRaw(query, ...values);
-          return query.join('').includes('FROM "Document"') ? result.then(once) : result;
+          return query.join('').includes('"parsedText"') && values.includes(id) ? result.then(once) : result;
         };
       }
       if (table === 'QualitativeEntry' && prop === 'qualitativeEntry') {
         return new Proxy(target.qualitativeEntry, {
           get(delegate, method) {
-            if (method === 'findMany') return (args: Parameters<typeof delegate.findMany>[0]) => delegate.findMany(args).then(once);
+            if (method === 'findUnique') {
+              return (args: Parameters<typeof delegate.findUnique>[0]) =>
+                args.where.id === id ? delegate.findUnique(args).then(once) : delegate.findUnique(args);
+            }
             return bound(delegate, method);
           },
         });
@@ -366,7 +369,7 @@ describe.skipIf(!hasTestDatabase)('redaction backfill (database)', () => {
 
   it('skips a document written between read and write, says to run again, and the next run redacts it', async () => {
     const reparsed = 'Parsed again by an old API: call 0569876543.';
-    const client = writesAfterFirstRead('Document', () =>
+    const client = writesAfterRowRead('Document', s.legacy, () =>
       prisma.document.update({ where: { id: s.legacy }, data: { parsedText: reparsed } }));
     const { lines, out } = captured();
 
@@ -385,7 +388,7 @@ describe.skipIf(!hasTestDatabase)('redaction backfill (database)', () => {
 
   it('skips a qualitative entry edited between read and write', async () => {
     const edited = 'Edited meanwhile: ID 402345678';
-    const client = writesAfterFirstRead('QualitativeEntry', () =>
+    const client = writesAfterRowRead('QualitativeEntry', s.entry, () =>
       prisma.qualitativeEntry.update({ where: { id: s.entry }, data: { content: edited } }));
     const report = await redactStoredText({ prisma: client, apply: true, includeQualitative: true, log: () => undefined });
     expect(report.qualitative).toMatchObject({ found: 1, changed: 0, skipped: 1, counts: NONE });

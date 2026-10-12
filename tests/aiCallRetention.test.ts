@@ -6,6 +6,7 @@ import {
   aiCallRetentionCutoff,
   pruneAiCalls,
   PRUNE_AI_CALLS_JOB,
+  PRUNE_AI_CALLS_SCHEDULE,
   runAiCallPruneCli,
   runMaintenanceJob,
   scheduleAiCallPruning,
@@ -140,14 +141,31 @@ describe('nightly schedule', () => {
     return { queue: { upsertJobScheduler }, schedulers, upsertJobScheduler };
   }
 
-  it("registers 'prune-ai-calls' every night at 02:30 Asia/Hebron", async () => {
+  it("registers 'prune-ai-calls' every night at 03:30 Asia/Hebron", async () => {
     const { queue, upsertJobScheduler } = fakeQueue();
     await scheduleAiCallPruning(queue);
     expect(upsertJobScheduler).toHaveBeenCalledWith(
       'prune-ai-calls',
-      { pattern: '30 2 * * *', tz: 'Asia/Hebron' },
+      { pattern: '30 3 * * *', tz: 'Asia/Hebron' },
       expect.objectContaining({ name: 'prune-ai-calls' }),
     );
+  });
+
+  it('runs at a time that exists exactly once every night in Asia/Hebron, also when the clocks change', () => {
+    const [minute, hour] = PRUNE_AI_CALLS_SCHEDULE.pattern.split(' ');
+    const wanted = `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}`;
+    const local = new Intl.DateTimeFormat('en-GB', {
+      timeZone: PRUNE_AI_CALLS_SCHEDULE.tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    });
+    const seen = new Map<string, number>();
+    // Every half hour of 2023-2035 (02:30 is skipped on spring change nights in these years).
+    for (let t = Date.UTC(2023, 0, 1); t < Date.UTC(2036, 0, 1); t += 30 * 60 * 1000) {
+      const p = Object.fromEntries(local.formatToParts(new Date(t)).map(part => [part.type, part.value]));
+      if (`${p.hour}:${p.minute}` === wanted) seen.set(`${p.year}-${p.month}-${p.day}`, (seen.get(`${p.year}-${p.month}-${p.day}`) ?? 0) + 1);
+    }
+    const days = (Date.UTC(2036, 0, 1) - Date.UTC(2023, 0, 1)) / 86_400_000;
+    expect(seen.size).toBe(days);
+    expect([...seen.values()].every(n => n === 1)).toBe(true);
   });
 
   it('is idempotent: every worker start updates the same scheduler', async () => {

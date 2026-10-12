@@ -1,7 +1,7 @@
 /**
  * AiCall retention (owner decision, October 2026): AiCall rows are kept for
  * AI_CALL_RETENTION_MONTHS calendar months (default 24) and then deleted. The worker runs
- * pruneAiCalls every night at 02:30 Asia/Hebron (the 'prune-ai-calls' job of the 'maintenance'
+ * pruneAiCalls every night at 03:30 Asia/Hebron (the 'prune-ai-calls' job of the 'maintenance'
  * queue); `npm run ai-calls:prune` runs it by hand (dry run unless --apply).
  *
  * Kept free of the API configuration (src/config/env.ts imports the setting's schema from here,
@@ -32,8 +32,11 @@ const MAX_BATCH_SIZE = 100_000;
 /** BullMQ names of the nightly job (src/jobs/queues.ts, src/jobs/worker.ts). */
 export const MAINTENANCE_QUEUE = 'maintenance';
 export const PRUNE_AI_CALLS_JOB = 'prune-ai-calls';
-/** Every night at 02:30 in Palestine (cron pattern in Asia/Hebron time). */
-export const PRUNE_AI_CALLS_SCHEDULE = { pattern: '30 2 * * *', tz: 'Asia/Hebron' } as const;
+/**
+ * Every night at 03:30 in Palestine (cron pattern in Asia/Hebron time). Palestine's clocks change
+ * between 00:00 and 03:00 on change nights, so 03:30 exists exactly once every night.
+ */
+export const PRUNE_AI_CALLS_SCHEDULE = { pattern: '30 3 * * *', tz: 'Asia/Hebron' } as const;
 
 const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 

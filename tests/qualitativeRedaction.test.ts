@@ -146,6 +146,29 @@ describe.skipIf(!hasTestDatabase)('POST /api/projects/:id/qualitative: notes are
     expect(codeQualitativeEntry).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [{ entryType: 'interview' }, 'entryType must be one of: fgd_transcript, kii_notes, observation_checklist, community_scorecard, msc_story, field_notes'],
+    [{ participants: 99999999999 }, 'participants must be a whole number from 0 to 100000'],
+    [{ participants: -1 }, 'participants must be a whole number from 0 to 100000'],
+    [{ participants: 2.5 }, 'participants must be a whole number from 0 to 100000'],
+    [{ participants: '12 people' }, 'participants must be a whole number from 0 to 100000'],
+    [{ dateConducted: 'not-a-date' }, 'dateConducted must be a date'],
+  ])('refuses %j before saving, without the note in any log line', async (override, message) => {
+    const before = await prisma.qualitativeEntry.count();
+    const res = await post({ ...NOTE, ...override });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe(message);
+    expect(await prisma.qualitativeEntry.count()).toBe(before);
+    const logged = consoleText();
+    for (const value of [...PERSONAL, ...NOTE_WORDS]) expect(logged).not.toContain(value);
+  });
+
+  it('accepts participants as a number or a number in text, and a date', async () => {
+    const res = await post({ ...NOTE, participants: '12', dateConducted: '2026-09-15' });
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({ participants: 12, dateConducted: '2026-09-15T00:00:00.000Z' });
+  });
+
   it('still requires entryType, title and content', async () => {
     const res = await post({ entryType: 'field_notes', title: '', content: 'Notes' });
     expect(res.status).toBe(400);

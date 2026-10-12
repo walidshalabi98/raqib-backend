@@ -1,6 +1,7 @@
 import { env } from './config/env';
 import { prisma } from './config/prisma';
 import { loadSharedSystemPrompt } from './services/ai/prompts/system';
+import { safeErrorSummary } from './services/ai/errors';
 import app from './app';
 
 // Fail fast when the AI system prompt (knowledge/me-foundations.md §1–12) cannot be built.
@@ -23,12 +24,13 @@ const server = app.listen(env.port, () => {
 });
 
 // Catch unhandled rejections and uncaught exceptions — prevent crashes
-process.on('unhandledRejection', (reason: any) => {
-  console.error('Unhandled Rejection:', reason?.message || reason);
+// Class names only: error messages can quote stored values (CLAUDE.md rules 3 and 5).
+process.on('unhandledRejection', (reason: unknown) => {
+  console.error('Unhandled Rejection:', safeErrorSummary(reason));
 });
 
 process.on('uncaughtException', (err: Error) => {
-  console.error('Uncaught Exception:', err.message);
+  console.error('Uncaught Exception:', safeErrorSummary(err));
   // Don't exit — let the server keep running
 });
 

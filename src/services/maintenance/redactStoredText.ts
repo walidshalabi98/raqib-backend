@@ -13,7 +13,7 @@
  *   npm run redact:backfill -- --include-qualitative         # also existing qualitative entries
  *   npm run redact:backfill -- --verbose                     # also the ids of the rows that change
  *
- * Rows are read in id order, BATCH_SIZE at a time. A row is written only if the columns still hold
+ * Rows are read in id order, one at a time (ids in batches). A row is written only if the columns still hold
  * what was read (each UPDATE compares them), so a row edited or re-parsed while the script runs is
  * skipped, never overwritten; the summary then says to run the script again.
  *
@@ -32,7 +32,7 @@ import {
   type QualitativeTextField,
 } from '../qualitative/redactEntry';
 
-/** Rows read per query. parsedText can be long, so batches stay small. */
+/** Row ids read per query; each row is then read and processed on its own. */
 export const REDACT_BACKFILL_BATCH_SIZE = 100;
 
 /** The Phase 3 SQL that adds Document.aiAnalysis (and moves legacy analyses out of parsedText). */
@@ -224,17 +224,18 @@ async function redactDocuments(options: Required<Omit<RedactStoredTextOptions, '
   };
   let cursor = '';
   for (;;) {
-    // aiAnalysis as Postgres prints it: compared and redacted as text, so numbers keep their digits.
-    const rows = await prisma.$queryRaw<({ id: string } & StoredDocumentText)[]>`
-      SELECT "id", "parsedText", "aiAnalysis"::text AS "aiAnalysis"
-      FROM "Document"
-      WHERE "id" > ${cursor}
-      ORDER BY "id"
-      LIMIT ${batchSize}`;
-    if (rows.length === 0) break;
-    cursor = rows[rows.length - 1].id;
+    // Ids in batches, then one document at a time: a document's text can be megabytes long, and
+    // redacting it takes several times its size in memory.
+    const ids = await prisma.$queryRaw<{ id: string }[]>`
+      SELECT "id" FROM "Document" WHERE "id" > ${cursor} ORDER BY "id" LIMIT ${batchSize}`;
+    if (ids.length === 0) break;
+    cursor = ids[ids.length - 1].id;
 
-    for (const row of rows) {
+    for (const { id } of ids) {
+      // aiAnalysis as Postgres prints it: compared and redacted as text, so numbers keep their digits.
+      const [row] = await prisma.$queryRaw<({ id: string } & StoredDocumentText)[]>`
+        SELECT "id", "parsedText", "aiAnalysis"::text AS "aiAnalysis" FROM "Document" WHERE "id" = ${id}`;
+      if (!row) continue; // deleted while the script ran
       report.scanned++;
       const plan = planDocumentRedaction(row);
       if (plan.legacyMarker) report.legacyMarker++;
@@ -279,16 +280,22 @@ async function redactQualitativeEntries(options: Required<Omit<RedactStoredTextO
   };
   let cursor = '';
   for (;;) {
-    const rows = await prisma.qualitativeEntry.findMany({
+    // Ids in batches, then one entry at a time (transcripts can be long), as for documents.
+    const ids = await prisma.qualitativeEntry.findMany({
       where: { id: { gt: cursor } },
       orderBy: { id: 'asc' },
       take: batchSize,
-      select: { id: true, title: true, content: true, location: true, facilitator: true },
+      select: { id: true },
     });
-    if (rows.length === 0) break;
-    cursor = rows[rows.length - 1].id;
+    if (ids.length === 0) break;
+    cursor = ids[ids.length - 1].id;
 
-    for (const row of rows) {
+    for (const { id: entryId } of ids) {
+      const row = await prisma.qualitativeEntry.findUnique({
+        where: { id: entryId },
+        select: { id: true, title: true, content: true, location: true, facilitator: true },
+      });
+      if (!row) continue; // deleted while the script ran
       report.scanned++;
       const { id, ...stored } = row;
       const { values: next, counts } = redactQualitativeFields(stored);

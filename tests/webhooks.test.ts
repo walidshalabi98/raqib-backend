@@ -220,6 +220,32 @@ describe.skipIf(!hasTestDatabase)('webhook authentication', () => {
     }
   });
 
+  it('refuses an unknown entry type or date before saving, without the submission in any log line', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const before = await prisma.qualitativeEntry.count({ where: { projectId: a.project.id } });
+      const cases: [Record<string, unknown>, string][] = [
+        [{ entry_type: 'kii' }, 'entry_type must be one of:'],
+        [{ _submission_time: 'yesterday' }, '_submission_time must be a date'],
+      ];
+      for (const [override, message] of cases) {
+        const res = await request(app)
+          .post('/api/webhooks/kobotoolbox')
+          .set('X-Raqib-Webhook-Token', tokenA)
+          .send({ _project_id: a.project.id, _type: 'qualitative', title: 'KII with Fatima Ahmad Saleh', notes: 'Fatima Ahmad Saleh said the distribution was late', ...override });
+        expect(res.status).toBe(400);
+        expect(res.body.message).toContain(message);
+      }
+      expect(await prisma.qualitativeEntry.count({ where: { projectId: a.project.id } })).toBe(before);
+      const logged = [...error.mock.calls, ...log.mock.calls].map(args => args.map(String).join(' ')).join('\n');
+      expect(logged).not.toContain('Fatima');
+    } finally {
+      error.mockRestore();
+      log.mockRestore();
+    }
+  });
+
   it('rejects a revoked token', async () => {
     const created = await request(app).post(`/api/organizations/${a.org.id}/webhook-tokens`).set('Authorization', a.adminAuth);
     const revoke = await request(app)
