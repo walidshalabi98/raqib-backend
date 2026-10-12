@@ -294,34 +294,40 @@ model Project {
 }
 
 model Document {
-  id            String        @id @default(uuid())
-  projectId     String
-  project       Project       @relation(fields: [projectId], references: [id])
-  uploadedBy    String
-  uploader      User          @relation(fields: [uploadedBy], references: [id])
-  fileName      String
-  fileUrl       String
-  fileType      DocumentType
-  fileSizeBytes BigInt?
-  parsedText    String? // extracted text with phone, ID and email numbers removed (safe to send to AI)
-  aiAnalysis    Json? // the model's analysis of the document (documentParser); kept apart from parsedText
-  parsingStatus ParsingStatus @default(pending)
-  uploadedAt    DateTime      @default(now())
+  id                String        @id @default(uuid())
+  projectId         String
+  project           Project       @relation(fields: [projectId], references: [id])
+  uploadedBy        String
+  uploader          User          @relation(fields: [uploadedBy], references: [id])
+  fileName          String
+  fileUrl           String
+  fileType          DocumentType
+  fileSizeBytes     BigInt?
+  parsedText        String? // extracted text with phone, ID and email numbers removed (safe to send to AI)
+  aiAnalysis        Json? // the model's analysis of the document (documentParser); kept apart from parsedText
+  // Uploaded as an FGD/KII transcript (qualitative upload): coded with the qualitative entry only,
+  // never sent to document analysis, framework generation or assessments.
+  qualitativeSource Boolean       @default(false)
+  parsingStatus     ParsingStatus @default(pending)
+  uploadedAt        DateTime      @default(now())
 }
 
 model Framework {
-  id          String          @id @default(uuid())
-  projectId   String
-  project     Project         @relation(fields: [projectId], references: [id])
-  version     Int             @default(1)
-  status      FrameworkStatus @default(draft)
-  name        String?
-  aiModelUsed String?
-  generatedAt DateTime        @default(now())
-  approvedAt  DateTime?
-  approvedBy  String?
-  indicators  Indicator[]
-  resultNodes ResultNode[]
+  id              String          @id @default(uuid())
+  projectId       String
+  project         Project         @relation(fields: [projectId], references: [id])
+  version         Int             @default(1)
+  status          FrameworkStatus @default(draft)
+  name            String?
+  aiModelUsed     String?
+  // Set when AI generation of this version failed (a safe message, never model output); such a
+  // version is not used as the project's current framework.
+  generationError String?
+  generatedAt     DateTime        @default(now())
+  approvedAt      DateTime?
+  approvedBy      String?
+  indicators      Indicator[]
+  resultNodes     ResultNode[]
 }
 
 // Results chain node: goal/impact → outcome → output (→ activity).
@@ -494,6 +500,7 @@ model IndicatorLibraryEntry {
   notes               String?
   version             String // library meta.version the entry was loaded from
   embedding           Unsupported("vector(1024)")? // Voyage voyage-4 (Phase 3)
+  embeddingModel      String? // embedding model that produced `embedding`; a different model means re-embed
   createdAt           DateTime                     @default(now())
   updatedAt           DateTime                     @updatedAt
   indicators          Indicator[]
@@ -639,4 +646,5 @@ model AiCall {
   @@index([createdAt])
   @@index([organizationId, createdAt])
   @@index([feature, createdAt])
+  @@index([projectId, createdAt])
 }
