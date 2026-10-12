@@ -117,6 +117,29 @@ describe.skipIf(!hasTestDatabase)('webhook authentication', () => {
     expect(manasati.body.count).toBe(1); // "Indicator b" belongs to another organisation and is not matched
   });
 
+  it('stores imported numbers in canonical form, like manual data entry', async () => {
+    const fromKobo = await request(app)
+      .post('/api/webhooks/kobotoolbox')
+      .set('X-Raqib-Webhook-Token', tokenA)
+      .send({ ...kobo(a.project.id, a.indicator.id), _submission_time: '2026-05-02T10:00:00Z', q1: '١٬٢٠٠' });
+    expect(fromKobo.status).toBe(200);
+    const manasati = await request(app)
+      .post('/api/webhooks/manasati')
+      .set('X-Raqib-Webhook-Token', tokenA)
+      .send({ projectId: a.project.id, indicators: [
+        { indicatorMatch: 'Indicator a', value: '2,500', date: '2026-05-03' },
+        { indicatorMatch: 'Indicator a', value: 'Yes', date: '2026-05-04' },
+      ] });
+    expect(manasati.status).toBe(200);
+
+    const values = async (date: string) => (await prisma.dataPoint.findMany({
+      where: { indicatorId: a.indicator.id, collectionDate: new Date(date) }, select: { value: true },
+    })).map(p => p.value);
+    expect(await values('2026-05-02T10:00:00Z')).toEqual(['1200']);
+    expect(await values('2026-05-03')).toEqual(['2500']);
+    expect(await values('2026-05-04')).toEqual(['Yes']);
+  });
+
   it('verifies an HMAC signature when one is sent', async () => {
     const body = JSON.stringify(kobo(a.project.id, a.indicator.id));
 

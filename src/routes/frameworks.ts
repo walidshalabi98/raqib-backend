@@ -1,33 +1,46 @@
 import { Router, Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { assertFrameworkAccess, assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
-import { asyncHandler } from '../middleware/errorHandler';
+import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { generateFramework } from '../services/ai/frameworkGenerator';
+import { levelForResult, sortResultNodes } from '../services/indicators/hierarchy';
+import { assertIndicatorReferences } from '../services/indicators/references';
+import { INDICATOR_INCLUDE, INDICATOR_LIST_INCLUDE, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
+import { parseIndicatorCreate, toIndicatorCreateData } from '../services/indicators/validation';
 
 const router = Router();
 
-// GET /api/projects/:id/framework — Get active framework with indicators
+const INDICATOR_ORDER = [{ sortOrder: 'asc' }, { createdAt: 'asc' }] satisfies Prisma.IndicatorOrderByWithRelationInput[];
+
+/** A framework with its result nodes (each with counts) and its indicators (each with its result and data point count). */
+const FRAMEWORK_DETAIL_INCLUDE = {
+  resultNodes: { include: RESULT_NODE_INCLUDE },
+  indicators: { orderBy: INDICATOR_ORDER, include: INDICATOR_LIST_INCLUDE },
+} satisfies Prisma.FrameworkInclude;
+
+/** Result nodes ordered impact, outcome, output, activity, then sortOrder, then code. */
+function withOrderedResults<T extends { resultNodes: Parameters<typeof sortResultNodes>[0] }>(framework: T): T {
+  return { ...framework, resultNodes: sortResultNodes(framework.resultNodes) };
+}
+
+// GET /api/projects/:id/framework — Latest framework with its results chain and indicators
 router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
   const framework = await prisma.framework.findFirst({
     where: { projectId: req.params.id },
     orderBy: { version: 'desc' },
-    include: {
-      indicators: {
-        orderBy: { sortOrder: 'asc' },
-        include: { _count: { select: { dataPoints: true } } },
-      },
-    },
+    include: FRAMEWORK_DETAIL_INCLUDE,
   });
 
   if (!framework) {
     res.json(null);
     return;
   }
-  res.json(framework);
+  res.json(withOrderedResults(framework));
 }));
 
 // POST /api/projects/:id/framework/generate — Trigger AI generation (runs inline, no Redis needed)
@@ -70,7 +83,7 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
   await assertFrameworkAccess(req, req.params.id);
   const framework = await prisma.framework.findUniqueOrThrow({
     where: { id: req.params.id },
-    include: { indicators: { orderBy: { sortOrder: 'asc' } } },
+    include: FRAMEWORK_DETAIL_INCLUDE,
   });
 
   const hasIndicators = framework.indicators.length > 0;
@@ -79,31 +92,37 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
     frameworkId: framework.id,
     status: hasIndicators ? 'completed' : 'processing',
     progress: hasIndicators ? 'Framework generated successfully' : 'AI is analyzing project data...',
-    framework: hasIndicators ? framework : undefined,
+    framework: hasIndicators ? withOrderedResults(framework) : undefined,
   });
 }));
 
-// PATCH /api/frameworks/:id/approve
+// PATCH /api/frameworks/:id/approve — approving the framework approves its indicators
 router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const framework = await assertFrameworkAccess(req, req.params.id);
 
-  const updated = await prisma.framework.update({
-    where: { id: req.params.id },
-    data: {
-      status: 'approved',
-      approvedAt: new Date(),
-      approvedBy: req.user!.id,
-    },
-    include: { indicators: { orderBy: { sortOrder: 'asc' } } },
-  });
+  // One transaction; the indicators are approved first so the response shows them approved.
+  const [, updated] = await prisma.$transaction([
+    prisma.indicator.updateMany({
+      where: { frameworkId: framework.id },
+      data: { isApproved: true },
+    }),
+    prisma.framework.update({
+      where: { id: framework.id },
+      data: {
+        status: 'approved',
+        approvedAt: new Date(),
+        approvedBy: req.user!.id,
+      },
+      include: FRAMEWORK_DETAIL_INCLUDE,
+    }),
+    // Update project status
+    prisma.project.update({
+      where: { id: framework.projectId },
+      data: { status: 'active' },
+    }),
+  ]);
 
-  // Update project status
-  await prisma.project.update({
-    where: { id: framework.projectId },
-    data: { status: 'active' },
-  });
-
-  res.json(updated);
+  res.json(withOrderedResults(updated));
 }));
 
 // POST /api/projects/:id/framework/manual — Create a blank manual framework
@@ -129,45 +148,27 @@ router.post('/projects/:id/framework/manual', authenticate, authorize('org_admin
   res.status(201).json(framework);
 }));
 
-// POST /api/frameworks/:id/indicators — Create a single indicator manually
+// POST /api/frameworks/:id/indicators — Create a single indicator manually (or from the library)
 router.post('/frameworks/:id/indicators', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  await assertFrameworkAccess(req, req.params.id);
+  const framework = await assertFrameworkAccess(req, req.params.id);
+  const input = parseIndicatorCreate(req.body);
+  const { result } = await assertIndicatorReferences(framework.id, input);
+  // Level fits the result (knowledge/me-foundations.md §2 rule 5): without a level it takes the result's.
+  const fit = levelForResult(input.level, result?.level);
+  if (fit.ok === false) throw new AppError(400, fit.message);
 
   // Get next sort order
   const lastIndicator = await prisma.indicator.findFirst({
-    where: { frameworkId: req.params.id },
+    where: { frameworkId: framework.id },
     orderBy: { sortOrder: 'desc' },
   });
 
-  const {
-    indicatorText, indicatorTextAr, level, dataCollectionMethod, frequency,
-    baselineValue, targetValue, currentValue, unit, phases, aiRationale,
-    startDate, endDate, actualStartDate, actualEndDate, milestones, responsibility, status,
-  } = req.body;
-
   const indicator = await prisma.indicator.create({
-    data: {
-      frameworkId: req.params.id,
-      indicatorText: indicatorText || 'New Indicator',
-      indicatorTextAr,
-      level: level || 'output',
-      dataCollectionMethod: dataCollectionMethod || 'hh_survey',
-      frequency: frequency || 'quarterly',
-      baselineValue,
-      targetValue,
-      currentValue,
-      unit,
-      phases: phases || ['baseline', 'midterm', 'endline'],
-      aiRationale,
+    data: toIndicatorCreateData(framework.id, input, {
       sortOrder: (lastIndicator?.sortOrder ?? -1) + 1,
-      startDate: startDate ? new Date(startDate) : undefined,
-      endDate: endDate ? new Date(endDate) : undefined,
-      actualStartDate: actualStartDate ? new Date(actualStartDate) : undefined,
-      actualEndDate: actualEndDate ? new Date(actualEndDate) : undefined,
-      milestones: milestones || undefined,
-      responsibility,
-      status: status || undefined,
-    },
+      resultLevel: result?.level,
+    }),
+    include: INDICATOR_INCLUDE,
   });
 
   res.status(201).json(indicator);
@@ -179,8 +180,8 @@ router.get('/frameworks/:id/indicators', authenticate, asyncHandler(async (req: 
 
   const indicators = await prisma.indicator.findMany({
     where: { frameworkId: req.params.id },
-    orderBy: { sortOrder: 'asc' },
-    include: { _count: { select: { dataPoints: true } } },
+    orderBy: INDICATOR_ORDER,
+    include: INDICATOR_LIST_INCLUDE,
   });
 
   res.json(indicators);

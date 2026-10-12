@@ -1,5 +1,7 @@
-import { PrismaClient } from '@prisma/client';
+import { CollectionMethod, IndicatorLevel, Prisma, PrismaClient } from '@prisma/client';
 import bcrypt from 'bcrypt';
+import { FRAMEWORK_PROMPT_VERSION } from '../src/services/ai/prompts';
+import { seedLibrary } from '../src/services/library/seed';
 
 const prisma = new PrismaClient();
 
@@ -19,6 +21,59 @@ if (!seedPassword || seedPassword.length < 8) {
 }
 const shownPassword = process.env.SEED_PASSWORD ? '<SEED_PASSWORD>' : seedPassword;
 
+/** Model id recorded on the seeded AI-generated frameworks and indicators (same as the framework generator's). */
+const SEED_AI_MODEL = 'claude-sonnet-4-20250514';
+
+const RESULT_LEVELS: IndicatorLevel[] = ['impact', 'outcome', 'output', 'activity'];
+
+/** A result and its children; the depth gives the level (goal → outcomes → outputs → activities). */
+interface ResultSpec {
+  code: string;
+  text: string;
+  textAr: string;
+  children?: ResultSpec[];
+}
+
+/**
+ * Creates a framework's results chain, parents first, so the hierarchy rule holds
+ * (each parent is exactly one level up). Returns the node ids by code.
+ */
+async function createResultsChain(frameworkId: string, goal: ResultSpec): Promise<Record<string, string>> {
+  const ids: Record<string, string> = {};
+  const create = async (spec: ResultSpec, depth: number, parentId: string | null, sortOrder: number): Promise<void> => {
+    const node = await prisma.resultNode.create({
+      data: { frameworkId, parentId, level: RESULT_LEVELS[depth], code: spec.code, text: spec.text, textAr: spec.textAr, sortOrder },
+    });
+    ids[spec.code] = node.id;
+    for (const [i, child] of (spec.children ?? []).entries()) await create(child, depth + 1, node.id, i);
+  };
+  await create(goal, 0, null, 0);
+  return ids;
+}
+
+/**
+ * Splits a count into categories by share. The last category takes the remainder,
+ * so the parts always add up to the total (the API rejects count breakdowns that do not).
+ */
+function splitCount(total: number, shares: Record<string, number>): Record<string, number> {
+  const entries = Object.entries(shares);
+  const parts: Record<string, number> = {};
+  let assigned = 0;
+  entries.forEach(([category, share], i) => {
+    const n = i === entries.length - 1 ? total - assigned : Math.min(total - assigned, Math.round(total * share));
+    parts[category] = n;
+    assigned += n;
+  });
+  return parts;
+}
+
+const PERCENT_FORMULA = 'numerator ÷ denominator × 100';
+
+/** Seeded indicator: the indicator fields plus the library entry it is adapted from (linked once the library is loaded). */
+type SeedIndicator = Omit<Prisma.IndicatorUncheckedCreateInput, 'frameworkId' | 'sortOrder' | 'libraryId'> & {
+  libraryId?: string;
+};
+
 async function main() {
   console.log('🌱 Seeding RAQIB database...');
 
@@ -30,6 +85,9 @@ async function main() {
   await prisma.dataPoint.deleteMany();
   await prisma.qualitativeEntry.deleteMany();
   await prisma.indicator.deleteMany();
+  // Results reference their parent (ON DELETE RESTRICT): unlink them before deleting.
+  await prisma.resultNode.updateMany({ data: { parentId: null } });
+  await prisma.resultNode.deleteMany();
   await prisma.framework.deleteMany();
   await prisma.assessment.deleteMany();
   await prisma.document.deleteMany();
@@ -39,6 +97,7 @@ async function main() {
   await prisma.user.deleteMany();
   await prisma.project.deleteMany();
   await prisma.organization.deleteMany();
+  // IndicatorLibraryEntry rows are kept: the library is loaded with an idempotent upsert at the end.
 
   // Organization
   const org = await prisma.organization.create({
@@ -100,6 +159,8 @@ async function main() {
       nameAr: 'تشغيل الشباب وتنمية المهارات',
       description: 'A comprehensive program to improve employment prospects for Palestinian youth aged 18-30 through vocational training, internships, and entrepreneurship support.',
       sector: 'livelihoods',
+      sectors: ['livelihoods', 'youth', 'gender'],
+      humanitarian: false,
       donor: 'GIZ',
       donorType: 'giz',
       budgetUsd: 450000,
@@ -118,6 +179,8 @@ async function main() {
       nameAr: 'برنامج مرونة الصحة المجتمعية',
       description: 'Strengthening primary healthcare access and community health resilience in underserved areas of the West Bank.',
       sector: 'health',
+      sectors: ['health', 'mhpss'],
+      humanitarian: false,
       donor: 'EU',
       donorType: 'eu',
       budgetUsd: 320000,
@@ -136,6 +199,9 @@ async function main() {
       nameAr: 'تحسين جودة التعليم',
       description: 'Improving education quality in marginalized schools through teacher training, curriculum development, and digital learning tools.',
       sector: 'education',
+      // Includes Gaza schools: an education-in-emergencies response with psychosocial support.
+      sectors: ['education', 'mhpss', 'protection'],
+      humanitarian: true,
       donor: 'UNICEF',
       donorType: 'unicef',
       budgetUsd: 280000,
@@ -147,192 +213,499 @@ async function main() {
     },
   });
 
-  // Framework for Project 1
+  // A humanitarian DG ECHO project without a framework yet (try framework generation here).
+  const project4 = await prisma.project.create({
+    data: {
+      organizationId: org.id,
+      name: 'Gaza Emergency WASH and Cash Response',
+      nameAr: 'الاستجابة الطارئة في مجالي المياه والصرف الصحي والمساعدات النقدية في غزة',
+      description: 'Emergency water trucking, hygiene kits and multipurpose cash assistance for displaced and host-community households in the southern Gaza Strip.',
+      sector: 'wash',
+      sectors: ['wash', 'cash', 'shelter'],
+      humanitarian: true,
+      donor: 'DG ECHO',
+      donorType: 'echo',
+      budgetUsd: 600000,
+      startDate: new Date('2026-01-01'),
+      endDate: new Date('2026-12-31'),
+      targetBeneficiaries: 12000,
+      geographicScope: 'Gaza Strip - Khan Younis, Deir al-Balah',
+      status: 'setup',
+    },
+  });
+
+  // Indicators adapted from the library are linked once the library is loaded (at the end).
+  const libraryLinks: Array<{ indicatorId: string; libraryId: string }> = [];
+  const createIndicators = async (frameworkId: string, specs: SeedIndicator[]) => {
+    const created = [];
+    for (const [sortOrder, { libraryId, ...data }] of specs.entries()) {
+      const indicator = await prisma.indicator.create({ data: { ...data, frameworkId, sortOrder } });
+      if (libraryId) libraryLinks.push({ indicatorId: indicator.id, libraryId });
+      created.push(indicator);
+    }
+    return created;
+  };
+
+  // Framework for Project 1 (generated by the earlier framework prompts, reviewed and approved)
   const framework1 = await prisma.framework.create({
     data: {
       projectId: project1.id,
       version: 1,
       status: 'approved',
-      aiModelUsed: 'claude-sonnet-4-20250514',
+      aiModelUsed: SEED_AI_MODEL,
       approvedAt: new Date('2025-02-15'),
       approvedBy: adminUser.id,
     },
   });
 
-  // Indicators for Project 1
-  const indicators = await Promise.all([
-    prisma.indicator.create({
-      data: {
-        frameworkId: framework1.id,
-        indicatorText: 'Percentage increase in youth employment rate in target areas',
-        indicatorTextAr: 'نسبة الزيادة في معدل توظيف الشباب في المناطق المستهدفة',
+  const results1 = await createResultsChain(framework1.id, {
+    code: 'G',
+    text: 'Improved economic participation of young women and men (18–30) in Ramallah, Nablus and Hebron governorates',
+    textAr: 'تحسين المشاركة الاقتصادية للشابات والشباب (18–30 عامًا) في محافظات رام الله ونابلس والخليل',
+    children: [
+      {
+        code: 'O1',
+        text: 'Young women and men who complete the programme secure decent employment',
+        textAr: 'حصول الشابات والشباب الذين يُتمّون البرنامج على عمل لائق',
+        children: [
+          {
+            code: 'O1.1',
+            text: 'Young women and men complete market-relevant vocational training',
+            textAr: 'إتمام الشابات والشباب تدريبًا مهنيًا يلائم احتياجات سوق العمل',
+            children: [
+              { code: 'A1.1.1', text: 'Deliver vocational training courses with accredited training centres', textAr: 'تنفيذ دورات التدريب المهني بالشراكة مع مراكز تدريب معتمدة' },
+              { code: 'A1.1.2', text: 'Run outreach and transport support for young women', textAr: 'تنفيذ أنشطة التواصل وتوفير دعم المواصلات للشابات' },
+            ],
+          },
+          {
+            code: 'O1.2',
+            text: 'Graduates are placed in internships with private-sector employers',
+            textAr: 'إلحاق الخريجين ببرامج تدريب عملي لدى مشغّلين من القطاع الخاص',
+            children: [
+              { code: 'A1.2.1', text: 'Match graduates with partner employers', textAr: 'مواءمة الخريجين مع المشغّلين الشركاء' },
+              { code: 'A1.2.2', text: 'Monitor internship placements', textAr: 'متابعة برامج التدريب العملي' },
+            ],
+          },
+        ],
+      },
+      {
+        code: 'O2',
+        text: 'Young entrepreneurs start and sustain small businesses',
+        textAr: 'تأسيس رواد الأعمال الشباب مشاريع صغيرة والحفاظ على استمراريتها',
+        children: [
+          {
+            code: 'O2.1',
+            text: 'Young entrepreneurs receive small business grants and coaching',
+            textAr: 'حصول رواد الأعمال الشباب على منح للمشاريع الصغيرة وعلى الإرشاد',
+            children: [
+              { code: 'A2.1.1', text: 'Run entrepreneurship bootcamps', textAr: 'تنفيذ معسكرات تدريبية في ريادة الأعمال' },
+              { code: 'A2.1.2', text: 'Select grantees through a scoring committee', textAr: 'اختيار المستفيدين من المنح عبر لجنة تقييم' },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  // Indicators for Project 1, with their reference sheets (knowledge/me-foundations.md §3)
+  const aiFramework1 = { provenance: 'ai_generated' as const, aiModel: SEED_AI_MODEL, promptVersion: 'framework-v1' };
+  // Indicators without seeded data points (women's share, sessions, businesses operating) are not named.
+  const [employmentRate, graduatesEmployed, completedTraining, , , internships, grants] =
+    await createIndicators(framework1.id, [
+      {
+        resultId: results1.G,
+        indicatorText: 'Employment rate of young women and men (18–30) in target governorates',
+        indicatorTextAr: 'معدل التشغيل بين الشابات والشباب (18–30 عامًا) في المحافظات المستهدفة',
         level: 'impact',
         dataCollectionMethod: 'hh_survey',
         frequency: 'annual',
+        unit: 'percent',
         baselineValue: '22',
         targetValue: '35',
         currentValue: '26',
-        unit: '%',
         status: 'on_track',
         phases: ['baseline', 'midterm', 'endline'],
-        aiRationale: 'Measures the overall employment impact on youth in target communities.',
-        sortOrder: 0,
+        definition: 'Persons aged 18–30 in the target governorates who worked at least one hour for pay or profit in the reference week (ILO definition), as a share of all persons aged 18–30 living there (employment-to-population ratio).',
+        calculation: {
+          numerator: 'Persons aged 18–30 in the target governorates employed in the reference week',
+          denominator: 'All persons aged 18–30 in the target governorates',
+          formula: PERCENT_FORMULA,
+          rounding: 'Whole number',
+        },
+        direction: 'increase',
+        disaggregation: ['sex', 'age', 'disability', 'location'],
+        meansOfVerification: 'Programme household survey using the PCBS Labour Force Survey employment module, n≈400 households representative of the target communities; compared with PCBS governorate figures for the same year',
+        baselineDate: new Date('2025-02-28'),
+        baselineMethod: 'Baseline household survey, January–February 2025 (n=400 households in the three governorates)',
+        targetJustification: 'Proposal target: baseline + 13 percentage points by the end of 2027, in line with comparable employment programmes in the West Bank.',
+        intermediateTargets: [{ date: '2025-12-31', value: '26' }, { date: '2026-12-31', value: '30' }, { date: '2027-12-31', value: '35' }],
+        assumptions: 'The West Bank labour market does not deteriorate sharply and movement restrictions allow access to workplaces. Many factors beyond the programme affect this rate: the programme contributes to the change but cannot claim it alone.',
+        responsibility: 'M&E Officer',
+        aiRationale: 'Measures the overall employment impact on young people in the target governorates.',
         isApproved: true,
+        ...aiFramework1,
       },
-    }),
-    prisma.indicator.create({
-      data: {
-        frameworkId: framework1.id,
-        indicatorText: 'Number of youth who completed vocational training programs',
-        indicatorTextAr: 'عدد الشباب الذين أكملوا برامج التدريب المهني',
+      {
+        resultId: results1.O1,
+        libraryId: 'LV-01',
+        indicatorText: '% of training graduates employed or self-employed six months after completing training',
+        indicatorTextAr: 'نسبة خريجي التدريب الذين يعملون بأجر أو لحسابهم الخاص بعد ستة أشهر من إنهاء التدريب',
         level: 'outcome',
-        dataCollectionMethod: 'document_review',
-        frequency: 'quarterly',
-        baselineValue: '0',
-        targetValue: '800',
-        currentValue: '342',
-        unit: 'number',
-        status: 'on_track',
-        phases: ['baseline', 'midterm', 'endline'],
-        aiRationale: 'Tracks direct program output of trained youth.',
-        sortOrder: 1,
-        isApproved: true,
-      },
-    }),
-    prisma.indicator.create({
-      data: {
-        frameworkId: framework1.id,
-        indicatorText: 'Percentage of training graduates who secured employment within 6 months',
-        indicatorTextAr: 'نسبة خريجي التدريب الذين حصلوا على عمل خلال 6 أشهر',
-        level: 'outcome',
-        dataCollectionMethod: 'kii',
-        frequency: 'biannual',
+        dataCollectionMethod: 'hh_survey',
+        frequency: 'per_cohort',
+        unit: 'percent',
         baselineValue: '0',
         targetValue: '60',
         currentValue: '45',
-        unit: '%',
         status: 'at_risk',
         phases: ['midterm', 'endline'],
-        aiRationale: 'Measures the effectiveness of training in leading to actual employment.',
-        sortOrder: 2,
+        definition: 'Graduates who report paid employment or self-employment of at least 15 hours a week six months after completing a programme course, as a share of the graduates reached by the tracer survey.',
+        calculation: {
+          numerator: 'Graduates employed or self-employed (≥15 hours a week) at six months',
+          denominator: 'Graduates reached by the six-month tracer survey',
+          formula: PERCENT_FORMULA,
+          rounding: 'Whole number',
+        },
+        direction: 'increase',
+        disaggregation: ['sex', 'age', 'disability', 'location'],
+        meansOfVerification: 'Six-month phone tracer survey of every cohort (all graduates; response rate reported), with employer confirmation for a 10% sample',
+        baselineDate: new Date('2025-01-01'),
+        baselineMethod: 'No graduates before the programme started (baseline 0 by definition); first measured at the tracer survey of cohort 1 in June 2025',
+        targetJustification: 'Proposal target of 60%, above the 35–50% typical for the Palestinian labour market because training is linked to employer demand.',
+        intermediateTargets: [{ date: '2025-12-31', value: '45' }, { date: '2026-12-31', value: '55' }, { date: '2027-12-31', value: '60' }],
+        assumptions: 'Graduates can be reached by phone; partner employers in the target governorates keep hiring.',
+        responsibility: 'M&E Officer',
+        aiRationale: 'Measures whether the training leads to actual employment.',
         isApproved: true,
+        ...aiFramework1,
       },
-    }),
-    prisma.indicator.create({
-      data: {
-        frameworkId: framework1.id,
-        indicatorText: 'Number of internship placements facilitated',
-        indicatorTextAr: 'عدد فرص التدريب العملي التي تم تيسيرها',
-        level: 'output',
-        dataCollectionMethod: 'document_review',
-        frequency: 'monthly',
-        baselineValue: '0',
-        targetValue: '500',
-        currentValue: '187',
-        unit: 'number',
-        status: 'on_track',
-        phases: ['baseline', 'midterm', 'endline'],
-        aiRationale: 'Tracks the program output of internship connections.',
-        sortOrder: 3,
-        isApproved: true,
-      },
-    }),
-    prisma.indicator.create({
-      data: {
-        frameworkId: framework1.id,
-        indicatorText: 'Number of small business grants disbursed to youth entrepreneurs',
-        indicatorTextAr: 'عدد منح الأعمال الصغيرة الممنوحة لرواد الأعمال الشباب',
+      {
+        resultId: results1['O1.1'],
+        libraryId: 'YO-01',
+        indicatorText: 'Number of young women and men who completed vocational training',
+        indicatorTextAr: 'عدد الشابات والشباب الذين أتمّوا التدريب المهني',
         level: 'output',
         dataCollectionMethod: 'document_review',
         frequency: 'quarterly',
-        baselineValue: '0',
-        targetValue: '120',
-        currentValue: '34',
         unit: 'number',
-        status: 'off_track',
-        phases: ['baseline', 'midterm', 'endline'],
-        aiRationale: 'Measures entrepreneurship support component delivery.',
-        sortOrder: 4,
-        isApproved: true,
-      },
-    }),
-    prisma.indicator.create({
-      data: {
-        frameworkId: framework1.id,
-        indicatorText: 'Number of training sessions conducted per quarter',
-        indicatorTextAr: 'عدد جلسات التدريب المنفذة لكل ربع سنة',
-        level: 'activity',
-        dataCollectionMethod: 'observation',
-        frequency: 'monthly',
         baselineValue: '0',
-        targetValue: '48',
-        currentValue: '22',
-        unit: 'number',
+        targetValue: '800',
+        currentValue: '342',
         status: 'on_track',
         phases: ['baseline', 'midterm', 'endline'],
-        aiRationale: 'Tracks implementation pace of training activities.',
-        sortOrder: 5,
+        definition: 'Participants aged 18–30 who attended at least 80% of the sessions of a programme vocational course and passed its final assessment. Each person is counted once, even after completing more than one course (cumulative).',
+        calculation: { formula: 'Unique participants meeting the completion threshold (cumulative)' },
+        direction: 'increase',
+        disaggregation: ['sex', 'age', 'disability', 'location'],
+        meansOfVerification: 'Attendance sheets, final assessment results and the certificates register kept by the partner training centres',
+        baselineDate: new Date('2025-01-01'),
+        baselineMethod: 'Programme records at the start (no graduates yet)',
+        targetJustification: 'Proposal and budget: 800 trainees in eight cohorts of about 100.',
+        intermediateTargets: [{ date: '2025-12-31', value: '350' }, { date: '2026-12-31', value: '600' }, { date: '2027-12-31', value: '800' }],
+        assumptions: 'Partner training centres remain accessible; transport costs do not prevent young women from attending.',
+        responsibility: 'Field Team',
+        provenance: 'library',
         isApproved: true,
       },
-    }),
-    prisma.indicator.create({
-      data: {
-        frameworkId: framework1.id,
-        indicatorText: 'Percentage of female participants in training programs',
-        indicatorTextAr: 'نسبة المشاركات الإناث في برامج التدريب',
+      {
+        resultId: results1['O1.1'],
+        indicatorText: '% of training participants who are women',
+        indicatorTextAr: 'نسبة النساء بين المشاركين في التدريب',
         level: 'output',
         dataCollectionMethod: 'document_review',
         frequency: 'quarterly',
+        unit: 'percent',
         baselineValue: '30',
         targetValue: '50',
         currentValue: '42',
-        unit: '%',
         status: 'on_track',
         phases: ['baseline', 'midterm', 'endline'],
-        aiRationale: 'Gender mainstreaming indicator to ensure equitable access.',
-        sortOrder: 6,
+        definition: 'Women enrolled in programme vocational courses as a share of all enrolled participants (cumulative). The indicator itself is the sex split, so it is not disaggregated by sex again.',
+        calculation: {
+          numerator: 'Women enrolled in programme vocational courses',
+          denominator: 'All participants enrolled in programme vocational courses',
+          formula: PERCENT_FORMULA,
+          rounding: 'Whole number',
+        },
+        direction: 'increase',
+        disaggregation: ['age', 'disability', 'location'],
+        meansOfVerification: 'Enrolment registers of the partner training centres',
+        baselineDate: new Date('2024-12-31'),
+        baselineMethod: 'Enrolment records of the partner centres for their 2024 courses',
+        targetJustification: 'Proposal: gender parity among participants (GIZ gender marker GG1).',
+        intermediateTargets: [{ date: '2026-06-30', value: '45' }, { date: '2027-12-31', value: '50' }],
+        assumptions: 'Outreach and transport support offset family and mobility barriers for young women.',
+        responsibility: 'Project Manager',
+        provenance: 'manual',
         isApproved: true,
       },
-    }),
-  ]);
+      {
+        resultId: results1['O1.1'],
+        indicatorText: 'Number of vocational training sessions delivered',
+        indicatorTextAr: 'عدد جلسات التدريب المهني المنفذة',
+        level: 'output',
+        dataCollectionMethod: 'document_review',
+        frequency: 'monthly',
+        unit: 'number',
+        baselineValue: '0',
+        targetValue: '48',
+        currentValue: '22',
+        status: 'on_track',
+        phases: ['baseline', 'midterm', 'endline'],
+        definition: 'Training sessions of at least three hours delivered by a partner centre under a programme course (cumulative).',
+        calculation: { formula: 'Sum of sessions recorded in the session logs' },
+        direction: 'increase',
+        disaggregation: ['location'],
+        meansOfVerification: 'Session logs signed by the trainer and the centre coordinator, spot-checked monthly by the field team',
+        baselineDate: new Date('2025-01-01'),
+        baselineMethod: 'Programme records at the start (no sessions yet)',
+        targetJustification: 'Training plan in the proposal: six sessions per cohort for eight cohorts.',
+        assumptions: 'Closures do not interrupt the training calendar for more than two weeks at a time.',
+        responsibility: 'Field Team',
+        provenance: 'manual',
+        isApproved: true,
+      },
+      {
+        resultId: results1['O1.2'],
+        indicatorText: 'Number of internship placements facilitated with private-sector employers',
+        indicatorTextAr: 'عدد فرص التدريب العملي التي تم تيسيرها لدى مشغّلين من القطاع الخاص',
+        level: 'output',
+        dataCollectionMethod: 'document_review',
+        frequency: 'monthly',
+        unit: 'number',
+        baselineValue: '0',
+        targetValue: '500',
+        currentValue: '187',
+        status: 'on_track',
+        phases: ['baseline', 'midterm', 'endline'],
+        definition: 'Graduates who start a structured internship of at least eight weeks with a private-sector employer under a signed programme agreement. Each graduate is counted once (cumulative).',
+        calculation: { formula: 'Unique graduates with a signed internship agreement (cumulative)' },
+        direction: 'increase',
+        disaggregation: ['sex', 'location'],
+        meansOfVerification: 'Signed internship agreements and the placement register, cross-checked with employer attendance confirmations',
+        baselineDate: new Date('2025-01-01'),
+        baselineMethod: 'Programme records at the start (no placements yet)',
+        targetJustification: 'Proposal: about 60% of graduates offered an internship.',
+        assumptions: 'Partner employers keep their internship commitments during economic downturns.',
+        responsibility: 'Field Team',
+        aiRationale: 'Tracks the internship connections the programme facilitates.',
+        isApproved: true,
+        ...aiFramework1,
+      },
+      {
+        resultId: results1['O2.1'],
+        indicatorText: 'Number of small business grants disbursed to young entrepreneurs',
+        indicatorTextAr: 'عدد منح المشاريع الصغيرة المصروفة لرواد الأعمال الشباب',
+        level: 'output',
+        dataCollectionMethod: 'document_review',
+        frequency: 'quarterly',
+        unit: 'number',
+        baselineValue: '0',
+        targetValue: '120',
+        currentValue: '34',
+        status: 'off_track',
+        phases: ['baseline', 'midterm', 'endline'],
+        definition: 'Grants of up to USD 5,000 whose first instalment was paid to a young entrepreneur (18–30) selected by the grant committee. Each business is counted once (cumulative).',
+        calculation: { formula: 'Unique businesses with a first instalment paid (cumulative)' },
+        direction: 'increase',
+        disaggregation: ['sex', 'age', 'location'],
+        meansOfVerification: 'Grant agreements and bank transfer records in the grants register kept by the finance unit',
+        baselineDate: new Date('2025-01-01'),
+        baselineMethod: 'Programme records at the start (no grants yet)',
+        targetJustification: 'Budget line for 120 grants of up to USD 5,000.',
+        assumptions: 'Banks can transfer funds to grantees without delays caused by closures.',
+        responsibility: 'Project Manager',
+        aiRationale: 'Measures delivery of the entrepreneurship support component.',
+        isApproved: true,
+        ...aiFramework1,
+      },
+      {
+        resultId: results1.O2,
+        indicatorText: '% of grant-supported youth businesses operating 12 months after receiving the grant',
+        indicatorTextAr: 'نسبة مشاريع الشباب المدعومة بالمنح التي ما زالت تعمل بعد 12 شهرًا من استلام المنحة',
+        level: 'outcome',
+        dataCollectionMethod: 'kii',
+        frequency: 'biannual',
+        unit: 'percent',
+        targetValue: '70',
+        status: 'not_started',
+        phases: ['midterm', 'endline'],
+        definition: 'Businesses that received a programme grant and are trading (sales in the past month) 12 months after the first instalment, as a share of the businesses that received their first instalment at least 12 months earlier.',
+        calculation: {
+          numerator: 'Grant-supported businesses trading 12 months after the first instalment',
+          denominator: 'Businesses whose first instalment was paid at least 12 months earlier',
+          formula: PERCENT_FORMULA,
+          rounding: 'Whole number',
+        },
+        direction: 'increase',
+        disaggregation: ['sex', 'location'],
+        meansOfVerification: 'Follow-up visit or phone interview with each grantee 12 months after the first instalment, using the business status checklist',
+        baselineMethod: 'Pending baseline: first measured in June 2026, 12 months after the first grants',
+        targetJustification: 'Proposal target of 70%, consistent with survival rates reported by comparable youth grant schemes in the West Bank.',
+        intermediateTargets: [{ date: '2027-12-31', value: '70' }],
+        assumptions: 'Market access for small businesses does not deteriorate sharply; grantees remain reachable.',
+        responsibility: 'M&E Officer',
+        aiRationale: 'Shows whether the grants lead to businesses that last, the change outcome O2 describes.',
+        isApproved: true,
+        ...aiFramework1,
+      },
+    ]);
 
-  // Data Points
-  const dataPointsData = [
-    { indicatorId: indicators[0].id, value: '22', date: '2025-01-15', method: 'hh_survey' as const },
-    { indicatorId: indicators[0].id, value: '24', date: '2025-06-15', method: 'hh_survey' as const },
-    { indicatorId: indicators[0].id, value: '26', date: '2025-12-15', method: 'hh_survey' as const },
-    { indicatorId: indicators[1].id, value: '0', date: '2025-01-15', method: 'document_review' as const },
-    { indicatorId: indicators[1].id, value: '85', date: '2025-03-31', method: 'document_review' as const },
-    { indicatorId: indicators[1].id, value: '178', date: '2025-06-30', method: 'document_review' as const },
-    { indicatorId: indicators[1].id, value: '265', date: '2025-09-30', method: 'document_review' as const },
-    { indicatorId: indicators[1].id, value: '342', date: '2025-12-31', method: 'document_review' as const },
-    { indicatorId: indicators[2].id, value: '0', date: '2025-06-30', method: 'kii' as const },
-    { indicatorId: indicators[2].id, value: '45', date: '2025-12-31', method: 'kii' as const },
-    { indicatorId: indicators[3].id, value: '0', date: '2025-01-31', method: 'document_review' as const },
-    { indicatorId: indicators[3].id, value: '45', date: '2025-03-31', method: 'document_review' as const },
-    { indicatorId: indicators[3].id, value: '98', date: '2025-06-30', method: 'document_review' as const },
-    { indicatorId: indicators[3].id, value: '142', date: '2025-09-30', method: 'document_review' as const },
-    { indicatorId: indicators[3].id, value: '187', date: '2025-12-31', method: 'document_review' as const },
-    { indicatorId: indicators[4].id, value: '0', date: '2025-03-31', method: 'document_review' as const },
-    { indicatorId: indicators[4].id, value: '12', date: '2025-06-30', method: 'document_review' as const },
-    { indicatorId: indicators[4].id, value: '22', date: '2025-09-30', method: 'document_review' as const },
-    { indicatorId: indicators[4].id, value: '34', date: '2025-12-31', method: 'document_review' as const },
+  // Data points. Breakdowns follow the API rules: every dimension of a count adds up to the value;
+  // percentage indicators give the rate for each group.
+  const sexSplit = (value: number, femaleShare: number) => splitCount(value, { female: femaleShare, male: 1 - femaleShare });
+  const countBreakdown = (value: number, femaleShare: number, withDisability?: number) => ({
+    sex: sexSplit(value, femaleShare),
+    ...(withDisability !== undefined && { disability: splitCount(value, { yes: withDisability, no: 1 - withDisability }) }),
+  });
+  const percentBySex = (female: number, male: number) => ({ sex: { female, male } });
+
+  type SeedDataPoint = { indicatorId: string; value: number; date: string; method: CollectionMethod; breakdown?: Prisma.InputJsonValue };
+  const countSeries = (indicatorId: string, rows: Array<[number, string]>, breakdown: (value: number) => Prisma.InputJsonValue): SeedDataPoint[] =>
+    rows.map(([value, date]) => ({ indicatorId, value, date, method: 'document_review', breakdown: breakdown(value) }));
+
+  const dataPointsData: SeedDataPoint[] = [
+    { indicatorId: employmentRate.id, value: 22, date: '2025-01-15', method: 'hh_survey', breakdown: percentBySex(8, 36) },
+    { indicatorId: employmentRate.id, value: 24, date: '2025-06-15', method: 'hh_survey', breakdown: percentBySex(9, 39) },
+    { indicatorId: employmentRate.id, value: 26, date: '2025-12-15', method: 'hh_survey', breakdown: percentBySex(11, 41) },
+    ...countSeries(completedTraining.id, [[0, '2025-01-15'], [85, '2025-03-31'], [178, '2025-06-30'], [265, '2025-09-30'], [342, '2025-12-31']],
+      value => countBreakdown(value, 0.42, 0.04)),
+    { indicatorId: graduatesEmployed.id, value: 0, date: '2025-06-30', method: 'hh_survey' },
+    { indicatorId: graduatesEmployed.id, value: 45, date: '2025-12-31', method: 'hh_survey', breakdown: percentBySex(38, 50) },
+    ...countSeries(internships.id, [[0, '2025-01-31'], [45, '2025-03-31'], [98, '2025-06-30'], [142, '2025-09-30'], [187, '2025-12-31']],
+      value => countBreakdown(value, 0.38)),
+    ...countSeries(grants.id, [[0, '2025-03-31'], [12, '2025-06-30'], [22, '2025-09-30'], [34, '2025-12-31']],
+      value => countBreakdown(value, 0.35)),
   ];
 
-  for (const dp of dataPointsData) {
+  for (const [i, dp] of dataPointsData.entries()) {
     await prisma.dataPoint.create({
       data: {
         indicatorId: dp.indicatorId,
         projectId: project1.id,
-        value: dp.value,
+        value: String(dp.value),
         collectionDate: new Date(dp.date),
         collectionMethod: dp.method,
         dataSource: 'Manual entry',
-        geographicArea: ['Ramallah', 'Nablus', 'Hebron'][Math.floor(Math.random() * 3)],
+        geographicArea: ['Ramallah', 'Nablus', 'Hebron'][i % 3],
+        ...(dp.breakdown !== undefined && { breakdown: dp.breakdown }),
         createdBy: meOfficer.id,
       },
     });
   }
+
+  // Framework for Project 2: generated with the current prompts and awaiting expert review
+  // (indicators are unapproved, so the app labels them "AI suggested — review before approval").
+  const framework2 = await prisma.framework.create({
+    data: { projectId: project2.id, version: 1, status: 'expert_review', aiModelUsed: SEED_AI_MODEL },
+  });
+
+  const results2 = await createResultsChain(framework2.id, {
+    code: 'G',
+    text: 'Improved health and well-being of communities in underserved Area C localities of the West Bank',
+    textAr: 'تحسين صحة ورفاه المجتمعات في التجمعات المحرومة من الخدمات في المنطقة (ج) بالضفة الغربية',
+    children: [
+      {
+        code: 'O1',
+        text: 'Women, children and older persons in target communities use quality primary health care services',
+        textAr: 'استخدام النساء والأطفال وكبار السن في المجتمعات المستهدفة خدمات رعاية صحية أولية ذات جودة',
+        children: [
+          {
+            code: 'O1.1',
+            text: 'Mobile clinics and supported facilities provide primary health care consultations',
+            textAr: 'تقديم العيادات المتنقلة والمرافق المدعومة استشارات الرعاية الصحية الأولية',
+            children: [
+              { code: 'A1.1.1', text: 'Operate weekly mobile clinic visits', textAr: 'تشغيل زيارات أسبوعية للعيادات المتنقلة' },
+              { code: 'A1.1.2', text: 'Supply essential medicines to supported facilities', textAr: 'تزويد المرافق المدعومة بالأدوية الأساسية' },
+            ],
+          },
+          {
+            code: 'O1.2',
+            text: 'People in distress receive focused psychosocial support at supported facilities',
+            textAr: 'حصول الأشخاص الذين يعانون من الضيق النفسي على دعم نفسي اجتماعي مركّز في المرافق المدعومة',
+            children: [
+              { code: 'A1.2.1', text: 'Train facility staff in psychological first aid and referral', textAr: 'تدريب طواقم المرافق على الإسعافات النفسية الأولية والإحالة' },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  const aiFramework2 = { provenance: 'ai_generated' as const, aiModel: SEED_AI_MODEL, promptVersion: FRAMEWORK_PROMPT_VERSION };
+  await createIndicators(framework2.id, [
+    {
+      resultId: results2.O1,
+      libraryId: 'HE-02',
+      indicatorText: '% of pregnant women in target communities receiving at least four antenatal care visits',
+      indicatorTextAr: 'نسبة النساء الحوامل في المجتمعات المستهدفة اللواتي تلقين أربع زيارات رعاية ما قبل الولادة على الأقل',
+      level: 'outcome',
+      dataCollectionMethod: 'hh_survey',
+      frequency: 'biannual',
+      unit: 'percent',
+      phases: ['baseline', 'midterm', 'endline'],
+      definition: 'Women in the target communities who gave birth in the reference period and attended at least four antenatal care visits during the pregnancy, as a share of all women there who gave birth in the period.',
+      calculation: {
+        numerator: 'Women who gave birth in the period with at least four antenatal care visits',
+        denominator: 'Women in the target communities who gave birth in the period',
+        formula: PERCENT_FORMULA,
+      },
+      direction: 'increase',
+      disaggregation: ['age', 'disability', 'location'],
+      meansOfVerification: 'Household survey, maternal health module, n≈500 households in the target Area C communities; facility antenatal care registers for the quarterly trend',
+      baselineMethod: 'Pending baseline: household survey in the target communities (in the field since April 2025)',
+      targetJustification: 'Proposed method: baseline + 15 percentage points, consistent with similar EU-funded primary health care programmes — confirm after baseline.',
+      assumptions: 'Mobile clinics can reach the communities despite movement restrictions; align the definition with the Ministry of Health.',
+      responsibility: 'M&E Officer',
+      aiRationale: 'A widely used coverage indicator for the maternal health part of outcome O1, adapted from library entry HE-02.',
+      ...aiFramework2,
+    },
+    {
+      resultId: results2['O1.1'],
+      libraryId: 'HE-03',
+      indicatorText: 'Number of consultations provided at supported primary health care facilities and mobile clinics',
+      indicatorTextAr: 'عدد الاستشارات الطبية المقدّمة في مرافق الرعاية الصحية الأولية المدعومة والعيادات المتنقلة',
+      level: 'output',
+      dataCollectionMethod: 'document_review',
+      frequency: 'monthly',
+      unit: 'number',
+      phases: ['baseline', 'midterm', 'endline'],
+      definition: 'Outpatient consultations recorded at facilities receiving project support and at programme mobile clinics during the period. Counts consultations, not unique patients.',
+      calculation: { formula: 'Sum of consultations from facility and mobile clinic registers' },
+      direction: 'increase',
+      disaggregation: ['sex', 'age', 'location'],
+      meansOfVerification: 'Facility HMIS reports and mobile clinic consultation registers, compiled monthly by the health coordinator',
+      baselineMethod: 'Facility records for the 12 months before the project start (to be compiled during inception)',
+      targetJustification: 'Proposed method: baseline consultation volume from the facility records, raised in line with the number of target people (5,000) and comparable programmes — confirm after baseline.',
+      assumptions: 'Supported facilities keep complete registers; mobile clinic schedules are not disrupted by closures.',
+      responsibility: 'Field Team',
+      aiRationale: 'Counts the main service delivered under output O1.1.',
+      ...aiFramework2,
+    },
+    {
+      resultId: results2['O1.2'],
+      libraryId: 'PR-01',
+      standardReferenceCode: 'IASC MHPSS M&E Framework O5.4',
+      indicatorText: 'Number of people receiving focused psychosocial or psychological care',
+      indicatorTextAr: 'عدد الأشخاص الذين يتلقّون رعاية نفسية اجتماعية أو نفسية مركّزة',
+      level: 'output',
+      dataCollectionMethod: 'document_review',
+      frequency: 'monthly',
+      unit: 'number',
+      phases: ['baseline', 'midterm', 'endline'],
+      definition: 'Individuals who received at least four sessions of a focused (individual, family or group) psychosocial or psychological intervention at a supported facility.',
+      calculation: { formula: 'Unique clients meeting the session threshold' },
+      direction: 'increase',
+      disaggregation: ['sex', 'age', 'disability', 'location'],
+      meansOfVerification: 'Case management records, aggregated monthly by the MHPSS focal point (no personal data leaves the facility)',
+      baselineMethod: 'No focused care offered at the supported facilities before the project (to be confirmed during inception)',
+      targetJustification: 'Proposed method: set after the baseline from the facility caseload capacity (staff × clients per month) over the project period — confirm after baseline.',
+      assumptions: 'Trained staff stay in post; stigma does not prevent people from seeking care.',
+      responsibility: 'MHPSS Focal Point',
+      aiRationale: 'IASC MHPSS standard output indicator for focused care, matching the MHPSS sector of the project.',
+      ...aiFramework2,
+    },
+  ]);
 
   // Assessments
   await prisma.assessment.create({
@@ -476,7 +849,7 @@ async function main() {
     },
   });
 
-  // M&E Templates — comprehensive library covering all sectors with Palestinian context
+  // M&E Templates (deprecated: replaced by IndicatorLibraryEntry, kept while /api/templates still serves them)
   const templateData = [
     // === LIVELIHOODS (10 indicators) ===
     { sector: 'livelihoods' as const, text: 'Percentage increase in household income among beneficiaries', textAr: 'نسبة الزيادة في دخل الأسرة بين المستفيدين', level: 'impact' as const, method: 'hh_survey' as const, freq: 'annual' as const, target: '25%', benchmark: '15-30% achievable in WB/Gaza', donors: ['eu', 'giz', 'usaid'] },
@@ -598,6 +971,27 @@ async function main() {
 
   console.log(`📊 Seeded ${templateData.length} M&E templates across ${new Set(templateData.map(t => t.sector)).size} sectors`);
 
+  // Indicator library: idempotent upsert from knowledge/indicator-library.json (same as `npm run seed:library`),
+  // then link the seeded indicators adapted from library entries.
+  const library = await seedLibrary(prisma);
+  console.log(`📚 Indicator library ${library.version}: ${library.total} entries (${library.created} created, ${library.updated} updated, ${library.unchanged} unchanged)`);
+
+  const knownLibraryIds = new Set((await prisma.indicatorLibraryEntry.findMany({
+    where: { id: { in: libraryLinks.map(l => l.libraryId) } },
+    select: { id: true },
+  })).map(e => e.id));
+  for (const link of libraryLinks) {
+    if (knownLibraryIds.has(link.libraryId)) {
+      await prisma.indicator.update({ where: { id: link.indicatorId }, data: { libraryId: link.libraryId } });
+    } else {
+      console.warn(`⚠️  Library entry ${link.libraryId} is not in the library file; the seeded indicator is left unlinked`);
+      await prisma.indicator.updateMany({ where: { id: link.indicatorId, provenance: 'library' }, data: { provenance: 'manual' } });
+    }
+  }
+
+  const [resultCount, indicatorCount] = await Promise.all([prisma.resultNode.count(), prisma.indicator.count()]);
+  console.log(`🧭 Seeded ${resultCount} results and ${indicatorCount} indicators (${knownLibraryIds.size} linked to library entries)`);
+
   console.log('✅ Seed completed successfully!');
   console.log('');
   console.log('Demo accounts:');
@@ -605,7 +999,7 @@ async function main() {
   console.log(`  M&E:     me@momentumlabs.ps / ${shownPassword}`);
   console.log(`  Donor:   donor@momentumlabs.ps / ${shownPassword}`);
   console.log('');
-  console.log(`Projects: ${project1.name}, ${project2.name}, ${project3.name}`);
+  console.log(`Projects: ${[project1, project2, project3, project4].map(p => p.name).join(', ')}`);
 }
 
 main()

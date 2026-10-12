@@ -12,7 +12,7 @@ Requirements: Node 22, PostgreSQL 16 with the `vector` extension (or a Supabase 
 npm ci
 cp .env.example .env          # then fill in the values (see below)
 npx prisma db push            # create the schema in your local database
-npm run seed                  # demo organisation, users and projects (local only)
+npm run seed                  # demo organisation, users, projects, results chains and the indicator library (local only)
 npm run dev                   # API on http://localhost:3001
 ```
 
@@ -41,7 +41,7 @@ The server refuses to start if a required value is missing and lists what is wro
 | `ANTHROPIC_API_KEY` | Claude API key |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | required in production for private document storage |
 
-Everything else is optional and documented in `.env.example`. Security-related setup (storage bucket, webhook tokens, migrating old uploads) is in [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md).
+Everything else is optional and documented in `.env.example`. Security-related setup (storage bucket, webhook tokens, migrating old uploads) is in [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md). The Phase 2 data model (results chain, indicator reference sheets, breakdowns, library) and the rollout steps for its SQL are in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
 
 ## Commands
 
@@ -54,7 +54,9 @@ Everything else is optional and documented in `.env.example`. Security-related s
 | `npm run lint` | ESLint |
 | `npm run typecheck` | type-check source, tests, scripts and seed |
 | `npm test` | Vitest unit and integration tests (see below) |
-| `npm run seed` | reset and seed demo data — **deletes all data**, refuses to run in production |
+| `npm run seed` | reset and seed demo data — **deletes all data**, refuses to run in production; also loads the indicator library |
+| `npm run seed:library` | load or update the indicator library from `knowledge/indicator-library.json` (idempotent, never deletes; safe in any environment; `-- path/to/draft.json` checks a draft file) |
+| `npm run verify:migration` | prove `prisma/sql/2026-10-11_phase2_data_model.sql` on throwaway local databases (needs git history and local Postgres) |
 | `npm run storage:setup` | create the private Supabase Storage bucket |
 | `npm run storage:migrate` | move pre-Phase-0 files from `uploads/` to private storage (dry run; add `-- --apply`) |
 

@@ -3,6 +3,9 @@ import { prisma } from '../config/prisma';
 import { assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
+import { validationErrorBody } from '../services/dataPoints/fields';
+import { sortResultNodes } from '../services/indicators/hierarchy';
+import { parseProjectCreate, parseProjectUpdate } from '../services/projects/validation';
 
 const router = Router();
 
@@ -21,31 +24,17 @@ router.get('/', authenticate, asyncHandler(async (req: Request, res: Response) =
 }));
 
 // POST /api/projects
+// Body: name, sector, donor, donorType, startDate, endDate (required), plus optional nameAr, description,
+// budgetUsd, targetBeneficiaries, geographicScope, sectors (Sector[]; always includes `sector`) and humanitarian.
 router.post('/', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
-  const {
-    name, nameAr, description, sector, donor, donorType,
-    budgetUsd, startDate, endDate, targetBeneficiaries, geographicScope,
-  } = req.body;
-
-  if (!name || !sector || !donor || !donorType || !startDate || !endDate) {
-    throw new AppError(400, 'name, sector, donor, donorType, startDate, and endDate are required');
+  const parsed = parseProjectCreate(req.body);
+  if (parsed.ok === false) {
+    res.status(400).json(validationErrorBody(parsed.errors));
+    return;
   }
 
   const project = await prisma.project.create({
-    data: {
-      organizationId: req.user!.organizationId,
-      name,
-      nameAr,
-      description,
-      sector,
-      donor,
-      donorType,
-      budgetUsd: budgetUsd ? parseFloat(budgetUsd) : undefined,
-      startDate: new Date(startDate),
-      endDate: new Date(endDate),
-      targetBeneficiaries: targetBeneficiaries ? parseInt(targetBeneficiaries) : undefined,
-      geographicScope,
-    },
+    data: { ...parsed.data, organizationId: req.user!.organizationId },
   });
 
   res.status(201).json(project);
@@ -72,31 +61,20 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
   res.json(project);
 }));
 
-// PATCH /api/projects/:id
+// PATCH /api/projects/:id — any subset of the create fields, plus status.
+// Changing `sector` or `sectors` keeps the primary sector in `sectors`.
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  await assertProjectAccess(req, req.params.id);
+  const current = await assertProjectAccess(req, req.params.id);
 
-  const {
-    name, nameAr, description, sector, donor, donorType,
-    budgetUsd, startDate, endDate, targetBeneficiaries, geographicScope, status,
-  } = req.body;
+  const parsed = parseProjectUpdate(req.body, current);
+  if (parsed.ok === false) {
+    res.status(400).json(validationErrorBody(parsed.errors));
+    return;
+  }
 
   const updated = await prisma.project.update({
     where: { id: req.params.id },
-    data: {
-      ...(name !== undefined && { name }),
-      ...(nameAr !== undefined && { nameAr }),
-      ...(description !== undefined && { description }),
-      ...(sector !== undefined && { sector }),
-      ...(donor !== undefined && { donor }),
-      ...(donorType !== undefined && { donorType }),
-      ...(budgetUsd !== undefined && { budgetUsd }),
-      ...(startDate !== undefined && { startDate: new Date(startDate) }),
-      ...(endDate !== undefined && { endDate: new Date(endDate) }),
-      ...(targetBeneficiaries !== undefined && { targetBeneficiaries }),
-      ...(geographicScope !== undefined && { geographicScope }),
-      ...(status !== undefined && { status }),
-    },
+    data: parsed.data,
   });
 
   res.json(updated);
@@ -110,9 +88,13 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
       frameworks: {
         orderBy: { version: 'desc' },
         include: {
+          resultNodes: {
+            select: { id: true, code: true, level: true, text: true, textAr: true, parentId: true, sortOrder: true },
+          },
           indicators: {
             orderBy: { sortOrder: 'asc' },
             include: {
+              result: { select: { code: true } },
               dataPoints: { orderBy: { collectionDate: 'desc' } },
             },
           },
@@ -131,7 +113,22 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
 
   if (!project) throw new AppError(404, 'Project not found');
 
-  // Flatten indicators with their data points for easy spreadsheet mapping
+  // Each framework with its results chain (impact > outcome > output > activity, in display order)
+  const frameworks = project.frameworks.map(fw => ({
+    id: fw.id,
+    version: fw.version,
+    status: fw.status,
+    resultNodes: sortResultNodes(fw.resultNodes).map(node => ({
+      id: node.id,
+      code: node.code,
+      level: node.level,
+      text: node.text,
+      textAr: node.textAr,
+      parentId: node.parentId,
+    })),
+  }));
+
+  // Flatten indicators with their reference sheets and data points for easy spreadsheet mapping
   const indicators = project.frameworks.flatMap(fw =>
     fw.indicators.map(ind => ({
       frameworkVersion: fw.version,
@@ -147,6 +144,23 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
       currentValue: ind.currentValue,
       unit: ind.unit,
       status: ind.status,
+      // Reference sheet (knowledge/me-foundations.md §3)
+      frameworkId: fw.id,
+      resultId: ind.resultId,
+      resultCode: ind.result?.code ?? null,
+      definition: ind.definition,
+      calculation: ind.calculation,
+      direction: ind.direction,
+      disaggregation: ind.disaggregation,
+      meansOfVerification: ind.meansOfVerification,
+      baselineDate: ind.baselineDate,
+      baselineMethod: ind.baselineMethod,
+      targetJustification: ind.targetJustification,
+      intermediateTargets: ind.intermediateTargets,
+      assumptions: ind.assumptions,
+      libraryId: ind.libraryId,
+      standardReferenceCode: ind.standardReferenceCode,
+      provenance: ind.provenance,
       dataPoints: ind.dataPoints.map(dp => ({
         id: dp.id,
         value: dp.value,
@@ -155,6 +169,7 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
         dataSource: dp.dataSource,
         geographicArea: dp.geographicArea,
         notes: dp.notes,
+        breakdown: dp.breakdown,
       })),
     }))
   );
@@ -193,6 +208,8 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
       nameAr: project.nameAr,
       description: project.description,
       sector: project.sector,
+      sectors: project.sectors,
+      humanitarian: project.humanitarian,
       donor: project.donor,
       donorType: project.donorType,
       budgetUsd: project.budgetUsd,
@@ -202,6 +219,7 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
       geographicScope: project.geographicScope,
       status: project.status,
     },
+    frameworks,
     indicators,
     beneficiaries,
     assessments: project.assessments,

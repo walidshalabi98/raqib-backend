@@ -35,7 +35,7 @@ export function bearer(user: { id: string; email: string; organizationId: string
 
 export const PDF_BYTES = Buffer.from('%PDF-1.4\n% test document\n%%EOF\n');
 
-/** Creates an organisation with one of every project-owned resource. */
+/** Creates an organisation with one of every project-owned resource (the indicator measures the outcome result `O1`). */
 export async function createOrgFixture(label: string) {
   const org = await prisma.organization.create({
     data: { name: `Org ${label}`, type: 'local_ngo', country: 'Palestine', city: 'Ramallah', contactEmail: `${label}@example.org` },
@@ -53,9 +53,12 @@ export async function createOrgFixture(label: string) {
     },
   });
   const framework = await prisma.framework.create({ data: { projectId: project.id, version: 1 } });
+  const result = await prisma.resultNode.create({
+    data: { frameworkId: framework.id, level: 'outcome', code: 'O1', text: `Outcome ${label}` },
+  });
   const indicator = await prisma.indicator.create({
     data: {
-      frameworkId: framework.id, indicatorText: `Indicator ${label}`, level: 'outcome',
+      frameworkId: framework.id, resultId: result.id, indicatorText: `Indicator ${label}`, level: 'outcome',
       dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: ['baseline', 'endline'],
     },
   });
@@ -82,7 +85,7 @@ export async function createOrgFixture(label: string) {
   });
 
   return {
-    org, admin, officer, project, framework, indicator, assessment, dataPoint, qualitative, report, beneficiary, document,
+    org, admin, officer, project, framework, result, indicator, assessment, dataPoint, qualitative, report, beneficiary, document,
     adminAuth: bearer(admin),
     officerAuth: bearer(officer),
   };

@@ -2,43 +2,42 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertIndicatorAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
-import { asyncHandler } from '../middleware/errorHandler';
+import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
+import { levelForResult } from '../services/indicators/hierarchy';
+import { assertIndicatorReferences } from '../services/indicators/references';
+import { INDICATOR_INCLUDE } from '../services/indicators/selects';
+import { parseIndicatorUpdate, provenanceAfterUpdate, toIndicatorUpdateData } from '../services/indicators/validation';
 
 const router = Router();
 
-// PATCH /api/indicators/:id
+// PATCH /api/indicators/:id — any subset of the indicator and reference-sheet fields.
+// Provenance is set by the server; a linked indicator's level must match its result's level.
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  await assertIndicatorAccess(req, req.params.id);
+  const indicator = await assertIndicatorAccess(req, req.params.id);
+  const input = parseIndicatorUpdate(req.body);
+  const { result } = await assertIndicatorReferences(indicator.frameworkId, input);
+  const data = toIndicatorUpdateData(input);
 
-  const {
-    indicatorText, indicatorTextAr, level, dataCollectionMethod,
-    frequency, baselineValue, targetValue, currentValue, unit, status, phases, sortOrder,
-    startDate, endDate, actualStartDate, actualEndDate, milestones, responsibility,
-  } = req.body;
+  // Level fits the result (knowledge/me-foundations.md §2 rule 5), checked whenever the update sets either.
+  if (input.level !== undefined || input.resultId !== undefined) {
+    const resultId = input.resultId === undefined ? indicator.resultId : input.resultId;
+    const resultLevel = result?.level ?? (resultId
+      ? (await prisma.resultNode.findUnique({ where: { id: resultId }, select: { level: true } }))?.level
+      : null);
+    // As on create, a newly linked result sets the level when none is sent.
+    const fit = levelForResult(input.level ?? (input.resultId === undefined ? indicator.level : undefined), resultLevel);
+    if (fit.ok === false) throw new AppError(400, fit.message);
+    if (fit.level !== undefined && fit.level !== indicator.level) data.level = fit.level;
+  }
+
+  const provenance = provenanceAfterUpdate(indicator.provenance, input.libraryId === undefined ? indicator.libraryId : input.libraryId);
+  if (provenance !== indicator.provenance) data.provenance = provenance;
 
   const updated = await prisma.indicator.update({
-    where: { id: req.params.id },
-    data: {
-      ...(indicatorText !== undefined && { indicatorText }),
-      ...(indicatorTextAr !== undefined && { indicatorTextAr }),
-      ...(level !== undefined && { level }),
-      ...(dataCollectionMethod !== undefined && { dataCollectionMethod }),
-      ...(frequency !== undefined && { frequency }),
-      ...(baselineValue !== undefined && { baselineValue }),
-      ...(targetValue !== undefined && { targetValue }),
-      ...(currentValue !== undefined && { currentValue }),
-      ...(unit !== undefined && { unit }),
-      ...(status !== undefined && { status }),
-      ...(phases !== undefined && { phases }),
-      ...(sortOrder !== undefined && { sortOrder }),
-      ...(startDate !== undefined && { startDate: startDate ? new Date(startDate) : null }),
-      ...(endDate !== undefined && { endDate: endDate ? new Date(endDate) : null }),
-      ...(actualStartDate !== undefined && { actualStartDate: actualStartDate ? new Date(actualStartDate) : null }),
-      ...(actualEndDate !== undefined && { actualEndDate: actualEndDate ? new Date(actualEndDate) : null }),
-      ...(milestones !== undefined && { milestones }),
-      ...(responsibility !== undefined && { responsibility }),
-    },
+    where: { id: indicator.id },
+    data,
+    include: INDICATOR_INCLUDE,
   });
 
   res.json(updated);
@@ -60,6 +59,7 @@ router.patch('/:id/approve', authenticate, authorize('org_admin', 'platform_admi
   const updated = await prisma.indicator.update({
     where: { id: req.params.id },
     data: { isApproved: true },
+    include: INDICATOR_INCLUDE,
   });
 
   res.json(updated);
