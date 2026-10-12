@@ -5,6 +5,7 @@ import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { generateAutoAssessment } from '../services/ai/assessmentGenerator';
+import { safeErrorSummary } from '../services/ai/errors';
 
 const router = Router();
 
@@ -44,7 +45,7 @@ router.post('/projects/:id/assessments', authenticate, authorize('org_admin', 'p
   // Trigger AI auto-assessment generation
   if (autoGenerate) {
     generateAutoAssessment(assessment.id, req.params.id, type).catch(err => {
-      console.error('Auto-assessment generation failed:', err.message);
+      console.error(`Auto-assessment generation failed for ${assessment.id}: ${safeErrorSummary(err)}`);
     });
   }
 

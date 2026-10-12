@@ -10,8 +10,9 @@
  * Every call:
  * - sends the shared system prompt (role + knowledge/me-foundations.md §1–12) first, marked
  *   for prompt caching, then the feature's own instructions;
- * - asks for structured output (output_config.format, JSON schema from the zod/v4 schema),
- *   parses the text blocks and validates the answer again with the same schema;
+ * - asks for structured output (output_config.format, JSON schema from the zod/v4 schema,
+ *   see ./outputSchema), parses the text blocks and validates the answer again with the
+ *   same schema;
  * - retries rate limits, overloads, server errors and network failures with exponential
  *   backoff (own loop; the SDK's retries are off), retries a cut-off answer once with a
  *   higher token limit, and turns refusals into AiRefusalError;
@@ -19,13 +20,13 @@
  *   text) and one console line with the same numbers.
  */
 import Anthropic from '@anthropic-ai/sdk';
-import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import type * as z from 'zod/v4';
 import type { AiCallStatus } from '@prisma/client';
 import { env } from '../../config/env';
 import { prisma } from '../../config/prisma';
 import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from './errors';
 import { estimateCostUsd, roundUsd, supportsEffort, supportsServerFallback } from './models';
+import { outputJsonSchema } from './outputSchema';
 import { loadSharedSystemPrompt } from './prompts/system';
 
 /** Which configured model to use: main = AI_MODEL_MAIN (default claude-sonnet-5-5), fast = AI_MODEL_FAST (default claude-haiku-5-5). */
@@ -59,8 +60,8 @@ export interface GenerateStructuredParams<S extends z.ZodType> {
   /** Conversation; usually one user message holding the prompt. */
   messages: AiMessage[];
   /**
-   * zod/v4 schema of the answer. Sent as output_config.format (JSON schema via the SDK's
-   * zodOutputFormat) and used again to validate the parsed answer. The root must be an object;
+   * zod/v4 schema of the answer. Sent as output_config.format (JSON schema from
+   * outputJsonSchema in ./outputSchema) and used again to validate the parsed answer. The root must be an object;
    * keep every property required (use "" or null for unknown values) and avoid transforms.
    */
   schema: S;
@@ -283,7 +284,7 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
     }
   };
 
-  const outputFormat = zodOutputFormat(params.schema);
+  const outputSchema = outputJsonSchema(params.schema);
   const effort = params.effort ?? 'medium';
   const useFallback = env.aiRefusalFallback === 'default' && supportsServerFallback(model);
   const buildBody = (maxTokens: number) => ({
@@ -295,7 +296,7 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
     ],
     messages: params.messages.map(m => ({ role: m.role, content: m.content })),
     output_config: {
-      format: { type: 'json_schema', schema: outputFormat.schema },
+      format: { type: 'json_schema', schema: outputSchema },
       ...(supportsEffort(model) ? { effort } : {}),
     },
     ...(useFallback ? { betas: [REFUSAL_FALLBACK_BETA], fallbacks: 'default' } : {}),

@@ -8,6 +8,7 @@ import { assertFileContent, documentUpload } from '../middleware/upload';
 import { buildDocumentKey, getStorage } from '../services/storage';
 import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
 import { parseDocument } from '../services/ai/documentParser';
+import { safeErrorSummary } from '../services/ai/errors';
 
 const router = Router();
 
@@ -53,7 +54,7 @@ router.post('/projects/:id/qualitative', authenticate, aiLimiter, asyncHandler(a
 
   // Auto-trigger AI thematic coding after creation
   codeQualitativeEntry(entry.id, req.params.id).catch(err => {
-    console.error('Auto-coding qualitative entry failed:', err.message);
+    console.error(`Auto-coding qualitative entry ${entry.id} failed: ${safeErrorSummary(err)}`);
   });
 
   res.status(201).json(entry);
@@ -111,12 +112,13 @@ router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documen
 
     // 4. Auto-trigger AI thematic coding
     codeQualitativeEntry(entry.id, req.params.id).catch(err => {
-      console.error('Qualitative coding after upload failed:', err.message);
+      console.error(`Qualitative coding after upload failed for entry ${entry.id}: ${safeErrorSummary(err)}`);
     });
 
-    console.log(`[Qualitative] Created entry from uploaded doc: ${file.originalname}`);
+    // Log ids only: file names can hold personal data.
+    console.log(`[Qualitative] Created entry ${entry.id} from uploaded document ${document.id}`);
   }).catch(err => {
-    console.error('Document parsing for qualitative failed:', err.message);
+    console.error(`Document parsing for qualitative failed for document ${document.id}: ${safeErrorSummary(err)}`);
   });
 
   res.status(202).json({
@@ -139,7 +141,7 @@ router.post('/qualitative/:id/code', authenticate, aiLimiter, asyncHandler(async
 
   // Thematic coding runs inline (no Redis/BullMQ needed)
   codeQualitativeEntry(req.params.id, entry.projectId).catch(err => {
-    console.error('Qualitative coding failed:', err.message);
+    console.error(`Qualitative coding failed for entry ${req.params.id}: ${safeErrorSummary(err)}`);
   });
 
   res.status(202).json({ entryId: req.params.id, status: 'processing' });

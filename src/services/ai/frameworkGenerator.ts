@@ -11,6 +11,7 @@ import { IndicatorLevel, Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { generateStructured } from './client';
 import { AiInvalidOutputError, AiOutputTruncatedError } from './errors';
+import { redactPersonalData } from './redact';
 import {
   FRAMEWORK_INDICATORS_SCHEMA,
   FRAMEWORK_INDICATORS_SYSTEM,
@@ -91,7 +92,8 @@ export async function generateFramework(frameworkId: string, projectId: string):
     humanitarian: project.humanitarian,
     donor: project.donor,
     donorType: project.donorType,
-    description: project.description || undefined,
+    // Organisational text, but staff sometimes add a contact number: redact it like the documents.
+    description: project.description ? redactPersonalData(project.description).text : undefined,
     targetBeneficiaries: project.targetBeneficiaries || undefined,
     geographicScope: project.geographicScope || undefined,
     startDate: project.startDate.toISOString().slice(0, 10),

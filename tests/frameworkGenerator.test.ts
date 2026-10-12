@@ -1403,6 +1403,28 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(trained.targetValue).toBeNull();
   });
 
+  it('redacts phone numbers, emails and ID numbers in the project description before both prompts', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu', documentText: DOCS[0] });
+    await prisma.project.update({
+      where: { id: project.id },
+      data: { description: 'Vocational training for young people in Nablus. Focal point: 0598 765 432, focal@example.org, ID 412345678.' },
+    });
+    mockAi({
+      structure: { data: structureAnswer() },
+      indicators: { data: { indicators: [aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: '', unit: 'number', calculation: EMPTY_CALCULATION })] } },
+    });
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+
+    const prompts = [promptOf('framework.structure'), promptOf('framework.indicators')];
+    expect(prompts[0]).toContain('Vocational training for young people in Nablus.');
+    expect(prompts[0]).toContain('[phone removed]');
+    for (const prompt of prompts) {
+      for (const secret of ['0598 765 432', 'focal@example.org', '412345678']) expect(prompt).not.toContain(secret);
+    }
+  });
+
   it('checks indicators against their linked library entries, including entries that were not candidates', async () => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
     mockAi({

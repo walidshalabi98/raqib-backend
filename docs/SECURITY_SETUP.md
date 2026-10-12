@@ -1,6 +1,6 @@
-# Security setup (Phase 0)
+# Security setup
 
-What changed in Phase 0 and what to do once per environment.
+What changed in Phase 0 (and the AI rules added in Phase 3, §6) and what to do once per environment.
 
 ## 1. Environment variables
 
@@ -13,8 +13,15 @@ The server now refuses to start when required settings are missing or weak, and 
 | `ANTHROPIC_API_KEY` | required |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | required in production (document storage) |
 | `CORS_ORIGINS` | extra browser origins, comma-separated; `APP_URL` is always allowed |
+| `AI_MODEL_MAIN` | optional, default `claude-sonnet-5-5`; the only place a main-tier model id is set |
+| `AI_MODEL_FAST` | optional, default `claude-haiku-5-5`; the only place a fast-tier model id is set |
+| `AI_REQUEST_TIMEOUT_MS` | optional, default `60000`, at least `1000`; timeout per AI request (long generations pass more) |
+| `AI_MAX_RETRIES` | optional, default `3`, from 0 to 10; retries after rate limits, overloads, server and network errors |
+| `AI_REFUSAL_FALLBACK` | optional, `default` (the default) or `off`; `default` lets Anthropic re-run a refused request on its fallback model (Sonnet 5.5, Opus 5, Opus 5.5 only) |
+| `VOYAGE_API_KEY` | optional secret; embeddings for the indicator library. Without it nothing is sent to Voyage and search uses keywords |
+| `VOYAGE_MODEL` | optional, default `voyage-4` |
 
-Changing `JWT_SECRET` signs everyone out once. See `.env.example` for the full list.
+Blank values (`NAME=`) for the optional AI settings use the default. Changing `JWT_SECRET` signs everyone out once. See `.env.example` for the full list.
 
 ## 2. Document storage
 
@@ -42,6 +49,8 @@ Rejected calls are logged as `[Webhook] Rejected {...}` with the reason and IP, 
 
 Phase 0 adds one table, `WebhookToken`. The reviewed SQL is in `prisma/sql/2026-10-11_phase0_webhook_tokens.sql` (additive only, and it enables row level security on the new table so Supabase's public API cannot read it). Apply it to a Supabase development branch first, then to the shared database.
 
+Phase 2 and Phase 3 add more reviewed SQL (Phase 3: the `AiCall` table with row level security and `Document.aiAnalysis`). Apply the files in order (Phase 0, Phase 2, Phase 3) as described in `docs/DATA_MODEL.md` §9.
+
 ## 5. Other protections
 
 - Security headers (`helmet`), CORS limited to configured origins.
@@ -50,7 +59,25 @@ Phase 0 adds one table, `WebhookToken`. The reviewed SQL is in `prisma/sql/2026-
 - Org admins can no longer grant the `platform_admin` role.
 - The seed refuses to run in production and needs `SEED_PASSWORD` outside development.
 
-## 6. Tests
+## 6. AI providers and personal data (Phase 3)
+
+Raqib sends text to Anthropic (all AI features) and, when `VOYAGE_API_KEY` is set, to Voyage AI (embeddings). Models receive aggregates and organisational text only (CLAUDE.md rule 5). Details per feature: `docs/AI.md` §9.
+
+**Sent to Anthropic:** project metadata (name, sectors, donor, dates, target beneficiaries, geographic scope, the redacted description); redacted document text (at most 8 000 characters per document for frameworks, 12 000 for document analysis) and redacted file names; indicator texts, definitions, baselines, targets and aggregated values with areas and disaggregated counts; redacted qualitative entries (titles, content, themes); indicator library entries.
+
+**Sent to Voyage:** indicator library text only (name, Arabic name, definition, tags); from Phase 4 also result statements. Never personal data.
+
+**Never sent:** beneficiary records, user names and email addresses, passwords, tokens and keys, data point notes, original files.
+
+**Personal data in documents.** Uploaded documents stay in the private bucket. The parser (`src/services/ai/documentParser.ts`) extracts the text and runs `redactPersonalData` (`src/services/ai/redact.ts`) before anything is stored or sent to a model. It removes email addresses, phone numbers (+/00 international numbers, 970/972 mobiles, local 05X mobiles and 0[2489] landlines, in ASCII or Arabic digits) and 9-digit ID numbers, replacing them with `[email removed]`, `[phone removed]` and `[ID number removed]`. `Document.parsedText` holds only redacted text. The model sees at most the first 12 000 characters plus the redacted file name. The analysis is stored in `Document.aiAnalysis`, never appended to `parsedText`. Qualitative entries and project descriptions are redacted the same way before a prompt is built, and model output is redacted again before it is stored.
+
+**Limits.** Names and street addresses cannot be detected by patterns. The prompts forbid the model from writing them, but text that staff upload or type is sent as it is. **Staff must not put names, addresses or other identifying details of beneficiaries into documents, transcripts, notes or descriptions that Raqib analyses.** Documents parsed before Phase 3 keep unredacted text at rest until they are parsed again; the AI services redact it again before every model call.
+
+**Logs.** Every AI call writes one `AiCall` row (feature, model, prompt versions, status, token counts, latency, estimated cost, organisation and project ids) and one console line with the same numbers. Neither ever holds prompt text, document text, model answers or error messages. AI job failures are logged with the AiError message or the error class name only (`safeErrorSummary`), never database error text. The parser logs document ids, lengths and redaction counts only.
+
+**Anthropic API key.** `ANTHROPIC_API_KEY` is a secret like the JWT secrets: keep it in the environment, never in code, tests or logs. Tests point the SDK at an unreachable local address, so they can never call the real API; only `npm run ai:smoke` does.
+
+## 7. Tests
 
 ```bash
 # Unit tests run anywhere; integration tests need a disposable Postgres with pgvector

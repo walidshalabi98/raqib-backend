@@ -17,7 +17,11 @@ export const TO_BE_CONFIRMED = 'To be confirmed by the M&E officer';
 /** Used when the model gives no target-setting method. Never a number (me-foundations.md §6). */
 export const DEFAULT_TARGET_METHOD = 'set after the baseline survey, using comparable programmes';
 
-/** Marker after which the document parser appends the model's own analysis to Document.parsedText (documentParser.ts). */
+/**
+ * Marker after which the pre-Phase 3 document parser appended the model's own analysis to
+ * Document.parsedText. New analyses are stored in Document.aiAnalysis (StoredDocumentAnalysis in
+ * prompts/documentAnalysis.ts); the marker now appears only in legacy rows.
+ */
 export const AI_ANALYSIS_MARKER = '---AI_ANALYSIS---';
 
 // Field limits match the indicator and result validation of the REST API.

@@ -34,12 +34,6 @@ How you answer:
 - You receive aggregates only. Never ask for, repeat or produce personal data: names, ID numbers, phone numbers, email addresses or exact addresses.
 - Follow the M&E rules below. When a donor's own guidance is given for a project, it overrides the general rules.`;
 
-/**
- * @deprecated Kept until the last services move to generateStructured; the AI client
- * already sends ROLE_PROMPT and the foundations, so new code must not send this again.
- */
-export const SYSTEM_CONTEXT = ROLE_PROMPT;
-
 export interface SharedSystemPrompt {
   /** ROLE_PROMPT followed by the foundations title and §1–12. */
   text: string;

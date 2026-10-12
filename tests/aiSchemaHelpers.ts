@@ -1,5 +1,5 @@
 import type * as z from 'zod/v4';
-import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
+import { outputJsonSchema } from '../src/services/ai/outputSchema';
 
 type JsonSchema = Record<string, unknown>;
 
@@ -15,7 +15,7 @@ export const MAX_UNIONS = 8;
  */
 export function structuredOutputSchemaProblems(schema: z.ZodType): string[] {
   const problems: string[] = [];
-  const root = zodOutputFormat(schema).schema as JsonSchema;
+  const root = outputJsonSchema(schema) as JsonSchema;
   if (root.type !== 'object') problems.push('root: must be an object');
   let unions = 0;
 

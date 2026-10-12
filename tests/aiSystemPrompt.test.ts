@@ -7,7 +7,6 @@ import {
   DEFAULT_FOUNDATIONS_PATH,
   loadSharedSystemPrompt,
   ROLE_PROMPT,
-  SYSTEM_CONTEXT,
   SYSTEM_PROMPT_VERSION,
 } from '../src/services/ai/prompts/system';
 
@@ -128,9 +127,5 @@ describe('ROLE_PROMPT', () => {
     expect(ROLE_PROMPT).toMatch(/structured output/);
     expect(ROLE_PROMPT).toMatch(/aggregates only/);
     expect(ROLE_PROMPT).toMatch(/phone numbers/);
-  });
-
-  it('is still exported as the deprecated SYSTEM_CONTEXT', () => {
-    expect(SYSTEM_CONTEXT).toBe(ROLE_PROMPT);
   });
 });

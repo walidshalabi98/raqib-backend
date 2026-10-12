@@ -6,13 +6,15 @@ import { describe, expect, it } from 'vitest';
 /**
  * Guards for CLAUDE.md rule 4 and the Phase 3 acceptance criteria: AI services choose a
  * tier, never a model id; parse nothing by hand; never import the SDK; and leave the shared
- * system prompt to the client. Only client.ts and models.ts may know about models and the SDK.
+ * system prompt to the client. Only client.ts and models.ts may know about models and the SDK;
+ * outputSchema.ts may import the SDK's JSON schema transform and nothing else from it.
  */
 
 const ROOT = nodePath.resolve(__dirname, '..');
 const AI_DIR = nodePath.join(ROOT, 'src/services/ai');
 const EXEMPT = new Set(['client.ts', 'models.ts'].map(f => nodePath.join(AI_DIR, f)));
-const SYSTEM_PROMPT_FILE = nodePath.join(AI_DIR, 'prompts/system.ts');
+/** Builds the structured-output JSON schema with the SDK's transform; checked by every other rule. */
+const OUTPUT_SCHEMA_FILE = nodePath.join(AI_DIR, 'outputSchema.ts');
 
 interface Rule {
   name: string;
@@ -53,6 +55,7 @@ const RULES: Rule[] = [
   {
     name: 'Anthropic SDK import (call generateStructured in client.ts)',
     pattern: /(?:from\s+|require\(\s*|import\(\s*|import\s+)['"]@anthropic-ai\/sdk(?:\/[^'"]*)?['"]/,
+    allowedIn: [OUTPUT_SCHEMA_FILE],
     catches: [
       "import Anthropic from '@anthropic-ai/sdk';",
       "import type { Message } from '@anthropic-ai/sdk/resources/messages';",
@@ -66,7 +69,6 @@ const RULES: Rule[] = [
   {
     name: 'SYSTEM_CONTEXT (the client already sends the shared system prompt)',
     pattern: /\bSYSTEM_CONTEXT\b/,
-    allowedIn: [SYSTEM_PROMPT_FILE],
     catches: ["import { SYSTEM_CONTEXT } from './prompts/system';", 'system: SYSTEM_CONTEXT,'],
     allows: ['const SYSTEM_CONTEXTUAL = 1;', 'system: FRAMEWORK_SYSTEM,'],
   },
@@ -97,7 +99,7 @@ function offenders(rule: Rule): string[] {
 describe('AI service guard', () => {
   it('scans the AI services (and skips only client.ts and models.ts)', () => {
     const names = scanned.map(file => nodePath.relative(AI_DIR, file));
-    expect(names).toEqual(expect.arrayContaining(['prompts/system.ts', 'errors.ts']));
+    expect(names).toEqual(expect.arrayContaining(['prompts/system.ts', 'errors.ts', 'outputSchema.ts']));
     expect(names).not.toContain('client.ts');
     expect(names).not.toContain('models.ts');
   });
@@ -114,6 +116,13 @@ describe('AI service guard', () => {
   });
 });
 
+describe('outputSchema.ts', () => {
+  it('imports only the SDK JSON schema transform (no client, no model calls)', () => {
+    const sdkImports = fs.readFileSync(OUTPUT_SCHEMA_FILE, 'utf8').split('\n').filter(line => /@anthropic-ai\/sdk/.test(line) && !/^\s*(\*|\/\/)/.test(line));
+    expect(sdkImports).toEqual(["import { transformJSONSchema } from '@anthropic-ai/sdk/lib/transform-json-schema';"]);
+  });
+});
+
 describe('ESLint: Anthropic SDK imports', () => {
   const eslint = new ESLint({ cwd: ROOT });
   const source = "import Anthropic from '@anthropic-ai/sdk';\nimport { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';\nexport { Anthropic, zodOutputFormat };\n";
@@ -126,6 +135,15 @@ describe('ESLint: Anthropic SDK imports', () => {
   it('rejects the SDK in services and routes', async () => {
     expect(await restrictedImportErrors('src/services/ai/someService.ts')).toBe(2);
     expect(await restrictedImportErrors('src/routes/someRoute.ts')).toBe(2);
+  });
+
+  it('allows only the JSON schema transform in outputSchema.ts', async () => {
+    expect(await restrictedImportErrors('src/services/ai/outputSchema.ts')).toBe(2);
+    const [result] = await eslint.lintText(
+      "import { transformJSONSchema } from '@anthropic-ai/sdk/lib/transform-json-schema';\nexport { transformJSONSchema };\n",
+      { filePath: nodePath.join(ROOT, 'src/services/ai/outputSchema.ts') },
+    );
+    expect(result.messages.filter(m => m.ruleId === 'no-restricted-imports')).toEqual([]);
   });
 
   it('allows the SDK in client.ts, models.ts and tests', async () => {

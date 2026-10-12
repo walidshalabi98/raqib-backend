@@ -1,5 +1,4 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
 import * as z from 'zod/v4';
 import { env } from '../src/config/env';
@@ -18,7 +17,8 @@ import {
   resolveModel,
   retryDelayMs,
 } from '../src/services/ai/client';
-import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from '../src/services/ai/errors';
+import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError, safeErrorSummary } from '../src/services/ai/errors';
+import { outputJsonSchema } from '../src/services/ai/outputSchema';
 import { loadSharedSystemPrompt } from '../src/services/ai/prompts/system';
 import { structuredOutputSchemaProblems } from './aiSchemaHelpers';
 import { hasTestDatabase, resetDatabase } from './helpers';
@@ -126,6 +126,55 @@ describe('resolveModel', () => {
   });
 });
 
+describe('safeErrorSummary', () => {
+  it('keeps AiError messages (built without prompt or answer text) and only the class name otherwise', () => {
+    expect(safeErrorSummary(new AiRefusalError('report.narrative', 'cyber'))).toBe('AiRefusalError: The AI model declined the request (report.narrative, category cyber).');
+    expect(safeErrorSummary(new AiRequestError('qualitative.coding', 429, true, 4))).toBe('AiRequestError: The AI request failed (qualitative.coding, HTTP 429, after 4 attempts).');
+    const dbError = new TypeError(`Unique constraint failed on value ${PROMPT_MARKER}`);
+    expect(safeErrorSummary(dbError)).toBe('TypeError');
+    expect(safeErrorSummary(`raw ${PROMPT_MARKER}`)).toBe('unknown error');
+  });
+});
+
+describe('outputJsonSchema', () => {
+  it('keeps enum and const (the SDK transform would move them into the description)', () => {
+    const shared = z.enum(['a', 'b']);
+    const schema = z.object({
+      level: z.enum(['outcome', 'output']).describe('Result level'),
+      unit: z.enum(['number', 'percentage']).nullable(),
+      kind: z.literal('figure'),
+      rows: z.array(z.object({ method: z.enum(['survey', 'records']), first: shared, second: shared })),
+      note: z.string().min(3),
+    });
+    const sent = outputJsonSchema(schema) as any;
+
+    expect(sent.type).toBe('object');
+    expect(sent.additionalProperties).toBe(false);
+    expect(sent).not.toHaveProperty('$schema');
+    expect(sent).not.toHaveProperty('description');
+    expect(sent.properties.level).toEqual({ type: 'string', description: 'Result level', enum: ['outcome', 'output'] });
+    expect(sent.properties.unit).toEqual({ anyOf: [{ type: 'string', enum: ['number', 'percentage'] }, { type: 'null' }] });
+    expect(sent.properties.kind).toEqual({ type: 'string', const: 'figure' });
+    expect(sent.properties.rows.items.properties.method).toEqual({ type: 'string', enum: ['survey', 'records'] });
+    expect(sent.properties.rows.items.additionalProperties).toBe(false);
+    // Keywords structured outputs do not support still go into the description (and are checked by zod).
+    expect(sent.properties.note).toEqual({ type: 'string', description: '{minLength: 3}' });
+    expect(JSON.stringify(sent)).not.toContain('{enum:');
+    expect(JSON.stringify(sent)).not.toContain('{const:');
+    // A reused schema becomes a $ref; its definition keeps the enum too.
+    expect(sent.properties.rows.items.properties.first).toEqual({ $ref: '#/$defs/__schema0' });
+    expect(sent.$defs).toEqual({ __schema0: { type: 'string', enum: ['a', 'b'] } });
+  });
+
+  it('does not change the zod schema or the answers it accepts', () => {
+    const schema = z.object({ level: z.enum(['outcome', 'output']) });
+    outputJsonSchema(schema);
+    expect(schema.safeParse({ level: 'outcome' }).success).toBe(true);
+    expect(schema.safeParse({ level: 'activity' }).success).toBe(false);
+    expect(outputJsonSchema(schema)).toEqual(outputJsonSchema(schema));
+  });
+});
+
 describe('generateStructured: request', () => {
   it('sends the fast model with the cached shared system prompt, the JSON schema and effort (no fallback for Haiku)', async () => {
     queue(create, response({ model: 'claude-haiku-5-5' }));
@@ -143,10 +192,12 @@ describe('generateStructured: request', () => {
     expect(body.system[0].text).toContain('## 12. Privacy rules');
     expect(body.messages).toEqual([{ role: 'user', content: `Project context ${PROMPT_MARKER}` }]);
     expect(body.output_config).toEqual({
-      format: { type: 'json_schema', schema: zodOutputFormat(answerSchema).schema },
+      format: { type: 'json_schema', schema: outputJsonSchema(answerSchema) },
       effort: 'low',
     });
     expect(body.output_config.format.schema.additionalProperties).toBe(false);
+    // The allowed values are enforced by the API, not just described to the model.
+    expect(body.output_config.format.schema.properties.level).toEqual({ type: 'string', enum: ['outcome', 'output'] });
     expect(body).not.toHaveProperty('betas');
     expect(body).not.toHaveProperty('fallbacks');
     expect(options).toEqual({ timeout: 60000, maxRetries: 0 });

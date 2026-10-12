@@ -59,3 +59,14 @@ export class AiRequestError extends AiError {
     this.name = 'AiRequestError';
   }
 }
+
+/**
+ * One line about a failed AI job that is safe to log: the AiError message (built without
+ * prompt or answer text) or, for any other error, only its class name, because database and
+ * library errors can echo stored values (CLAUDE.md rules 3 and 5).
+ */
+export function safeErrorSummary(err: unknown): string {
+  if (err instanceof AiError) return `${err.name}: ${err.message}`;
+  if (err instanceof Error) return err.name || 'Error';
+  return 'unknown error';
+}

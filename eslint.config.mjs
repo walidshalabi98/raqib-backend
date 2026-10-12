@@ -20,12 +20,24 @@ export default tseslint.config(
   {
     // CLAUDE.md rule 4: AI calls go through src/services/ai/client.ts only.
     files: ['src/**/*.ts'],
-    ignores: ['src/services/ai/client.ts', 'src/services/ai/models.ts'],
+    // outputSchema.ts uses only the SDK's JSON schema transform (no client, no model calls).
+    ignores: ['src/services/ai/client.ts', 'src/services/ai/models.ts', 'src/services/ai/outputSchema.ts'],
     rules: {
       'no-restricted-imports': ['error', {
         patterns: [{
           group: ['@anthropic-ai/sdk', '@anthropic-ai/sdk/*'],
-          message: 'Call the model through generateStructured() in src/services/ai/client.ts (CLAUDE.md rule 4); only client.ts and models.ts may import the Anthropic SDK.',
+          message: 'Call the model through generateStructured() in src/services/ai/client.ts (CLAUDE.md rule 4); only client.ts, models.ts and outputSchema.ts may import the Anthropic SDK.',
+        }],
+      }],
+    },
+  },
+  {
+    files: ['src/services/ai/outputSchema.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          regex: '^@anthropic-ai/sdk(?!/lib/transform-json-schema$)(/.*)?$',
+          message: 'outputSchema.ts may import only the SDK JSON schema transform; model calls go through client.ts (CLAUDE.md rule 4).',
         }],
       }],
     },

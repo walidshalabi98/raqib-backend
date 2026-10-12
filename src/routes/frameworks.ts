@@ -11,6 +11,7 @@ import { levelForResult, sortResultNodes } from '../services/indicators/hierarch
 import { assertIndicatorReferences } from '../services/indicators/references';
 import { INDICATOR_INCLUDE, INDICATOR_LIST_INCLUDE, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
 import { parseIndicatorCreate, toIndicatorCreateData } from '../services/indicators/validation';
+import { safeErrorSummary } from '../services/ai/errors';
 
 const router = Router();
 
@@ -66,7 +67,7 @@ router.post('/projects/:id/framework/generate', authenticate, authorize('org_adm
 
   // Run AI generation inline (async, don't block the response)
   generateFramework(framework.id, req.params.id).catch(err => {
-    console.error(`[Framework] Generation failed for ${framework.id}:`, err);
+    console.error(`[Framework] Generation failed for ${framework.id}: ${safeErrorSummary(err)}`);
     // Update framework status to indicate failure
     prisma.framework.update({
       where: { id: framework.id },

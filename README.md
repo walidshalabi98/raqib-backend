@@ -41,7 +41,23 @@ The server refuses to start if a required value is missing and lists what is wro
 | `ANTHROPIC_API_KEY` | Claude API key |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | required in production for private document storage |
 
-Everything else is optional and documented in `.env.example`. Security-related setup (storage bucket, webhook tokens, migrating old uploads) is in [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md). The Phase 2 data model (results chain, indicator reference sheets, breakdowns, library) and the rollout steps for its SQL are in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
+Optional AI settings (defaults in brackets):
+
+| Variable | Notes |
+|---|---|
+| `AI_MODEL_MAIN` | model for long, careful work: frameworks, reports, assessments [`claude-sonnet-5-5`] |
+| `AI_MODEL_FAST` | model for short tasks: document analysis, alternatives, qualitative coding, risk [`claude-haiku-5-5`] |
+| `AI_REQUEST_TIMEOUT_MS` | timeout per AI request, at least 1000 [`60000`]; framework and report calls use longer ones |
+| `AI_MAX_RETRIES` | retries after rate limits, overloads, server and network errors, 0–10 [`3`] |
+| `AI_REFUSAL_FALLBACK` | `default`: a refused request is re-run on Anthropic's fallback model (Sonnet 5.5, Opus 5, Opus 5.5); `off`: refusals are errors [`default`] |
+| `VOYAGE_API_KEY` | embeddings for the indicator library; without it search uses keywords [empty] |
+| `VOYAGE_MODEL` | Voyage embedding model [`voyage-4`] |
+
+Everything else is optional and documented in `.env.example`. Security-related setup (storage bucket, webhook tokens, migrating old uploads, what is sent to AI providers) is in [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md). The data model (Phase 2: results chain, indicator reference sheets, breakdowns, library; Phase 3: the AiCall log and Document.aiAnalysis) and the rollout steps for its SQL are in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
+
+## AI layer
+
+All model calls go through `src/services/ai/client.ts` (`generateStructured`): services pick a tier (`main` or `fast`), never a model id. Every call uses structured outputs validated again with zod, sends the shared system prompt (role + `knowledge/me-foundations.md` §1–12, prompt-cached), retries rate limits and server errors, retries a cut-off answer once, turns refusals into typed errors, and writes one `AiCall` row (tokens, latency, estimated cost; never prompt or answer text). Document text is redacted (phone numbers, ID numbers, email addresses) before it is stored or sent. Details, prompt versions and privacy limits: [`docs/AI.md`](docs/AI.md).
 
 ## Commands
 
@@ -55,8 +71,9 @@ Everything else is optional and documented in `.env.example`. Security-related s
 | `npm run typecheck` | type-check source, tests, scripts and seed |
 | `npm test` | Vitest unit and integration tests (see below) |
 | `npm run seed` | reset and seed demo data — **deletes all data**, refuses to run in production; also loads the indicator library |
-| `npm run seed:library` | load or update the indicator library from `knowledge/indicator-library.json` (idempotent, never deletes; safe in any environment; `-- path/to/draft.json` checks a draft file) |
-| `npm run verify:migration` | prove `prisma/sql/2026-10-11_phase2_data_model.sql` on throwaway local databases (needs git history and local Postgres) |
+| `npm run seed:library` | load or update the indicator library from `knowledge/indicator-library.json` (idempotent, never deletes; safe in any environment; `-- path/to/draft.json` checks a draft file). With `VOYAGE_API_KEY` set, entries without an embedding are embedded (`VOYAGE_MODEL`, 1024 dimensions) and a second run embeds nothing; `-- --reembed` re-embeds every entry (needed after changing `VOYAGE_MODEL`). Without the key it prints "Embeddings skipped". Needs the API environment (`.env`), not only `DATABASE_URL` |
+| `npm run verify:migration` | prove the Phase 2 and Phase 3 SQL (`prisma/sql/2026-10-11_phase2_data_model.sql`, `prisma/sql/2026-10-12_phase3_ai_foundation.sql`) and the Phase 0, Phase 2, Phase 3 rollout order on throwaway local databases (needs git history and local Postgres with pgvector) |
+| `npm run ai:smoke -- --yes` | **calls the real Anthropic API and costs money** (one or two main-tier calls): generates a framework for the dev seed project (or `--project <id>`) on a development database and prints the indicators, the fields still to be confirmed and the AiCall rows. Needs a real `ANTHROPIC_API_KEY`; refuses in production; adds a framework version it never deletes. See [`docs/AI.md`](docs/AI.md) §10 |
 | `npm run storage:setup` | create the private Supabase Storage bucket |
 | `npm run storage:migrate` | move pre-Phase-0 files from `uploads/` to private storage (dry run; add `-- --apply`) |
 
@@ -70,7 +87,7 @@ DATABASE_URL=$TEST_DATABASE_URL DIRECT_URL=$TEST_DATABASE_URL npx prisma db push
 npm test
 ```
 
-Without `TEST_DATABASE_URL` the integration tests are skipped. AI calls are always mocked in tests.
+Without `TEST_DATABASE_URL` the integration tests are skipped. AI calls are always mocked in tests (`tests/setup.ts` also points the SDK at an unreachable address, so an unmocked call fails at once); `npm run ai:smoke` is the only command that calls the real API.
 
 ## Continuous integration
 
@@ -85,7 +102,8 @@ src/
   config/           env validation, Prisma, Redis
   middleware/       auth, organisation access checks, rate limits, uploads, webhooks, errors
   routes/           REST endpoints
-  services/ai/      AI features (framework generator, report narrative, …)
+  services/ai/      AI client, prompts, redaction, embeddings and features (see docs/AI.md)
+  services/library  indicator library loading, seeding and embedding
   services/storage  private file storage (Supabase / local)
   jobs/             BullMQ queues and worker
 prisma/             schema, seed, reviewed SQL for shared databases
