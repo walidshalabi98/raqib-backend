@@ -30,10 +30,11 @@ const FRAMEWORK_DETAIL_INCLUDE = {
 const CURRENT_FRAMEWORK = { generationError: null } satisfies Prisma.FrameworkWhereInput;
 
 /**
- * A draft that is still empty this long after it was created belongs to an interrupted run (a normal
- * run takes a few minutes). If a very slow run still finishes later, its status becomes "completed".
+ * A draft that is still empty this long after it was created belongs to an interrupted run. A normal
+ * run takes a few minutes; the slowest possible run (every timeout and max_tokens retry used) takes
+ * about 30, so the limit sits well above it and a slow run is never reported as failed.
  */
-export const INTERRUPTED_GENERATION_MS = 15 * 60 * 1000;
+export const INTERRUPTED_GENERATION_MS = 45 * 60 * 1000;
 
 export const INTERRUPTED_GENERATION_MESSAGE = 'Framework generation did not finish (the run was interrupted). Generate a new version to try again.';
 

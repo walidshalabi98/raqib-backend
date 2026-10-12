@@ -25,10 +25,10 @@ describe('generationFailure', () => {
   });
 
   it('reports an empty AI draft as interrupted only after the time limit', () => {
-    expect(INTERRUPTED_GENERATION_MS).toBe(15 * MINUTE);
+    expect(INTERRUPTED_GENERATION_MS).toBe(45 * MINUTE);
     expect(generationFailure(draft, now)).toBeNull();
-    expect(generationFailure({ ...draft, generatedAt: new Date(now.getTime() - 15 * MINUTE) }, now)).toBeNull();
-    expect(generationFailure({ ...draft, generatedAt: new Date(now.getTime() - 16 * MINUTE) }, now)).toBe(INTERRUPTED_GENERATION_MESSAGE);
+    expect(generationFailure({ ...draft, generatedAt: new Date(now.getTime() - 45 * MINUTE) }, now)).toBeNull();
+    expect(generationFailure({ ...draft, generatedAt: new Date(now.getTime() - 46 * MINUTE) }, now)).toBe(INTERRUPTED_GENERATION_MESSAGE);
   });
 
   it('never reports a manual framework, a framework with content or a reviewed framework as interrupted', () => {
