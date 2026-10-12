@@ -5,6 +5,7 @@ import { assertFrameworkAccess, assertProjectAccess } from '../middleware/access
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
+import { resolveModel } from '../services/ai/client';
 import { generateFramework } from '../services/ai/frameworkGenerator';
 import { levelForResult, sortResultNodes } from '../services/indicators/hierarchy';
 import { assertIndicatorReferences } from '../services/indicators/references';
@@ -58,7 +59,8 @@ router.post('/projects/:id/framework/generate', authenticate, authorize('org_adm
       projectId: req.params.id,
       version: (latest?.version || 0) + 1,
       status: 'draft',
-      aiModelUsed: 'claude-sonnet-4-20250514',
+      // The configured main model; the generator replaces it with the model that served the answer.
+      aiModelUsed: resolveModel('main'),
     },
   });
 

@@ -7,12 +7,26 @@
  * - AiMessage, ModelTier, AiEffort, AiCallContext, GenerateStructuredParams, StructuredResult
  * Errors are the typed classes in ./errors.
  *
- * STATUS: contract stub. The implementation (structured outputs, retries, timeouts,
- * max_tokens retry, refusal handling, prompt caching of the shared system prompt,
- * AiCall logging) is being written; until then generateStructured throws.
+ * Every call:
+ * - sends the shared system prompt (role + knowledge/me-foundations.md §1–12) first, marked
+ *   for prompt caching, then the feature's own instructions;
+ * - asks for structured output (output_config.format, JSON schema from the zod/v4 schema),
+ *   parses the text blocks and validates the answer again with the same schema;
+ * - retries rate limits, overloads, server errors and network failures with exponential
+ *   backoff (own loop; the SDK's retries are off), retries a cut-off answer once with a
+ *   higher token limit, and turns refusals into AiRefusalError;
+ * - writes exactly one AiCall row (ids, token counts, latency, cost; never prompt or answer
+ *   text) and one console line with the same numbers.
  */
+import Anthropic from '@anthropic-ai/sdk';
+import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import type * as z from 'zod/v4';
+import type { AiCallStatus } from '@prisma/client';
 import { env } from '../../config/env';
+import { prisma } from '../../config/prisma';
+import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from './errors';
+import { estimateCostUsd, roundUsd, supportsEffort, supportsServerFallback } from './models';
+import { loadSharedSystemPrompt } from './prompts/system';
 
 /** Which configured model to use: main = AI_MODEL_MAIN (default claude-sonnet-5-5), fast = AI_MODEL_FAST (default claude-haiku-5-5). */
 export type ModelTier = 'main' | 'fast';
@@ -83,9 +97,147 @@ export interface StructuredResult<T> {
   aiCallId: string | null;
 }
 
+/** Highest output token limit used for the one retry after stop_reason "max_tokens". */
+export const MAX_TOKENS_CEILING = 64_000;
+/** Backoff: 1s · 2^(retry-1), with jitter, never more than 30s (also caps retry-after). */
+export const RETRY_BASE_DELAY_MS = 1_000;
+export const RETRY_MAX_DELAY_MS = 30_000;
+/** A timed-out request is retried at most this many times per call (timeouts are slow and costly). */
+export const MAX_TIMEOUT_RETRIES = 1;
+/** Server-side refusal fallback ("default" routing by refusal category). */
+export const REFUSAL_FALLBACK_BETA = 'server-side-fallback-2026-07-01';
+
 /** Model id for a tier, from the validated env (never hard-coded in services). */
 export function resolveModel(tier: ModelTier): string {
   return tier === 'fast' ? env.aiModelFast : env.aiModelMain;
+}
+
+// ---------------------------------------------------------------------------
+// SDK seam: the minimal surface of the Anthropic client this module uses.
+
+type CreateMessage = (body: any, options?: { timeout?: number; maxRetries?: number }) => Promise<unknown>;
+
+/** The parts of the Anthropic client used here (tests pass a fake through configureAiClientForTests). */
+export interface AiSdkClient {
+  messages: { create: CreateMessage };
+  beta: { messages: { create: CreateMessage } };
+}
+
+/** The fields of a Messages API response this module reads. */
+interface SdkResponse {
+  model?: string;
+  stop_reason?: string | null;
+  stop_details?: { category?: string | null } | null;
+  content?: Array<{ type: string; text?: string }>;
+  usage?: {
+    input_tokens?: number | null;
+    output_tokens?: number | null;
+    cache_read_input_tokens?: number | null;
+    cache_creation_input_tokens?: number | null;
+  } | null;
+}
+
+/** What is stored in the AiCall table (ids and numbers only). */
+export interface AiCallRecord {
+  feature: string;
+  model: string;
+  servedModel: string | null;
+  promptVersion: string;
+  systemPromptVersion: string | null;
+  status: AiCallStatus;
+  stopReason: string | null;
+  errorType: string | null;
+  attempts: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  latencyMs: number;
+  estimatedCostUsd: number | null;
+  organizationId: string | null;
+  projectId: string | null;
+}
+
+/** Writes one AiCall row and returns its id. */
+export type AiCallLogger = (record: AiCallRecord) => Promise<string | null>;
+
+interface Deps {
+  anthropic: () => AiSdkClient;
+  sleep: (ms: number) => Promise<void>;
+  random: () => number;
+  logCall: AiCallLogger;
+  now: () => number;
+}
+
+let sdkClient: AiSdkClient | null = null;
+
+function defaultAnthropic(): AiSdkClient {
+  if (!sdkClient) {
+    sdkClient = new Anthropic({ apiKey: env.anthropicApiKey, maxRetries: 0, timeout: env.aiRequestTimeoutMs }) as unknown as AiSdkClient;
+  }
+  return sdkClient;
+}
+
+/** Default AiCall logger: one row in the AiCall table. */
+export async function writeAiCall(record: AiCallRecord): Promise<string | null> {
+  const row = await prisma.aiCall.create({ data: record, select: { id: true } });
+  return row.id;
+}
+
+const defaultDeps: Deps = {
+  anthropic: defaultAnthropic,
+  sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+  random: Math.random,
+  logCall: writeAiCall,
+  now: () => Date.now(),
+};
+
+let deps: Deps = { ...defaultDeps };
+
+/**
+ * Test seam: replace the SDK client, sleep, randomness, clock or AiCall logger.
+ * Production code never calls this.
+ */
+export function configureAiClientForTests(overrides: {
+  anthropic?: AiSdkClient;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  logCall?: AiCallLogger;
+  now?: () => number;
+}): void {
+  const { anthropic, ...rest } = overrides;
+  deps = { ...deps, ...rest, ...(anthropic ? { anthropic: () => anthropic } : {}) };
+}
+
+/** Restores the real SDK client, timers and logger (and drops the cached SDK client). */
+export function resetAiClientForTests(): void {
+  deps = { ...defaultDeps };
+  sdkClient = null;
+}
+
+// ---------------------------------------------------------------------------
+
+/** Mutable bookkeeping for one generateStructured call; becomes the AiCall row. */
+interface CallState {
+  attempts: number;
+  timeoutRetries: number;
+  usage: AiUsage;
+  /** Sum of per-response cost estimates; null once any response's model has no known price. */
+  cost: number | null;
+  servedModel: string | null;
+  stopReason: string | null;
+}
+
+/** Thrown inside the retry loop; carries what the AiCall row and the AiRequestError need. */
+class RequestFailure extends Error {
+  constructor(
+    readonly status: number | null,
+    readonly retryable: boolean,
+    /** The SDK (or other) error of the last attempt. */
+    readonly original: unknown,
+  ) {
+    super('AI request failed');
+  }
 }
 
 /**
@@ -93,5 +245,246 @@ export function resolveModel(tier: ModelTier): string {
  * Throws AiRefusalError, AiOutputTruncatedError, AiInvalidOutputError or AiRequestError (./errors).
  */
 export async function generateStructured<S extends z.ZodType>(params: GenerateStructuredParams<S>): Promise<StructuredResult<z.infer<S>>> {
-  throw new Error(`generateStructured is not implemented yet (${params.feature})`);
+  const started = deps.now();
+  const model = resolveModel(params.model);
+  const shared = loadSharedSystemPrompt();
+  const state: CallState = {
+    attempts: 0,
+    timeoutRetries: 0,
+    usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    cost: 0,
+    servedModel: null,
+    stopReason: null,
+  };
+
+  const finish = async (status: AiCallStatus, errorType: string | null): Promise<string | null> => {
+    const record: AiCallRecord = {
+      feature: params.feature,
+      model,
+      servedModel: state.servedModel,
+      promptVersion: params.promptVersion,
+      systemPromptVersion: shared.version,
+      status,
+      stopReason: state.stopReason,
+      errorType,
+      attempts: state.attempts,
+      ...state.usage,
+      latencyMs: Math.max(0, Math.round(deps.now() - started)),
+      estimatedCostUsd: state.cost === null ? null : roundUsd(state.cost),
+      organizationId: params.context?.organizationId ?? null,
+      projectId: params.context?.projectId ?? null,
+    };
+    logLine(record);
+    try {
+      return await deps.logCall(record);
+    } catch (err) {
+      console.warn(`[ai] could not write the AiCall row for ${params.feature}: ${(err as Error)?.name ?? 'Error'}`);
+      return null;
+    }
+  };
+
+  const outputFormat = zodOutputFormat(params.schema);
+  const effort = params.effort ?? 'medium';
+  const useFallback = env.aiRefusalFallback === 'default' && supportsServerFallback(model);
+  const buildBody = (maxTokens: number) => ({
+    model,
+    max_tokens: maxTokens,
+    system: [
+      { type: 'text', text: shared.text, cache_control: { type: 'ephemeral' } },
+      ...(params.system ? [{ type: 'text', text: params.system }] : []),
+    ],
+    messages: params.messages.map(m => ({ role: m.role, content: m.content })),
+    output_config: {
+      format: { type: 'json_schema', schema: outputFormat.schema },
+      ...(supportsEffort(model) ? { effort } : {}),
+    },
+    ...(useFallback ? { betas: [REFUSAL_FALLBACK_BETA], fallbacks: 'default' } : {}),
+  });
+
+  let maxTokens = params.maxTokens;
+  let timeoutMs = params.timeoutMs ?? env.aiRequestTimeoutMs;
+  let response: SdkResponse;
+  try {
+    response = await send(buildBody(maxTokens), timeoutMs, useFallback, state);
+    const retryLimit = Math.min(2 * params.maxTokens, MAX_TOKENS_CEILING);
+    if (response.stop_reason === 'max_tokens' && retryLimit > maxTokens) {
+      maxTokens = retryLimit;
+      timeoutMs *= 2;
+      response = await send(buildBody(maxTokens), timeoutMs, useFallback, state);
+    }
+  } catch (err) {
+    const failure = err instanceof RequestFailure ? err : new RequestFailure(null, false, err);
+    await finish('error', errorName(failure.original));
+    throw new AiRequestError(params.feature, failure.status, failure.retryable, state.attempts);
+  }
+
+  // Refusal first: the content of a refused response is not read.
+  if (response.stop_reason === 'refusal') {
+    const error = new AiRefusalError(params.feature, response.stop_details?.category ?? null);
+    await finish('refusal', error.name);
+    throw error;
+  }
+  if (response.stop_reason === 'max_tokens') {
+    const error = new AiOutputTruncatedError(params.feature, maxTokens);
+    await finish('max_tokens', error.name);
+    throw error;
+  }
+
+  const text = (response.content ?? [])
+    .filter(block => block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Never include the parser message: it quotes part of the answer.
+    const error = new AiInvalidOutputError(params.feature, [text.trim() ? 'root: not valid JSON' : 'root: empty answer']);
+    await finish('invalid_output', error.name);
+    throw error;
+  }
+  const result = params.schema.safeParse(parsed);
+  if (!result.success) {
+    const error = new AiInvalidOutputError(params.feature, describeIssues(result.error.issues));
+    await finish('invalid_output', error.name);
+    throw error;
+  }
+
+  const aiCallId = await finish('success', null);
+  return {
+    data: result.data as z.infer<S>,
+    model: state.servedModel ?? model,
+    promptVersion: params.promptVersion,
+    usage: { ...state.usage },
+    estimatedCostUsd: state.cost === null ? null : roundUsd(state.cost),
+    aiCallId,
+  };
+}
+
+/**
+ * One logical request: HTTP attempts with retries and backoff (at most AI_MAX_RETRIES
+ * retries per request, and MAX_TIMEOUT_RETRIES timeouts per call). Adds usage and cost to `state`.
+ */
+async function send(body: Record<string, unknown>, timeoutMs: number, beta: boolean, state: CallState): Promise<SdkResponse> {
+  const client = deps.anthropic();
+  const options = { timeout: timeoutMs, maxRetries: 0 };
+  let retries = 0;
+  for (;;) {
+    state.attempts += 1;
+    try {
+      const response = (await (beta ? client.beta.messages.create(body, options) : client.messages.create(body, options))) as SdkResponse;
+      recordResponse(response, state);
+      return response;
+    } catch (err) {
+      const { status, retryable, isTimeout } = classify(err);
+      const allowed = retryable && retries < env.aiMaxRetries && (!isTimeout || state.timeoutRetries < MAX_TIMEOUT_RETRIES);
+      if (!allowed) throw new RequestFailure(status, retryable, err);
+      retries += 1;
+      if (isTimeout) state.timeoutRetries += 1;
+      await deps.sleep(retryDelayMs(retries, err));
+    }
+  }
+}
+
+function recordResponse(response: SdkResponse, state: CallState): void {
+  const usage: AiUsage = {
+    inputTokens: response.usage?.input_tokens ?? 0,
+    outputTokens: response.usage?.output_tokens ?? 0,
+    cacheReadTokens: response.usage?.cache_read_input_tokens ?? 0,
+    cacheWriteTokens: response.usage?.cache_creation_input_tokens ?? 0,
+  };
+  state.usage.inputTokens += usage.inputTokens;
+  state.usage.outputTokens += usage.outputTokens;
+  state.usage.cacheReadTokens += usage.cacheReadTokens;
+  state.usage.cacheWriteTokens += usage.cacheWriteTokens;
+  state.servedModel = response.model ?? state.servedModel;
+  state.stopReason = response.stop_reason ?? null;
+  const cost = estimateCostUsd(response.model, usage);
+  state.cost = state.cost === null || cost === null ? null : state.cost + cost;
+}
+
+/** Retry policy by SDK error class and HTTP status (never by message text). */
+function classify(err: unknown): { status: number | null; retryable: boolean; isTimeout: boolean } {
+  if (err instanceof Anthropic.APIConnectionTimeoutError) return { status: null, retryable: true, isTimeout: true };
+  if (err instanceof Anthropic.APIUserAbortError) return { status: null, retryable: false, isTimeout: false };
+  if (err instanceof Anthropic.APIConnectionError) return { status: null, retryable: true, isTimeout: false };
+  if (err instanceof Anthropic.APIError && typeof err.status === 'number') {
+    const status = err.status;
+    const shouldRetry = header(err, 'x-should-retry');
+    if (shouldRetry === 'true') return { status, retryable: true, isTimeout: false };
+    if (shouldRetry === 'false') return { status, retryable: false, isTimeout: false };
+    return { status, retryable: status === 408 || status === 409 || status === 429 || status >= 500, isTimeout: false };
+  }
+  return { status: null, retryable: false, isTimeout: false };
+}
+
+/** Delay before retry number `retry` (1-based): retry-after-ms / retry-after when given, else exponential backoff with jitter; at most 30s. */
+export function retryDelayMs(retry: number, err?: unknown, random: () => number = deps.random): number {
+  const retryAfter = retryAfterMs(err);
+  if (retryAfter !== null) return Math.min(retryAfter, RETRY_MAX_DELAY_MS);
+  const jitter = 1 - random() * 0.25;
+  return Math.min(RETRY_BASE_DELAY_MS * 2 ** (retry - 1) * jitter, RETRY_MAX_DELAY_MS);
+}
+
+function retryAfterMs(err: unknown): number | null {
+  const ms = Number.parseFloat(header(err, 'retry-after-ms') ?? '');
+  if (Number.isFinite(ms) && ms >= 0) return ms;
+  const value = header(err, 'retry-after');
+  if (!value) return null;
+  const seconds = Number.parseFloat(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+}
+
+function header(err: unknown, name: string): string | null {
+  const headers = (err as { headers?: unknown } | null)?.headers;
+  if (!headers) return null;
+  if (typeof (headers as Headers).get === 'function') return (headers as Headers).get(name);
+  const value = (headers as Record<string, unknown>)[name];
+  return typeof value === 'string' ? value : null;
+}
+
+/**
+ * "path: problem" strings for the AiInvalidOutputError and logs. Built from the issue code
+ * and schema facts only, so no value from the answer (which may hold document text) leaks.
+ */
+export function describeIssues(issues: ReadonlyArray<z.core.$ZodIssue>): string[] {
+  return issues.slice(0, 20).map(issue => {
+    const path = issue.path.length ? issue.path.map(p => (typeof p === 'number' ? `[${p}]` : String(p))).join('.').replace(/\.\[/g, '[') : 'root';
+    return `${path}: ${describeIssue(issue)}`;
+  });
+}
+
+function describeIssue(issue: z.core.$ZodIssue): string {
+  switch (issue.code) {
+    case 'invalid_type':
+      return `expected ${issue.expected}`;
+    case 'invalid_value':
+      return 'not one of the allowed values';
+    case 'unrecognized_keys':
+      return `${issue.keys.length} unexpected key(s)`;
+    case 'too_small':
+      return `too small (minimum ${String(issue.minimum)})`;
+    case 'too_big':
+      return `too big (maximum ${String(issue.maximum)})`;
+    case 'invalid_union':
+      return 'does not match any allowed shape';
+    default:
+      return issue.code;
+  }
+}
+
+function errorName(err: unknown): string {
+  if (err instanceof Error) return err.constructor?.name || err.name || 'Error';
+  return typeof err;
+}
+
+/** One line per call with numbers only (never prompt or answer text). */
+function logLine(r: AiCallRecord): void {
+  console.info(
+    `[ai] ${r.feature} status=${r.status} model=${r.servedModel ?? r.model} attempts=${r.attempts}` +
+      ` tokens in=${r.inputTokens} out=${r.outputTokens} cacheRead=${r.cacheReadTokens} cacheWrite=${r.cacheWriteTokens}` +
+      ` latencyMs=${r.latencyMs} costUsd=${r.estimatedCostUsd ?? 'unknown'}`,
+  );
 }

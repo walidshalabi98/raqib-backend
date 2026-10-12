@@ -17,4 +17,17 @@ export default tseslint.config(
       '@typescript-eslint/no-namespace': ['error', { allowDeclarations: true }],
     },
   },
+  {
+    // CLAUDE.md rule 4: AI calls go through src/services/ai/client.ts only.
+    files: ['src/**/*.ts'],
+    ignores: ['src/services/ai/client.ts', 'src/services/ai/models.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          group: ['@anthropic-ai/sdk', '@anthropic-ai/sdk/*'],
+          message: 'Call the model through generateStructured() in src/services/ai/client.ts (CLAUDE.md rule 4); only client.ts and models.ts may import the Anthropic SDK.',
+        }],
+      }],
+    },
+  },
 );

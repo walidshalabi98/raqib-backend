@@ -1,15 +1,18 @@
 import fs from 'fs';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { CollectionMethod, Frequency, IndicatorDirection } from '@prisma/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AI_ANALYSIS_MARKER,
   DEFAULT_TARGET_METHOD,
   LibraryCandidate,
   LibraryEntryReference,
   NormalizeIndicatorsContext,
+  REFERENCE_SHEET_FIELDS,
   SourceDocument,
   TO_BE_CONFIRMED,
   appearsInDocuments,
   buildStructureFromMetadata,
+  documentTextForAi,
   ensureSexDisaggregation,
   extractIndicatorList,
   findSourceDocument,
@@ -27,6 +30,7 @@ import {
   normalizeProjectStructure,
   planResultNodes,
   projectSectors,
+  referenceSheetGaps,
   resolveBaselineAndTarget,
   resolveResult,
   selectLibraryCandidates,
@@ -35,23 +39,40 @@ import {
   structureForPrompt,
   withLibrarySexDisaggregation,
 } from '../src/services/ai/frameworkNormalize';
-import { FRAMEWORK_PROMPT_VERSION, extractProjectStructurePrompt, generateFrameworkPrompt } from '../src/services/ai/prompts/framework';
+import {
+  FRAMEWORK_DIRECTIONS,
+  FRAMEWORK_FREQUENCIES,
+  FRAMEWORK_INDICATORS_SCHEMA,
+  FRAMEWORK_INDICATORS_SYSTEM,
+  FRAMEWORK_METHODS,
+  FRAMEWORK_PROMPT_VERSION,
+  FRAMEWORK_STRUCTURE_SYSTEM,
+  INDICATOR_UNITS,
+  PROJECT_STRUCTURE_SCHEMA,
+  STRUCTURE_DOCUMENT_MAX_CHARS,
+  extractProjectStructurePrompt,
+  generateFrameworkPrompt,
+} from '../src/services/ai/prompts/framework';
+import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from '../src/services/ai/errors';
+import type { GenerateStructuredParams, StructuredResult } from '../src/services/ai/client';
 import { prisma } from '../src/config/prisma';
 import { DEFAULT_LIBRARY_PATH } from '../src/services/library/load';
+import { structuredOutputSchemaProblems } from './aiSchemaHelpers';
 import { hasTestDatabase, resetDatabase } from './helpers';
 
 // tests/setup.ts mocks the generator for every other test file; this file tests the real one
-// with the Anthropic SDK mocked, so no model is ever called.
+// with the AI client mocked (generateStructured), so no model is ever called.
 vi.unmock('../src/services/ai/frameworkGenerator');
 
-const { createMessage } = vi.hoisted(() => ({ createMessage: vi.fn() }));
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: class Anthropic {
-    messages = { create: createMessage };
-  },
+const { generateStructured } = vi.hoisted(() => ({ generateStructured: vi.fn() }));
+vi.mock('../src/services/ai/client', () => ({
+  generateStructured,
+  resolveModel: (tier: 'main' | 'fast') => (tier === 'main' ? 'configured-main-model' : 'configured-fast-model'),
 }));
 
-const MODEL = 'claude-sonnet-4-20250514';
+/** The model that "served" the mocked answers (generateStructured returns the served model, not the configured one). */
+const SERVED_MODEL = 'claude-sonnet-5-5-20261001';
+const MODEL = SERVED_MODEL;
 
 // ---------------------------------------------------------------- fixtures
 
@@ -77,7 +98,7 @@ const AI_ANALYSIS = `\n\n${AI_ANALYSIS_MARKER}\n{"targets_mentioned":[{"indicato
 
 /** The seed library (knowledge/indicator-library.json). */
 const LIBRARY_FILE = JSON.parse(fs.readFileSync(DEFAULT_LIBRARY_PATH, 'utf8')) as {
-  indicators: Array<LibraryEntryReference & { name: string; nameAr: string }>;
+  indicators: Array<LibraryEntryReference & { name: string; nameAr: string; unit: string }>;
 };
 const seedEntry = (id: string) => {
   const entry = LIBRARY_FILE.indicators.find(e => e.id === id);
@@ -120,7 +141,7 @@ function aiIndicator(overrides: Record<string, unknown> = {}): Record<string, un
     indicatorText: '% of trainees employed or self-employed six months after completing training',
     indicatorTextAr: 'نسبة المتدربين العاملين أو العاملين لحسابهم الخاص بعد ستة أشهر من إتمام التدريب',
     libraryId: 'LV-01',
-    standardReferenceCode: null,
+    standardReferenceCode: '',
     definition: 'Trainees who report paid work or self-employment at the six-month tracer survey.',
     unit: 'percent',
     calculation: { numerator: 'Trainees employed at six months', denominator: 'Trainees reached by the tracer survey', formula: 'numerator ÷ denominator × 100' },
@@ -646,7 +667,7 @@ describe('frameworkNormalize: indicators', () => {
       sortOrder: 0,
       provenance: 'ai_generated',
       aiModel: MODEL,
-      promptVersion: 'framework-v3',
+      promptVersion: 'framework-v4',
     });
     expect(p.startDate).toEqual(new Date('2026-07-01T00:00:00.000Z'));
     expect(p.milestones).toEqual([{ label: 'First tracer survey', date: '2026-12-15', completed: false }]);
@@ -735,11 +756,16 @@ describe('frameworkNormalize: indicators', () => {
       baselineMethod: '   ',
       targetValue: '',
       targetBasis: 'none',
+      assumptions: '',
+      responsibility: ' ',
     })], ctx());
     expect(p.disaggregation).toEqual(['sex', 'location']);
     expect(p.definition).toBe(TO_BE_CONFIRMED);
     expect(p.meansOfVerification).toBe(TO_BE_CONFIRMED);
     expect(p.baselineMethod).toBe(TO_BE_CONFIRMED);
+    expect(p.assumptions).toBe(TO_BE_CONFIRMED);
+    expect(p.responsibility).toBe(TO_BE_CONFIRMED);
+    expect(p.targetJustification).toBe(`Proposed method: ${DEFAULT_TARGET_METHOD} — confirm after baseline.`);
     expect(p.calculation).toBeUndefined();
     expect(p.targetValue).toBeNull();
   });
@@ -796,22 +822,200 @@ describe('frameworkNormalize: indicators', () => {
   });
 });
 
-// ---------------------------------------------------------------- prompts
+// ------------------------------------------------- "" from the structured answer
 
-describe('framework prompts', () => {
+/** An indicator answer as the schema allows it when the model knows almost nothing: every free text "". */
+function emptyAnswerIndicator(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    resultCode: 'O1', level: 'outcome', indicatorText: '% of graduates employed six months after training', indicatorTextAr: '',
+    libraryId: '', standardReferenceCode: '', definition: '', unit: 'percent', calculation: { numerator: '', denominator: '', formula: '' },
+    direction: 'increase', disaggregation: [], dataCollectionMethod: 'hh_survey', frequency: 'biannual', meansOfVerification: '',
+    baselineValue: '', baselineBasis: 'none', baselineMethod: '', targetValue: '', targetBasis: 'none', targetJustification: '',
+    assumptions: '', responsibility: '', phases: [], startDate: '', endDate: '',
+    milestones: [{ label: 'Baseline survey', date: '', completed: false }], aiRationale: '',
+    ...overrides,
+  };
+}
+
+describe('frameworkNormalize: "" in the structured answer means missing', () => {
+  it('the empty answer is schema-valid', () => {
+    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [emptyAnswerIndicator()] }).success).toBe(true);
+  });
+
+  it('treats "" as missing in every field and marks the reference sheet "to be confirmed"', () => {
+    const [p] = normalizeIndicators({ indicators: [emptyAnswerIndicator()] }, ctx());
+    expect(p).toMatchObject({
+      indicatorTextAr: null,
+      libraryId: null,
+      standardReferenceCode: null,
+      definition: TO_BE_CONFIRMED,
+      calculation: { numerator: TO_BE_CONFIRMED, denominator: TO_BE_CONFIRMED, formula: 'numerator ÷ denominator × 100' },
+      direction: 'increase',
+      disaggregation: ['sex'],
+      meansOfVerification: TO_BE_CONFIRMED,
+      baselineValue: null,
+      baselineMethod: TO_BE_CONFIRMED,
+      targetValue: null,
+      targetJustification: `Proposed method: ${DEFAULT_TARGET_METHOD} — confirm after baseline.`,
+      assumptions: TO_BE_CONFIRMED,
+      responsibility: TO_BE_CONFIRMED,
+      phases: ['baseline', 'midterm', 'endline'],
+      aiRationale: null,
+    });
+    expect(p.startDate).toBeUndefined();
+    expect(p.endDate).toBeUndefined();
+    expect(p.milestones).toEqual([{ label: 'Baseline survey', completed: false }]);
+  });
+
+  it('stores no calculation for a count whose calculation parts are all ""', () => {
+    const [p] = normalizeIndicators({ indicators: [emptyAnswerIndicator({ indicatorText: 'Number of hygiene kits distributed', unit: 'number' })] }, ctx());
+    expect(p.calculation).toBeUndefined();
+  });
+
+  it('does not treat "" values with a document basis as removed figures', () => {
+    const [p] = normalizeIndicators({
+      indicators: [emptyAnswerIndicator({ baselineBasis: 'document', targetBasis: 'document', targetJustification: 'baseline + 10 percentage points' })],
+    }, ctx());
+    expect(p).toMatchObject({ baselineValue: null, targetValue: null });
+    expect(p.targetJustification).toBe('Proposed method: baseline + 10 percentage points — confirm after baseline.');
+  });
+
+  it('keeps only the known facts of the structure answer', () => {
+    const s = normalizeProjectStructure({
+      goal: { code: 'G', text: 'Improved livelihoods', textAr: '' },
+      outcomes: [{
+        code: 'O1', text: 'Graduates find work', textAr: '',
+        outputs: [
+          { code: '', text: '', textAr: '', activities: [''] },
+          { code: 'O1.1', text: 'Youth trained', textAr: '', activities: ['', 'Deliver training'] },
+        ],
+      }],
+      beneficiaries: { total: null, types: ['', 'Young women and men'], disaggregation: [] },
+      timeline: { startDate: '', endDate: '2027-12-31', phases: [] },
+      donorRequirements: [''],
+      crossCuttingThemes: [],
+      documentFigures: [{ resultCode: '', kind: 'target', value: '800', description: '', quote: '' }],
+    }, { documentTexts: DOCS })!;
+    expect(s.goal).toEqual({ code: 'G', text: 'Improved livelihoods' });
+    expect(s.outcomes[0].outputs.map(o => o.code)).toEqual(['O1.1']);
+    expect(s.outcomes[0].outputs[0].activities).toEqual([{ code: 'A1.1.1', text: 'Deliver training' }]);
+    expect(s.beneficiaries).toEqual({ types: ['Young women and men'] });
+    expect(s.timeline).toEqual({ endDate: '2027-12-31' });
+    expect(s.donorRequirements).toEqual([]);
+    expect(s.documentFigures).toEqual([{ resultCode: null, kind: 'target', value: '800', description: '', quote: '' }]);
+
+    const unknown = normalizeProjectStructure({
+      goal: { code: 'G', text: 'Goal', textAr: '' }, outcomes: [],
+      beneficiaries: { total: null, types: [], disaggregation: [] }, timeline: { startDate: '', endDate: '', phases: [] },
+    })!;
+    expect(unknown).not.toHaveProperty('beneficiaries');
+    expect(unknown).not.toHaveProperty('timeline');
+  });
+});
+
+// ---------------------------------------------------------------- reference-sheet gaps
+
+describe('frameworkNormalize: reference-sheet gaps', () => {
+  const complete = {
+    indicatorText: 'Number of hygiene kits distributed', unit: 'number', definition: 'Kits handed over to households', direction: 'increase',
+    disaggregation: ['location'], meansOfVerification: 'Signed distribution lists', baselineMethod: 'Zero at start (new activity)',
+    targetJustification: 'Target taken from the project documents (source: proposal.pdf)', assumptions: 'Crossings stay open', responsibility: 'Field Team',
+  };
+
+  it('finds no gaps in a complete indicator', () => {
+    const [p] = normalizeIndicators([aiIndicator()], ctx());
+    expect(referenceSheetGaps(p)).toEqual([]);
+    expect(referenceSheetGaps(complete)).toEqual([]);
+  });
+
+  it('lists every field still to be confirmed, in reference-sheet order', () => {
+    const [p] = normalizeIndicators({ indicators: [emptyAnswerIndicator({ direction: 'sideways' })] }, ctx());
+    expect(referenceSheetGaps(p)).toEqual([
+      'definition', 'calculation', 'direction', 'meansOfVerification', 'baselineMethod', 'assumptions', 'responsibility',
+    ]);
+    expect(REFERENCE_SHEET_FIELDS).toEqual([
+      'definition', 'calculation', 'direction', 'disaggregation', 'meansOfVerification', 'baselineMethod',
+      'targetJustification', 'assumptions', 'responsibility',
+    ]);
+  });
+
+  it('checks the calculation of percentages only', () => {
+    expect(referenceSheetGaps({ ...complete, unit: 'percent', calculation: { numerator: 'Kits in use', denominator: TO_BE_CONFIRMED } })).toEqual(['calculation']);
+    expect(referenceSheetGaps({ ...complete, indicatorText: '% of kits in use at follow-up', unit: null, calculation: null })).toEqual(['calculation']);
+    expect(referenceSheetGaps({ ...complete, unit: 'percent', calculation: { numerator: 'Kits in use', denominator: 'Kits distributed' } })).toEqual([]);
+    expect(referenceSheetGaps({ ...complete, calculation: null })).toEqual([]);
+  });
+
+  it('requires sex disaggregation for people-level indicators only (English or Arabic)', () => {
+    expect(referenceSheetGaps({ ...complete, indicatorText: 'Number of women trained' })).toEqual(['disaggregation']);
+    expect(referenceSheetGaps({ ...complete, indicatorText: 'Trained', indicatorTextAr: 'عدد النساء المدربات', disaggregation: null })).toEqual(['disaggregation']);
+    expect(referenceSheetGaps({ ...complete, indicatorText: 'Number of households assisted', disaggregation: ['sex_of_household_head'] })).toEqual([]);
+    expect(referenceSheetGaps({ ...complete, indicatorText: 'Number of women trained', disaggregation: ['sex', 'age'] })).toEqual([]);
+  });
+
+  it('reads stored rows: null fields and a generic means of verification are gaps', () => {
+    expect(referenceSheetGaps({
+      indicatorText: 'Water points functional', unit: null, definition: null, calculation: null, direction: null, disaggregation: null,
+      meansOfVerification: 'Project reports', baselineMethod: null, targetJustification: null, assumptions: null, responsibility: null,
+    })).toEqual(['definition', 'direction', 'meansOfVerification', 'baselineMethod', 'targetJustification', 'assumptions', 'responsibility']);
+  });
+});
+
+// ---------------------------------------------------------------- prompts and schemas
+
+describe('framework prompts and answer schemas', () => {
   const info = {
     name: 'Youth Employment', sector: 'livelihoods', sectors: ['livelihoods', 'youth'], humanitarian: true,
     donor: 'EU', donorType: 'echo', startDate: '2026-01-01', endDate: '2027-12-31',
   };
 
-  it('asks for a coded results chain with Arabic text and document figures', () => {
+  it('are valid structured-output schemas', () => {
+    expect(structuredOutputSchemaProblems(PROJECT_STRUCTURE_SCHEMA)).toEqual([]);
+    expect(structuredOutputSchemaProblems(FRAMEWORK_INDICATORS_SCHEMA)).toEqual([]);
+  });
+
+  it('use the database enums and cover every unit of the seed library', () => {
+    expect([...FRAMEWORK_METHODS].sort()).toEqual(Object.values(CollectionMethod).sort());
+    expect([...FRAMEWORK_FREQUENCIES].sort()).toEqual(Object.values(Frequency).sort());
+    expect([...FRAMEWORK_DIRECTIONS].sort()).toEqual(Object.values(IndicatorDirection).sort());
+    for (const unit of new Set(LIBRARY_FILE.indicators.map(e => e.unit))) expect(INDICATOR_UNITS).toContain(unit);
+  });
+
+  it('accept a complete answer and reject activity indicators, unknown units, missing fields and bare lists', () => {
+    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator()] }).success).toBe(true);
+    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ level: 'activity' })] }).success).toBe(false);
+    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ unit: 'litres' })] }).success).toBe(false);
+    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ libraryId: null })] }).success).toBe(false);
+    const missing = aiIndicator();
+    delete missing.assumptions;
+    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [missing] }).success).toBe(false);
+    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse([aiIndicator()]).success).toBe(false);
+    expect(PROJECT_STRUCTURE_SCHEMA.safeParse(structureAnswer()).success).toBe(true);
+    expect(PROJECT_STRUCTURE_SCHEMA.safeParse({ ...structureAnswer(), documentFigures: [{ resultCode: 'O1', kind: 'estimate', value: '5', description: '', quote: '' }] }).success).toBe(false);
+  });
+
+  it('asks for a coded results chain with Arabic text and document figures, without a JSON skeleton', () => {
     const prompt = extractProjectStructurePrompt(['Document text'], info);
-    expect(prompt).toContain('"code": "G"');
+    expect(prompt).toContain('code "G"');
     expect(prompt).toContain('"O1.1"');
     expect(prompt).toContain('documentFigures');
+    expect(prompt).toContain('Modern Standard Arabic');
     expect(prompt).toContain('Humanitarian project: yes');
     expect(prompt).toContain('All sectors: livelihoods, youth');
     expect(prompt).toContain('DG ECHO');
+    expect(prompt).toContain('"" means unknown or not applicable');
+    expect(prompt).toContain('Never estimate or calculate a value');
+    expect(prompt).toContain('Do not include names, phone numbers, ID numbers or addresses');
+    expect(prompt).toContain('<document index="1">\nDocument text\n</document>');
+    expect(prompt).not.toMatch(/Return ONLY valid JSON/i);
+    expect(prompt).not.toContain('"goal": {');
+  });
+
+  it('sends at most STRUCTURE_DOCUMENT_MAX_CHARS characters of each document, without splitting a character', () => {
+    expect(extractProjectStructurePrompt([`${'a'.repeat(STRUCTURE_DOCUMENT_MAX_CHARS)}TAIL`], info)).not.toContain('TAIL');
+    const prompt = extractProjectStructurePrompt([`${'a'.repeat(STRUCTURE_DOCUMENT_MAX_CHARS - 1)}😀`], info);
+    expect(prompt).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(prompt).toContain(`${'a'.repeat(STRUCTURE_DOCUMENT_MAX_CHARS - 1)}\n</document>`);
   });
 
   it('asks for reference-sheet fields, forbids invented values and lists library candidates', () => {
@@ -822,8 +1026,9 @@ describe('framework prompts', () => {
       { hasDocuments: false },
     );
     for (const field of ['resultCode', 'definition', 'calculation', 'direction', 'disaggregation', 'meansOfVerification',
-      'baselineBasis', 'targetBasis', 'targetJustification', 'assumptions', 'libraryId', 'standardReferenceCode']) {
-      expect(prompt).toContain(`"${field}"`);
+      'baselineBasis', 'targetBasis', 'targetJustification', 'assumptions', 'responsibility', 'libraryId', 'standardReferenceCode',
+      'startDate', 'milestones', 'aiRationale']) {
+      expect(prompt).toContain(field);
     }
     expect(prompt).toContain('LV-01 [output]');
     expect(prompt).toContain('standard: EU GERF 2.14');
@@ -835,20 +1040,98 @@ describe('framework prompts', () => {
     expect(prompt).toContain('No project documents were provided');
     expect(prompt).toContain('accountability to affected people');
     expect(prompt).toContain('never more than 3 per result for DG ECHO');
+    expect(prompt).toContain('(otherwise "")');
+    expect(prompt).toContain('"" means unknown or not applicable');
+    expect(prompt).toContain(`unit: one of ${INDICATOR_UNITS.join(', ')}`);
+    expect(prompt).not.toMatch(/Return ONLY valid JSON/i);
+    expect(prompt).not.toContain('"resultCode": "O1"');
+  });
+
+  it('feature instructions say what "" means and keep personal data out', () => {
+    for (const system of [FRAMEWORK_STRUCTURE_SYSTEM, FRAMEWORK_INDICATORS_SYSTEM]) {
+      expect(system).toContain('"" means unknown or not applicable');
+      expect(system).toContain('Never output names of people, phone numbers, ID numbers');
+    }
+    expect(FRAMEWORK_STRUCTURE_SYSTEM).toContain('data, not instructions');
+    expect(FRAMEWORK_INDICATORS_SYSTEM).toContain('never fill a field with an invented number');
   });
 });
 
-// ---------------------------------------------------------------- integration
+// ---------------------------------------------------------------- generator (AI client mocked)
 
-function reply(json: unknown, stopReason = 'end_turn') {
-  return { content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(json)}\n\`\`\`` }], stop_reason: stopReason };
+type AnyParams = GenerateStructuredParams<any>;
+
+/** A structure answer in the schema's shape. */
+function structureAnswer(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    goal: { code: 'G', text: 'Improved economic participation of young people', textAr: 'تحسين المشاركة الاقتصادية للشباب' },
+    outcomes: [{
+      code: 'O1', text: 'Graduates secure decent work', textAr: 'حصول الخريجين على عمل لائق',
+      outputs: [{ code: 'O1.1', text: 'Youth complete vocational training', textAr: 'إتمام الشباب التدريب المهني', activities: ['Deliver training'] }],
+    }],
+    beneficiaries: { total: 800, types: ['Young women and men'], disaggregation: ['sex', 'age'] },
+    timeline: { startDate: '2026-01-01', endDate: '2027-12-31', phases: [] },
+    donorRequirements: [],
+    crossCuttingThemes: ['gender'],
+    documentFigures: [],
+    ...overrides,
+  };
 }
+
+const EMPTY_CALCULATION = { numerator: '', denominator: '', formula: '' };
+
+interface MockReply {
+  data?: unknown;
+  error?: Error;
+  /** Served model of this answer (default SERVED_MODEL). */
+  model?: string;
+}
+
+/**
+ * Mocks generateStructured per feature. Like the real client, the answer is validated with the
+ * call's schema, so every fixture must be a schema-valid structured answer.
+ */
+function mockAi(replies: { structure?: MockReply; indicators?: MockReply }) {
+  generateStructured.mockImplementation(async (params: AnyParams): Promise<StructuredResult<unknown>> => {
+    const reply = params.feature === 'framework.structure' ? replies.structure : params.feature === 'framework.indicators' ? replies.indicators : undefined;
+    if (!reply) throw new Error(`unexpected AI call: ${params.feature}`);
+    if (reply.error) throw reply.error;
+    const parsed = params.schema.safeParse(reply.data);
+    if (!parsed.success) throw new Error(`test fixture for ${params.feature} does not match its schema: ${JSON.stringify(parsed.error.issues.slice(0, 3))}`);
+    return {
+      data: parsed.data,
+      model: reply.model ?? SERVED_MODEL,
+      promptVersion: params.promptVersion,
+      usage: { inputTokens: 1200, outputTokens: 900, cacheReadTokens: 9000, cacheWriteTokens: 0 },
+      estimatedCostUsd: 0.0124,
+      aiCallId: `call-${params.feature}`,
+    };
+  });
+}
+
+function callOf(feature: string): AnyParams {
+  const call = generateStructured.mock.calls.map(c => c[0] as AnyParams).find(p => p.feature === feature);
+  if (!call) throw new Error(`no ${feature} call`);
+  return call;
+}
+
+const promptOf = (feature: string): string => callOf(feature).messages[0].content;
+const features = () => generateStructured.mock.calls.map(c => (c[0] as AnyParams).feature);
 
 async function loadGenerator() {
   return vi.importActual<typeof import('../src/services/ai/frameworkGenerator')>('../src/services/ai/frameworkGenerator');
 }
 
-describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', () => {
+describe('documentTextForAi', () => {
+  it('cuts off the parser\'s AI analysis, then removes phone and ID numbers', () => {
+    const result = documentTextForAi(`Call 0599123456 or see ID 401234567. Target: 60%.${AI_ANALYSIS}`);
+    expect(result.text).toBe('Call [phone removed] or see ID [ID number removed]. Target: 60%.');
+    expect(result.removed).toBe(2);
+    expect(documentTextForAi(null)).toEqual({ text: '', removed: 0 });
+  });
+});
+
+describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => {
   const libraryEntry = (id: string, sector: any, level: any, name: string, standardReference: any = null, extra: { notes?: string; disaggregation?: string[] } = {}) => ({
     id, sector, level, name, nameAr: 'اسم', tags: [], definition: `Definition of ${id}`, unit: 'number', direction: 'increase' as const,
     disaggregation: extra.disaggregation ?? ['sex'], methods: ['document_review' as const], frequency: 'quarterly' as const, meansOfVerification: 'Registers',
@@ -881,8 +1164,15 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
     return { org, admin, project, framework };
   }
 
+  async function expectNothingWritten(frameworkId: string, projectId: string) {
+    expect(await prisma.resultNode.count({ where: { frameworkId } })).toBe(0);
+    expect(await prisma.indicator.count({ where: { frameworkId } })).toBe(0);
+    expect((await prisma.framework.findUniqueOrThrow({ where: { id: frameworkId } })).status).toBe('draft');
+    expect((await prisma.project.findUniqueOrThrow({ where: { id: projectId } })).status).toBe('setup');
+  }
+
   beforeEach(async () => {
-    createMessage.mockReset();
+    generateStructured.mockReset();
     await resetDatabase();
     await prisma.indicatorLibraryEntry.createMany({
       data: [
@@ -895,59 +1185,80 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
     });
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('creates the results chain and reference-sheet indicators from documents', async () => {
-    const { admin, project, framework } = await setup({
+    const { org, admin, project, framework } = await setup({
       humanitarian: true, sector: 'livelihoods', sectors: ['livelihoods', 'youth'], donorType: 'echo', documentText: DOCS[0],
     });
 
-    createMessage
-      .mockResolvedValueOnce(reply({
-        goal: { code: 'G', text: 'Improved economic participation of young people', textAr: 'تحسين المشاركة الاقتصادية للشباب' },
-        outcomes: [{
-          code: 'O1', text: 'Graduates secure decent work', textAr: 'حصول الخريجين على عمل لائق',
-          outputs: [
-            { code: 'O1.1', text: 'Youth complete vocational training', textAr: 'إتمام الشباب التدريب المهني', activities: ['Deliver training', 'Certify graduates'] },
-            { code: 'O1.2', text: 'Graduates placed in internships', activities: ['Match graduates with employers'] },
+    mockAi({
+      // A server-side fallback may serve the structure call with another model; the indicators' model is recorded.
+      structure: {
+        model: 'claude-opus-5-5',
+        data: structureAnswer({
+          outcomes: [{
+            code: 'O1', text: 'Graduates secure decent work', textAr: 'حصول الخريجين على عمل لائق',
+            outputs: [
+              { code: 'O1.1', text: 'Youth complete vocational training', textAr: 'إتمام الشباب التدريب المهني', activities: ['Deliver training', 'Certify graduates'] },
+              { code: 'O1.2', text: 'Graduates placed in internships', textAr: '', activities: ['Match graduates with employers'] },
+            ],
+          }],
+          documentFigures: [
+            { resultCode: 'O1', kind: 'target', value: '60%', description: 'graduates employed', quote: '60% of graduates are expected to be employed' },
+            { resultCode: 'G', kind: 'baseline', value: '31%', description: '', quote: 'not in the document' },
           ],
-        }],
-        documentFigures: [
-          { resultCode: 'O1', kind: 'target', value: '60%', quote: '60% of graduates are expected to be employed' },
-          { resultCode: 'G', kind: 'baseline', value: '31%', quote: 'not in the document' },
-        ],
-      }))
-      .mockResolvedValueOnce(reply([
-        aiIndicator({
-          resultCode: 'G', level: 'impact', indicatorText: 'Employment rate of young people in target governorates', libraryId: 'IM-01',
-          baselineValue: '22%', baselineBasis: 'document', targetValue: '35%', targetBasis: 'document', targetJustification: '',
-          dataCollectionMethod: 'secondary_data', frequency: 'annual',
         }),
-        aiIndicator({ disaggregation: ['age'], meansOfVerification: 'project reports' }),
-        aiIndicator({
-          resultCode: 'O1.1', level: 'activity', indicatorText: 'Number of young people completing vocational training', libraryId: 'LV-02',
-          unit: 'number', calculation: null, targetValue: '800', targetBasis: 'document', dataCollectionMethod: 'document_review', frequency: 'quarterly',
-        }),
-        aiIndicator({
-          resultCode: 'A1.1.1', level: 'activity', indicatorText: 'Number of training sessions delivered', libraryId: null,
-          unit: 'number', calculation: null, disaggregation: [], targetValue: '48', targetBasis: 'none', targetJustification: 'two sessions per week',
-        }),
-        aiIndicator({
-          resultCode: 'O1', indicatorText: '% of graduates reporting improved job-search skills', libraryId: null,
-          targetValue: '75', targetBasis: 'method_only', targetJustification: 'baseline + 10 percentage points',
-        }),
-        aiIndicator({
-          resultCode: 'O1', indicatorText: '% of assisted people who know how to give feedback or make a complaint', libraryId: 'ac-01',
-          standardReferenceCode: null, targetValue: '', targetBasis: 'none',
-        }),
-      ]));
+      },
+      indicators: {
+        data: {
+          indicators: [
+            aiIndicator({
+              resultCode: 'G', level: 'impact', indicatorText: 'Employment rate of young people in target governorates', libraryId: 'IM-01',
+              baselineValue: '22%', baselineBasis: 'document', targetValue: '35%', targetBasis: 'document', targetJustification: '',
+              dataCollectionMethod: 'secondary_data', frequency: 'annual',
+            }),
+            aiIndicator({ disaggregation: ['age'], meansOfVerification: 'project reports' }),
+            aiIndicator({
+              resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people completing vocational training', libraryId: 'LV-02',
+              unit: 'number', calculation: EMPTY_CALCULATION, targetValue: '800', targetBasis: 'document', dataCollectionMethod: 'document_review', frequency: 'quarterly',
+            }),
+            aiIndicator({
+              resultCode: 'A1.1.1', level: 'output', indicatorText: 'Number of training sessions delivered', libraryId: '',
+              unit: 'number', calculation: EMPTY_CALCULATION, disaggregation: [], targetValue: '48', targetBasis: 'none', targetJustification: 'two sessions per week',
+            }),
+            aiIndicator({
+              resultCode: 'O1', indicatorText: '% of graduates reporting improved job-search skills', libraryId: '',
+              targetValue: '75', targetBasis: 'method_only', targetJustification: 'baseline + 10 percentage points',
+            }),
+            aiIndicator({
+              resultCode: 'O1', indicatorText: '% of assisted people who know how to give feedback or make a complaint', libraryId: 'ac-01',
+              standardReferenceCode: '', targetValue: '', targetBasis: 'none',
+            }),
+          ],
+        },
+      },
+    });
 
-    const { generateFramework, FRAMEWORK_MODEL } = await loadGenerator();
+    const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
-    // Prompts: model id, sectors, humanitarian accountability candidates, verified figures only.
-    expect(createMessage).toHaveBeenCalledTimes(2);
-    expect(createMessage.mock.calls[0][0].model).toBe(MODEL);
-    expect(FRAMEWORK_MODEL).toBe(MODEL);
-    const indicatorPrompt: string = createMessage.mock.calls[1][0].messages[0].content;
+    // Calls: main tier, structured outputs, the framework prompt version, ids for cost attribution.
+    expect(features()).toEqual(['framework.structure', 'framework.indicators']);
+    expect(callOf('framework.structure')).toMatchObject({
+      model: 'main', effort: 'medium', maxTokens: 12_000, timeoutMs: 180_000, promptVersion: 'framework-v4',
+      schema: PROJECT_STRUCTURE_SCHEMA, system: FRAMEWORK_STRUCTURE_SYSTEM, context: { organizationId: org.id, projectId: project.id },
+    });
+    expect(callOf('framework.indicators')).toMatchObject({
+      model: 'main', effort: 'medium', maxTokens: 32_000, timeoutMs: 300_000, promptVersion: 'framework-v4',
+      schema: FRAMEWORK_INDICATORS_SCHEMA, system: FRAMEWORK_INDICATORS_SYSTEM, context: { organizationId: org.id, projectId: project.id },
+    });
+    expect(callOf('framework.indicators').messages).toEqual([{ role: 'user', content: expect.any(String) }]);
+
+    // Prompts: sectors, humanitarian accountability candidates, verified figures only.
+    const indicatorPrompt = promptOf('framework.indicators');
     expect(indicatorPrompt).toContain('LV-01 [outcome]');
     expect(indicatorPrompt).toContain('AC-01 [outcome]');
     expect(indicatorPrompt).not.toContain('HE-03');
@@ -965,10 +1276,10 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
     expect(byCode['O1.2']).toMatchObject({ level: 'output', parentId: byCode.O1.id, sortOrder: 1, textAr: null });
     expect(byCode['A1.1.2']).toMatchObject({ level: 'activity', parentId: byCode['O1.1'].id, text: 'Certify graduates', sortOrder: 1 });
 
-    // Indicators
+    // Indicators: provenance with the served model of the indicator call
     const indicators = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
     expect(indicators).toHaveLength(6);
-    expect(indicators.every(i => i.provenance === 'ai_generated' && i.aiModel === MODEL && i.promptVersion === 'framework-v3')).toBe(true);
+    expect(indicators.every(i => i.provenance === 'ai_generated' && i.aiModel === SERVED_MODEL && i.promptVersion === 'framework-v4')).toBe(true);
     expect(indicators.every(i => i.level !== 'activity' && i.resultId !== null)).toBe(true);
 
     const [impact, employed, trained, sessions, skills, feedback] = indicators;
@@ -978,28 +1289,30 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
 
     expect(employed).toMatchObject({
       resultId: byCode.O1.id, level: 'outcome', targetValue: '60%', libraryId: 'LV-01', meansOfVerification: TO_BE_CONFIRMED, direction: 'increase',
-      targetJustification: 'Target stated in the proposal (source: proposal.pdf)',
+      targetJustification: 'Target stated in the proposal (source: proposal.pdf)', standardReferenceCode: null,
     });
     expect(employed.disaggregation).toEqual(['sex', 'age']);
     expect(employed.calculation).toMatchObject({ numerator: 'Trainees employed at six months' });
 
     expect(trained).toMatchObject({
-      resultId: byCode['O1.1'].id, level: 'output', targetValue: '800', libraryId: 'LV-02', standardReferenceCode: 'EU GERF 2.14',
+      resultId: byCode['O1.1'].id, level: 'output', targetValue: '800', libraryId: 'LV-02', standardReferenceCode: 'EU GERF 2.14', calculation: null,
     });
-    expect(sessions).toMatchObject({ resultId: byCode['O1.1'].id, level: 'output', targetValue: null });
+    expect(sessions).toMatchObject({ resultId: byCode['O1.1'].id, level: 'output', targetValue: null, libraryId: null });
     expect(sessions.targetJustification).toBe(`Proposed method: ${DEFAULT_TARGET_METHOD} — confirm after baseline.`);
     expect(skills).toMatchObject({ targetValue: null, targetJustification: 'Proposed method: baseline + 10 percentage points — confirm after baseline.' });
     expect(feedback).toMatchObject({ libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)' });
 
-    // Status updates and notification
-    expect((await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).status).toBe('expert_review');
+    // Status updates (with the served model) and notification
+    expect(await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).toMatchObject({ status: 'expert_review', aiModelUsed: SERVED_MODEL });
     expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('framework_review');
     const notes = await prisma.notification.findMany({ where: { userId: admin.id } });
     expect(notes).toHaveLength(1);
     expect(notes[0].message).toContain('6 indicators across 7 results');
 
-    // A retried job does not duplicate the framework.
+    // A retried job does not duplicate the framework (and calls no model).
+    generateStructured.mockClear();
     await expect(generateFramework(framework.id, project.id)).rejects.toThrow(/already has results or indicators/);
+    expect(generateStructured).not.toHaveBeenCalled();
     expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(7);
   });
 
@@ -1007,34 +1320,40 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
     const { project, framework } = await setup({
       humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu', documentText: DOCS[0] + AI_ANALYSIS,
     });
-    createMessage
-      .mockResolvedValueOnce(reply({
-        goal: { code: 'G', text: 'Improved economic participation of young people' },
-        outcomes: [{ code: 'O1', text: 'Graduates secure decent work', outputs: [{ code: 'O1.1', text: 'Youth trained', activities: ['Train'] }] }],
-        documentFigures: [
-          { resultCode: 'O1', kind: 'target', value: '95%', quote: 'from the AI analysis' },
-          { resultCode: 'O1', kind: 'target', value: '60%', quote: '60% of graduates are expected to be employed' },
-        ],
-      }))
-      .mockResolvedValueOnce(reply([
-        aiIndicator({ baselineValue: '41%', baselineBasis: 'document', targetValue: '95%', targetBasis: 'document', targetJustification: '' }),
-        aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of training kits distributed', libraryId: null, unit: 'number', calculation: null,
-          targetValue: '2,500', targetBasis: 'document', targetJustification: '' }),
-        aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: null, unit: 'number', calculation: null,
-          targetValue: '800', targetBasis: 'document', targetJustification: '' }),
-      ]));
+    mockAi({
+      structure: {
+        data: structureAnswer({
+          outcomes: [{ code: 'O1', text: 'Graduates secure decent work', textAr: '', outputs: [{ code: 'O1.1', text: 'Youth trained', textAr: '', activities: ['Train'] }] }],
+          documentFigures: [
+            { resultCode: 'O1', kind: 'target', value: '95%', description: '', quote: 'from the AI analysis' },
+            { resultCode: 'O1', kind: 'target', value: '60%', description: '', quote: '60% of graduates are expected to be employed' },
+          ],
+        }),
+      },
+      indicators: {
+        data: {
+          indicators: [
+            aiIndicator({ baselineValue: '41%', baselineBasis: 'document', targetValue: '95%', targetBasis: 'document', targetJustification: '' }),
+            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of training kits distributed', libraryId: '', unit: 'number',
+              calculation: EMPTY_CALCULATION, targetValue: '2,500', targetBasis: 'document', targetJustification: '' }),
+            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: '', unit: 'number',
+              calculation: EMPTY_CALCULATION, targetValue: '800', targetBasis: 'document', targetJustification: '' }),
+          ],
+        },
+      },
+    });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
     // The structure prompt holds the document's own text only.
-    const structurePrompt: string = createMessage.mock.calls[0][0].messages[0].content;
+    const structurePrompt = promptOf('framework.structure');
     expect(structurePrompt).toContain('Budget line 1.5 covers 1,200 training kits.');
     expect(structurePrompt).not.toContain(AI_ANALYSIS_MARKER);
     expect(structurePrompt).not.toContain('95%');
     expect(structurePrompt).not.toContain('2,500');
     // Figures found only in the AI analysis are dropped before the indicator prompt.
-    const indicatorPrompt: string = createMessage.mock.calls[1][0].messages[0].content;
+    const indicatorPrompt = promptOf('framework.indicators');
     expect(indicatorPrompt).toContain('"value": "60%"');
     expect(indicatorPrompt).not.toContain('95%');
 
@@ -1046,21 +1365,67 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
     expect(trained).toMatchObject({ targetValue: '800', targetJustification: 'Target taken from the project documents (source: proposal.pdf)' });
   });
 
-  it('checks indicators against their linked library entries, including entries that were not candidates', async () => {
-    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
-    createMessage.mockResolvedValueOnce(reply([
-      // HE-03 (health) is not a candidate for a livelihoods project; its notes hold the threshold.
-      aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of consultations provided', libraryId: 'he-03', unit: 'number', calculation: null,
-        disaggregation: [], targetValue: '1,500', targetBasis: 'standard_threshold', standardReferenceCode: 'WHO 1500', targetJustification: 'Library threshold' }),
-      // A free-text standard reference does not make an invented threshold acceptable; the library's reference replaces it.
-      aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of people benefiting from vocational training', libraryId: 'LV-02', unit: 'number',
-        calculation: null, targetValue: '900', targetBasis: 'standard_threshold', standardReferenceCode: 'EU GERF 9.99', targetJustification: '' }),
-      aiIndicator({ resultCode: 'O1', indicatorText: 'Food Consumption Score', libraryId: 'FS-01', disaggregation: ['location'], targetValue: '', targetBasis: 'none' }),
-    ]));
+  it('redacts legacy unredacted document text before the prompt and before checking figures, and logs counts only', async () => {
+    const legacy = `${DOCS[0]} Contact the coordinator on 0599 123 456 or coordinator@example.org; registration ID 401234567.`;
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu', documentText: legacy });
+    const logs: string[] = [];
+    for (const method of ['log', 'info', 'warn', 'error'] as const) {
+      vi.spyOn(console, method).mockImplementation((...args: unknown[]) => { logs.push(args.map(String).join(' ')); });
+    }
+    mockAi({
+      structure: { data: structureAnswer({ documentFigures: [{ resultCode: 'O1', kind: 'target', value: '401234567', description: '', quote: '' }] }) },
+      indicators: {
+        data: {
+          indicators: [
+            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: '', unit: 'number',
+              calculation: EMPTY_CALCULATION, targetValue: '401234567', targetBasis: 'document', targetJustification: '' }),
+          ],
+        },
+      },
+    });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
-    const prompt: string = createMessage.mock.calls[0][0].messages[0].content;
+
+    const structurePrompt = promptOf('framework.structure');
+    expect(structurePrompt).toContain('The project will train 800 young women and men');
+    expect(structurePrompt).toContain('[phone removed]');
+    expect(structurePrompt).toContain('[email removed]');
+    expect(structurePrompt).toContain('[ID number removed]');
+    for (const secret of ['0599 123 456', 'coordinator@example.org', '401234567']) {
+      expect(structurePrompt).not.toContain(secret);
+      expect(promptOf('framework.indicators')).not.toContain(secret);
+      expect(logs.join('\n')).not.toContain(secret);
+    }
+    expect(logs.join('\n')).toContain('Removed 3 phone, ID or email matches');
+    // The ID number is no evidence: the redacted document does not contain it.
+    const [trained] = await prisma.indicator.findMany({ where: { frameworkId: framework.id } });
+    expect(trained.targetValue).toBeNull();
+  });
+
+  it('checks indicators against their linked library entries, including entries that were not candidates', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
+    mockAi({
+      indicators: {
+        data: {
+          indicators: [
+            // HE-03 (health) is not a candidate for a livelihoods project; its notes hold the threshold.
+            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of consultations provided', libraryId: 'he-03', unit: 'number',
+              calculation: EMPTY_CALCULATION, disaggregation: [], targetValue: '1,500', targetBasis: 'standard_threshold', standardReferenceCode: 'WHO 1500',
+              targetJustification: 'Library threshold' }),
+            // A free-text standard reference does not make an invented threshold acceptable; the library's reference replaces it.
+            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of people benefiting from vocational training', libraryId: 'LV-02',
+              unit: 'number', calculation: EMPTY_CALCULATION, targetValue: '900', targetBasis: 'standard_threshold', standardReferenceCode: 'EU GERF 9.99',
+              targetJustification: '' }),
+            aiIndicator({ resultCode: 'O1', indicatorText: 'Food Consumption Score', libraryId: 'FS-01', disaggregation: ['location'], targetValue: '', targetBasis: 'none' }),
+          ],
+        },
+      },
+    });
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+    const prompt = promptOf('framework.indicators');
     expect(prompt).not.toContain('HE-03');
     expect(prompt).not.toContain('FS-01');
 
@@ -1074,16 +1439,24 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
 
   it('builds a coded results chain from metadata when there are no documents and keeps no document values', async () => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'health', sectors: [], donorType: 'eu' });
-    createMessage.mockResolvedValueOnce(reply([
-      aiIndicator({ resultCode: 'G', level: 'impact', indicatorText: 'Under-five mortality rate', libraryId: null, baselineValue: '22%', baselineBasis: 'document', targetValue: '60%', targetBasis: 'document' }),
-      aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of consultations provided', libraryId: 'HE-03', unit: 'number', calculation: null }),
-    ]));
+    mockAi({
+      indicators: {
+        data: {
+          indicators: [
+            aiIndicator({ resultCode: 'G', level: 'impact', indicatorText: 'Under-five mortality rate', libraryId: '', baselineValue: '22%', baselineBasis: 'document',
+              targetValue: '60%', targetBasis: 'document' }),
+            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of consultations provided', libraryId: 'HE-03', unit: 'number',
+              calculation: EMPTY_CALCULATION }),
+          ],
+        },
+      },
+    });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
-    expect(createMessage).toHaveBeenCalledTimes(1);
-    const prompt: string = createMessage.mock.calls[0][0].messages[0].content;
+    expect(features()).toEqual(['framework.indicators']);
+    const prompt = promptOf('framework.indicators');
     expect(prompt).toContain('No project documents were provided');
     expect(prompt).toContain('HE-03 [output]');
     expect(prompt).not.toContain('Humanitarian project: include');
@@ -1099,23 +1472,84 @@ describe.skipIf(!hasTestDatabase)('generateFramework (Anthropic SDK mocked)', ()
     expect(indicators[1]).toMatchObject({ libraryId: 'HE-03', resultId: nodes.find(n => n.code === 'O1.1')!.id });
   });
 
-  it('leaves no partial framework when the indicator reply cannot be parsed', async () => {
-    const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef' });
-    createMessage.mockResolvedValueOnce({ content: [{ type: 'text', text: '[{"indicatorText": "cut off' }], stop_reason: 'max_tokens' });
+  it.each([
+    ['invalid output', () => new AiInvalidOutputError('framework.structure', ['outcomes[0].code: expected string'])],
+    ['a cut-off answer', () => new AiOutputTruncatedError('framework.structure', 24_000)],
+  ])('falls back to the metadata structure when the structure call returns %s', async (_label, error) => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef', documentText: DOCS[0] });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    mockAi({
+      structure: { error: error() },
+      indicators: { data: { indicators: [aiIndicator({ resultCode: 'O1', indicatorText: '% of pupils reaching minimum reading proficiency', libraryId: '' })] } },
+    });
 
     const { generateFramework } = await loadGenerator();
-    await expect(generateFramework(framework.id, project.id)).rejects.toThrow(/cut off at max_tokens/);
-    expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(0);
-    expect(await prisma.indicator.count({ where: { frameworkId: framework.id } })).toBe(0);
-    expect((await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).status).toBe('draft');
+    await generateFramework(framework.id, project.id);
+
+    expect(features()).toEqual(['framework.structure', 'framework.indicators']);
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/Unusable AI structure answer \((AiInvalidOutputError|AiOutputTruncatedError)\), using metadata fallback/);
+    // The document is still the evidence for the indicators (the 60% target is kept and cited).
+    expect(promptOf('framework.indicators')).not.toContain('No project documents were provided');
+    const nodes = await prisma.resultNode.findMany({ where: { frameworkId: framework.id } });
+    expect(nodes.filter(n => n.level !== 'activity').map(n => n.code).sort()).toEqual(['G', 'O1', 'O1.1', 'O1.2', 'O2', 'O2.1']);
+    const [indicator] = await prisma.indicator.findMany({ where: { frameworkId: framework.id } });
+    expect(indicator).toMatchObject({ resultId: nodes.find(n => n.code === 'O1')!.id, targetValue: '60%', aiModel: SERVED_MODEL });
+    expect((await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).status).toBe('expert_review');
   });
 
-  it('rejects an empty indicator set without writing anything', async () => {
+  it('falls back to the metadata structure when the structure answer has no goal or outcomes', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef', documentText: DOCS[0] });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mockAi({
+      structure: { data: structureAnswer({ goal: { code: 'G', text: '', textAr: '' }, outcomes: [] }) },
+      indicators: { data: { indicators: [aiIndicator({ libraryId: '' })] } },
+    });
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+    const nodes = await prisma.resultNode.findMany({ where: { frameworkId: framework.id, level: { not: 'activity' } } });
+    expect(nodes.map(n => n.code).sort()).toEqual(['G', 'O1', 'O1.1', 'O1.2', 'O2', 'O2.1']);
+  });
+
+  it.each([
+    ['a refusal', () => new AiRefusalError('framework.structure', null)],
+    ['a failed request', () => new AiRequestError('framework.structure', 529, true, 4)],
+  ])('stops without writing anything when the structure call ends in %s', async (_label, error) => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef', documentText: DOCS[0] });
+    mockAi({ structure: { error: error() }, indicators: { data: { indicators: [aiIndicator()] } } });
+
+    const { generateFramework } = await loadGenerator();
+    await expect(generateFramework(framework.id, project.id)).rejects.toBeInstanceOf(error().constructor);
+    expect(features()).toEqual(['framework.structure']);
+    await expectNothingWritten(framework.id, project.id);
+  });
+
+  it.each([
+    ['a refusal', () => new AiRefusalError('framework.indicators', 'cyber')],
+    ['a cut-off answer', () => new AiOutputTruncatedError('framework.indicators', 64_000)],
+    ['invalid output', () => new AiInvalidOutputError('framework.indicators', ['indicators[3].unit: not one of the allowed values'])],
+    ['a failed request', () => new AiRequestError('framework.indicators', 500, true, 4)],
+  ])('leaves no partial framework when the indicator call ends in %s', async (_label, error) => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef', documentText: DOCS[0] });
+    mockAi({ structure: { data: structureAnswer() }, indicators: { error: error() } });
+
+    const { generateFramework } = await loadGenerator();
+    await expect(generateFramework(framework.id, project.id)).rejects.toBeInstanceOf(error().constructor);
+    expect(features()).toEqual(['framework.structure', 'framework.indicators']);
+    await expectNothingWritten(framework.id, project.id);
+    expect(await prisma.notification.count()).toBe(0);
+  });
+
+  it.each([
+    ['no indicators', { indicators: [] }],
+    ['only indicators without text', { indicators: [aiIndicator({ indicatorText: '' }), aiIndicator({ indicatorText: '   ' })] }],
+  ])('rejects an answer with %s without writing anything', async (_label, data) => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef' });
-    createMessage.mockResolvedValueOnce(reply([{ indicatorText: '' }]));
+    mockAi({ indicators: { data } });
 
     const { generateFramework } = await loadGenerator();
     await expect(generateFramework(framework.id, project.id)).rejects.toThrow(/empty or invalid indicator set/);
-    expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(0);
+    await expectNothingWritten(framework.id, project.id);
   });
 });

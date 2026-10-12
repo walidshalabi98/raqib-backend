@@ -1,8 +1,7 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { prisma } from '../../config/prisma';
-import { env } from '../../config/env';
-
-const anthropic = new Anthropic({ apiKey: env.anthropicApiKey });
+import { generateStructured } from './client';
+import { parseIndicatorNumber, valueTrend } from './indicatorFigures';
+import { RISK_PROMPT_VERSION, RISK_SCHEMA, RISK_SYSTEM, RiskAnswer, RiskIndicatorInput, riskAnalysisPrompt } from './prompts/risk';
 
 export interface RiskAlert {
   indicatorId: string;
@@ -18,6 +17,27 @@ export interface RiskAlert {
   estimatedImpact: string;
 }
 
+const DEFAULT_ACTIONS = ['Review data collection methods', 'Consult with field team', 'Consider timeline adjustments'];
+const MAX_ACTIONS = 5;
+
+/** An at-risk or off-track indicator with its latest data points (newest first). */
+export interface AtRiskIndicator {
+  id: string;
+  indicatorText: string;
+  level: string;
+  status: string;
+  unit: string | null;
+  direction: string | null;
+  baselineValue: string | null;
+  targetValue: string | null;
+  currentValue: string | null;
+  dataPoints: Array<{ value: string; collectionDate: Date }>;
+}
+
+/**
+ * Risk assessment of the project's at-risk and off-track indicators. The model (fast tier) adds an
+ * analysis and actions; on any AI error every indicator gets the deterministic assessment instead.
+ */
 export async function analyzeProjectRisks(projectId: string): Promise<RiskAlert[]> {
   const project = await prisma.project.findUnique({
     where: { id: projectId },
@@ -29,6 +49,7 @@ export async function analyzeProjectRisks(projectId: string): Promise<RiskAlert[
     orderBy: { version: 'desc' },
     include: {
       indicators: {
+        orderBy: { sortOrder: 'asc' },
         include: {
           dataPoints: {
             orderBy: { collectionDate: 'desc' },
@@ -40,92 +61,101 @@ export async function analyzeProjectRisks(projectId: string): Promise<RiskAlert[
   });
 
   if (!framework) return [];
-  const atRiskIndicators = framework.indicators.filter(
-    (ind) => ind.status === 'off_track' || ind.status === 'at_risk'
+  const atRiskIndicators: AtRiskIndicator[] = framework.indicators.filter(
+    (ind) => ind.status === 'off_track' || ind.status === 'at_risk',
   );
 
   if (atRiskIndicators.length === 0) return [];
 
-  // Build context for AI
-  const indicatorContext = atRiskIndicators.map((ind) => ({
+  // Aggregates only: indicator texts, values and dates.
+  const indicatorContext: RiskIndicatorInput[] = atRiskIndicators.map((ind) => ({
     id: ind.id,
     text: ind.indicatorText,
     level: ind.level,
     status: ind.status,
+    unit: ind.unit,
+    direction: ind.direction,
     baseline: ind.baselineValue,
     target: ind.targetValue,
     current: ind.currentValue,
+    computedTrend: valueTrend(ind.dataPoints.map(dp => dp.value), ind.direction),
     dataPoints: ind.dataPoints.map((dp) => ({
       value: dp.value,
       date: dp.collectionDate.toISOString().split('T')[0],
     })),
   }));
 
-  const prompt = `You are an M&E risk analyst for development projects in Palestine.
-
-Analyze these at-risk/off-track indicators and provide actionable risk assessments:
-
-Project: ${project.name}
-Sector: ${project.sector}
-Donor: ${project.donor}
-
-Indicators requiring attention:
-${JSON.stringify(indicatorContext, null, 2)}
-
-For EACH indicator, provide a JSON array with:
-{
-  "indicatorId": "the indicator id",
-  "riskLevel": "critical|high|medium|low",
-  "trend": "declining|stagnant|improving",
-  "analysis": "2-3 sentence analysis of why this indicator is at risk",
-  "suggestedActions": ["action 1", "action 2", "action 3"],
-  "estimatedImpact": "Brief description of impact if not addressed"
+  try {
+    const result = await generateStructured({
+      feature: 'risk.analysis',
+      model: 'fast',
+      effort: 'low',
+      system: RISK_SYSTEM,
+      messages: [{ role: 'user', content: riskAnalysisPrompt({ name: project.name, sector: project.sector, donor: project.donor }, indicatorContext) }],
+      schema: RISK_SCHEMA,
+      promptVersion: RISK_PROMPT_VERSION,
+      maxTokens: 4000,
+      context: { organizationId: project.organizationId, projectId: project.id },
+    });
+    return mergeRiskAnswer(atRiskIndicators, result.data);
+  } catch (err) {
+    // Error class only: no prompt or model text in logs.
+    console.error(`[RiskAnalyzer] AI risk analysis failed for project ${projectId}: ${err instanceof Error ? err.name : 'unknown error'}; using the deterministic assessment`);
+    return atRiskIndicators.map(fallbackRiskAlert);
+  }
 }
 
-Return ONLY a valid JSON array. No markdown.`;
+function baseAlert(ind: AtRiskIndicator): Pick<RiskAlert, 'indicatorId' | 'indicatorText' | 'level' | 'currentValue' | 'targetValue' | 'status'> {
+  return {
+    indicatorId: ind.id,
+    indicatorText: ind.indicatorText,
+    level: ind.level,
+    currentValue: parseIndicatorNumber(ind.currentValue),
+    targetValue: parseIndicatorNumber(ind.targetValue),
+    status: ind.status,
+  };
+}
 
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
-      messages: [{ role: 'user', content: prompt }],
-    });
+function deterministicTrend(ind: AtRiskIndicator): RiskAlert['trend'] {
+  const trend = valueTrend(ind.dataPoints.map(dp => dp.value), ind.direction);
+  return trend === 'insufficient_data' ? 'stagnant' : trend;
+}
 
-    const text = response.content[0].type === 'text' ? response.content[0].text : '';
-    const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const aiResults = JSON.parse(cleaned);
+/** The assessment without AI: high risk when off track, medium when at risk; trend from the data points. */
+export function fallbackRiskAlert(ind: AtRiskIndicator): RiskAlert {
+  return {
+    ...baseAlert(ind),
+    riskLevel: ind.status === 'off_track' ? 'high' : 'medium',
+    trend: deterministicTrend(ind),
+    aiAnalysis: `This ${ind.level} indicator is ${ind.status.replace(/_/g, ' ')} and requires attention.`,
+    suggestedActions: [...DEFAULT_ACTIONS],
+    estimatedImpact: 'May affect project outcomes if not addressed promptly.',
+  };
+}
 
-    return atRiskIndicators.map((ind) => {
-      const aiResult = aiResults.find((r: any) => r.indicatorId === ind.id) || {};
-      return {
-        indicatorId: ind.id,
-        indicatorText: ind.indicatorText,
-        level: ind.level,
-        currentValue: ind.currentValue ? parseFloat(ind.currentValue.toString()) : null,
-        targetValue: ind.targetValue ? parseFloat(ind.targetValue.toString()) : null,
-        status: ind.status,
-        riskLevel: aiResult.riskLevel || (ind.status === 'off_track' ? 'high' : 'medium'),
-        trend: aiResult.trend || 'stagnant',
-        aiAnalysis: aiResult.analysis || 'Indicator needs attention.',
-        suggestedActions: aiResult.suggestedActions || ['Review data collection methods', 'Consult with field team'],
-        estimatedImpact: aiResult.estimatedImpact || 'May affect project outcomes if not addressed.',
-      };
-    });
-  } catch (err: any) {
-    console.error('Risk analysis AI failed:', err.message);
-    // Return basic risk info without AI
-    return atRiskIndicators.map((ind) => ({
-      indicatorId: ind.id,
-      indicatorText: ind.indicatorText,
-      level: ind.level,
-      currentValue: ind.currentValue ? parseFloat(ind.currentValue.toString()) : null,
-      targetValue: ind.targetValue ? parseFloat(ind.targetValue.toString()) : null,
-      status: ind.status,
-      riskLevel: (ind.status === 'off_track' ? 'high' : 'medium') as 'high' | 'medium',
-      trend: 'stagnant' as const,
-      aiAnalysis: `This ${ind.level} indicator is ${ind.status.replace('_', ' ')} and requires attention.`,
-      suggestedActions: ['Review data collection methods', 'Consult with field team', 'Consider timeline adjustments'],
-      estimatedImpact: 'May affect project outcomes if not addressed promptly.',
-    }));
+/**
+ * Combines the model's answer with the indicators: answers for ids that were not sent are ignored
+ * (the first answer per id wins), and indicators without an answer get the deterministic assessment.
+ */
+export function mergeRiskAnswer(indicators: AtRiskIndicator[], answer: RiskAnswer): RiskAlert[] {
+  const byId = new Map<string, RiskAnswer['risks'][number]>();
+  const known = new Set(indicators.map(ind => ind.id));
+  for (const risk of answer.risks ?? []) {
+    if (known.has(risk.indicatorId) && !byId.has(risk.indicatorId)) byId.set(risk.indicatorId, risk);
   }
+
+  return indicators.map((ind) => {
+    const risk = byId.get(ind.id);
+    if (!risk) return fallbackRiskAlert(ind);
+    const fallback = fallbackRiskAlert(ind);
+    const actions = (risk.suggestedActions ?? []).map(a => a.trim()).filter(Boolean).slice(0, MAX_ACTIONS);
+    return {
+      ...baseAlert(ind),
+      riskLevel: risk.riskLevel,
+      trend: risk.trend,
+      aiAnalysis: risk.analysis.trim() || fallback.aiAnalysis,
+      suggestedActions: actions.length ? actions : fallback.suggestedActions,
+      estimatedImpact: risk.estimatedImpact.trim() || fallback.estimatedImpact,
+    };
+  });
 }

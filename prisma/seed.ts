@@ -1,6 +1,5 @@
 import { CollectionMethod, IndicatorLevel, Prisma, PrismaClient } from '@prisma/client';
 import bcrypt from 'bcrypt';
-import { FRAMEWORK_PROMPT_VERSION } from '../src/services/ai/prompts/framework';
 import { seedLibrary } from '../src/services/library/seed';
 
 const prisma = new PrismaClient();
@@ -21,7 +20,12 @@ if (!seedPassword || seedPassword.length < 8) {
 }
 const shownPassword = process.env.SEED_PASSWORD ? '<SEED_PASSWORD>' : seedPassword;
 
-/** Model id recorded on the seeded AI-generated frameworks and indicators (same as the framework generator's). */
+/**
+ * Sample history: the model recorded on the seeded AI-generated frameworks and indicators, which stand for
+ * generations made in the past with earlier prompt versions (framework-v1, framework-v3). A new generation
+ * records the model that served it (AI_MODEL_MAIN by default). The seed does not read the AI configuration,
+ * so it runs with only DATABASE_URL set (as in the migration rehearsal).
+ */
 const SEED_AI_MODEL = 'claude-sonnet-4-20250514';
 
 const RESULT_LEVELS: IndicatorLevel[] = ['impact', 'outcome', 'output', 'activity'];
@@ -594,7 +598,7 @@ async function main() {
     });
   }
 
-  // Framework for Project 2: generated with the current prompts and awaiting expert review
+  // Framework for Project 2: generated with the Phase 2 prompts (framework-v3) and awaiting expert review
   // (indicators are unapproved, so the app labels them "AI suggested — review before approval").
   const framework2 = await prisma.framework.create({
     data: { projectId: project2.id, version: 1, status: 'expert_review', aiModelUsed: SEED_AI_MODEL },
@@ -632,7 +636,7 @@ async function main() {
     ],
   });
 
-  const aiFramework2 = { provenance: 'ai_generated' as const, aiModel: SEED_AI_MODEL, promptVersion: FRAMEWORK_PROMPT_VERSION };
+  const aiFramework2 = { provenance: 'ai_generated' as const, aiModel: SEED_AI_MODEL, promptVersion: 'framework-v3' };
   await createIndicators(framework2.id, [
     {
       resultId: results2.O1,

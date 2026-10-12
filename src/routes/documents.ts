@@ -9,7 +9,7 @@ import { parseDocument } from '../services/ai/documentParser';
 
 const router = Router();
 
-// GET /api/projects/:id/documents
+// GET /api/projects/:id/documents — includes parsedText (redacted) and aiAnalysis (Document.aiAnalysis, or null)
 router.get('/projects/:id/documents', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
@@ -42,9 +42,9 @@ router.post('/projects/:id/documents', authenticate, documentUpload.single('file
     },
   });
 
-  // Parse document inline (no Redis needed)
-  parseDocument(document.id).catch(err => {
-    console.error(`[Documents] Background parsing failed for ${document.id}:`, err);
+  // Parse document inline (no Redis needed). parseDocument logs the cause without document content.
+  parseDocument(document.id).catch(() => {
+    console.error(`[Documents] Background parsing failed for ${document.id}`);
   });
 
   res.status(201).json(document);

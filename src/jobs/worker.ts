@@ -5,10 +5,19 @@ import { generateFramework } from '../services/ai/frameworkGenerator';
 import { generateIndicatorAlternatives } from '../services/ai/indicatorAlternative';
 import { generateReportNarrative } from '../services/ai/reportNarrative';
 import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
+import { loadSharedSystemPrompt } from '../services/ai/prompts/system';
 
 import '../config/env'; // ensure env is loaded
 
 console.log('[Worker] Starting RAQIB job workers...');
+
+// Fail fast when the AI system prompt (knowledge/me-foundations.md §1–12) cannot be built.
+try {
+  console.log(`[Worker] AI system prompt: ${loadSharedSystemPrompt().version}`);
+} catch (err) {
+  console.error(`[Worker] ${(err as Error).message}`);
+  process.exit(1);
+}
 
 // Document Parsing Worker
 const documentWorker = new Worker('document-parsing', async (job: Job) => {

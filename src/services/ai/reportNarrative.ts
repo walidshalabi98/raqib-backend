@@ -1,13 +1,23 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { prisma } from '../../config/prisma';
-import { env } from '../../config/env';
-import { SYSTEM_CONTEXT } from './prompts/system';
-import { writeNarrativePrompt } from './prompts/narrative';
+import { generateStructured } from './client';
+import { escapeHtml, htmlList, htmlParagraphs } from './html';
+import { progressTowardTarget } from './indicatorFigures';
+import {
+  NARRATIVE_PROMPT_VERSION,
+  NARRATIVE_SCHEMA,
+  NARRATIVE_SYSTEM,
+  NarrativeAnswer,
+  NarrativeIndicatorInput,
+  writeNarrativePrompt,
+} from './prompts/narrative';
+import { redactPersonalData } from './redact';
 
-const anthropic = new Anthropic({ apiKey: env.anthropicApiKey });
-
+/**
+ * Writes the AI narrative of a report (main tier) from the project's indicator figures and stores
+ * the report HTML in Report.aiNarrative. AI errors propagate (typed errors from ./errors).
+ */
 export async function generateReportNarrative(reportId: string, projectId: string): Promise<void> {
-  const report = await prisma.report.findUnique({ where: { id: reportId } });
+  const report = await prisma.report.findFirst({ where: { id: reportId, projectId } });
   if (!report) throw new Error(`Report ${reportId} not found`);
 
   const project = await prisma.project.findUnique({
@@ -18,6 +28,7 @@ export async function generateReportNarrative(reportId: string, projectId: strin
         take: 1,
         include: {
           indicators: {
+            orderBy: { sortOrder: 'asc' },
             include: {
               dataPoints: {
                 orderBy: { collectionDate: 'desc' },
@@ -34,16 +45,21 @@ export async function generateReportNarrative(reportId: string, projectId: strin
   const framework = project.frameworks[0];
   if (!framework) throw new Error('No framework found for project');
 
-  const indicatorData = framework.indicators.map(ind => ({
+  // Aggregates only: values, dates, areas and disaggregated counts (never data point notes).
+  const indicatorData: NarrativeIndicatorInput[] = framework.indicators.map(ind => ({
     indicatorText: ind.indicatorText,
     level: ind.level,
     status: ind.status,
-    baselineValue: ind.baselineValue || undefined,
-    targetValue: ind.targetValue || undefined,
-    currentValue: ind.currentValue || undefined,
+    unit: ind.unit,
+    baselineValue: ind.baselineValue,
+    targetValue: ind.targetValue,
+    currentValue: ind.currentValue,
+    progressPercent: progressTowardTarget(ind.baselineValue, ind.targetValue, ind.currentValue),
     dataPoints: ind.dataPoints.map(dp => ({
       value: dp.value,
-      date: dp.collectionDate.toISOString().split('T')[0],
+      date: isoDate(dp.collectionDate),
+      area: dp.geographicArea,
+      breakdown: dp.breakdown ?? undefined,
     })),
   }));
 
@@ -52,27 +68,35 @@ export async function generateReportNarrative(reportId: string, projectId: strin
       name: project.name,
       sector: project.sector,
       donor: project.donor,
-      periodStart: report.periodStart?.toISOString().split('T')[0],
-      periodEnd: report.periodEnd?.toISOString().split('T')[0],
+      periodStart: report.periodStart ? isoDate(report.periodStart) : undefined,
+      periodEnd: report.periodEnd ? isoDate(report.periodEnd) : undefined,
     },
     indicatorData,
-    report.donorFormat || undefined,
+    report.donorFormat,
   );
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 4096,
-    system: SYSTEM_CONTEXT,
+  const result = await generateStructured({
+    feature: 'report.narrative',
+    model: 'main',
+    effort: 'medium',
+    system: NARRATIVE_SYSTEM,
     messages: [{ role: 'user', content: prompt }],
+    schema: NARRATIVE_SCHEMA,
+    promptVersion: NARRATIVE_PROMPT_VERSION,
+    maxTokens: 8000,
+    timeoutMs: 180_000,
+    context: { organizationId: project.organizationId, projectId: project.id },
   });
 
-  const narrative = response.content
-    .filter(block => block.type === 'text')
-    .map(block => block.type === 'text' ? block.text : '')
-    .join('');
-
-  // Generate HTML report content (no PDF/Puppeteer needed)
-  const html = generateReportHtml(project.name, report.title, narrative, indicatorData);
+  // HTML report content (no PDF/Puppeteer needed); every value is escaped.
+  const html = generateReportHtml({
+    projectName: project.name,
+    reportTitle: report.title,
+    narrative: cleanNarrative(result.data),
+    indicators: indicatorData,
+    model: result.model,
+    promptVersion: result.promptVersion,
+  });
 
   await prisma.report.update({
     where: { id: reportId },
@@ -83,39 +107,64 @@ export async function generateReportNarrative(reportId: string, projectId: strin
     },
   });
 
-  console.log(`[ReportNarrative] Report generated for ${project.name}`);
+  console.log(`[ReportNarrative] Report ${reportId} generated (${indicatorData.length} indicators; ${result.model}, ${result.usage.inputTokens} input / ${result.usage.outputTokens} output tokens)`);
 }
 
-function generateReportHtml(
-  projectName: string,
-  reportTitle: string,
-  narrative: string,
-  indicators: Array<{
-    indicatorText: string;
-    level: string;
-    status: string;
-    baselineValue?: string;
-    targetValue?: string;
-    currentValue?: string;
-  }>,
-): string {
-  const statusColor: Record<string, string> = {
-    on_track: '#22c55e',
-    at_risk: '#f59e0b',
-    off_track: '#ef4444',
-    not_started: '#9ca3af',
-    completed: '#3b82f6',
+function isoDate(date: Date): string {
+  return date.toISOString().split('T')[0];
+}
+
+/** Trims every section and removes any phone number, ID number or email address the model wrote anyway. */
+function cleanNarrative(answer: NarrativeAnswer): NarrativeAnswer {
+  const clean = (value: string) => redactPersonalData((value ?? '').trim()).text;
+  return {
+    executiveSummary: clean(answer.executiveSummary),
+    progress: clean(answer.progress),
+    challenges: clean(answer.challenges),
+    patterns: clean(answer.patterns),
+    recommendations: (answer.recommendations ?? []).map(clean).filter(Boolean),
   };
+}
+
+const STATUS_COLOURS: Readonly<Record<string, string>> = {
+  on_track: '#22c55e',
+  at_risk: '#f59e0b',
+  off_track: '#ef4444',
+  not_started: '#9ca3af',
+  completed: '#3b82f6',
+};
+
+export interface ReportHtmlInput {
+  projectName: string;
+  reportTitle: string;
+  narrative: NarrativeAnswer;
+  indicators: ReadonlyArray<Pick<NarrativeIndicatorInput, 'indicatorText' | 'level' | 'status' | 'baselineValue' | 'targetValue' | 'currentValue'>>;
+  model: string;
+  promptVersion: string;
+  generatedAt?: Date;
+}
+
+function section(title: string, body: string): string {
+  return body ? `<h2>${escapeHtml(title)}</h2>\n<div class="narrative">${body}</div>` : '';
+}
+
+/** The report HTML. Every interpolated value (model output and database text) is HTML-escaped. */
+export function generateReportHtml(input: ReportHtmlInput): string {
+  const { narrative } = input;
+  const generated = (input.generatedAt ?? new Date()).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  const value = (v: string | null | undefined) => escapeHtml(v && v.trim() ? v : 'N/A');
 
   return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="generator" content="${escapeHtml(`Raqib AI report narrative (${input.promptVersion}; ${input.model})`)}">
   <style>
     body { font-family: 'Segoe UI', Arial, sans-serif; margin: 40px; color: #1a1a1a; line-height: 1.6; }
     h1 { color: #1e3a5f; border-bottom: 3px solid #1e3a5f; padding-bottom: 10px; }
     h2 { color: #2563eb; margin-top: 30px; }
     .header { text-align: center; margin-bottom: 40px; }
+    .ai-label { display: inline-block; padding: 4px 10px; border-radius: 4px; background: #fef3c7; color: #92400e; font-size: 12px; }
     .narrative { margin: 20px 0; text-align: justify; }
     table { width: 100%; border-collapse: collapse; margin: 20px 0; }
     th { background: #1e3a5f; color: white; padding: 10px; text-align: left; }
@@ -127,13 +176,17 @@ function generateReportHtml(
 </head>
 <body>
   <div class="header">
-    <h1>${reportTitle}</h1>
-    <p><strong>Project:</strong> ${projectName}</p>
-    <p><strong>Generated:</strong> ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</p>
+    <h1>${escapeHtml(input.reportTitle)}</h1>
+    <p><strong>Project:</strong> ${escapeHtml(input.projectName)}</p>
+    <p><strong>Generated:</strong> ${escapeHtml(generated)}</p>
+    <p class="ai-label">AI suggested — review before approval</p>
   </div>
 
-  <h2>Executive Narrative</h2>
-  <div class="narrative">${narrative.split('\n').map(p => `<p>${p}</p>`).join('')}</div>
+  ${section('Executive Summary', htmlParagraphs(narrative.executiveSummary))}
+  ${section('Progress Against Targets', htmlParagraphs(narrative.progress))}
+  ${section('Challenges', htmlParagraphs(narrative.challenges))}
+  ${section('Patterns', htmlParagraphs(narrative.patterns))}
+  ${section('Recommendations', htmlList(narrative.recommendations, true))}
 
   <h2>Indicator Summary</h2>
   <table>
@@ -141,21 +194,21 @@ function generateReportHtml(
       <tr><th>Indicator</th><th>Level</th><th>Baseline</th><th>Target</th><th>Current</th><th>Status</th></tr>
     </thead>
     <tbody>
-      ${indicators.map(ind => `
+      ${input.indicators.map(ind => `
         <tr>
-          <td>${ind.indicatorText}</td>
-          <td>${ind.level}</td>
-          <td>${ind.baselineValue || 'N/A'}</td>
-          <td>${ind.targetValue || 'N/A'}</td>
-          <td>${ind.currentValue || 'N/A'}</td>
-          <td><span class="status" style="background:${statusColor[ind.status] || '#9ca3af'}">${ind.status.replace('_', ' ')}</span></td>
+          <td>${escapeHtml(ind.indicatorText)}</td>
+          <td>${escapeHtml(ind.level)}</td>
+          <td>${value(ind.baselineValue)}</td>
+          <td>${value(ind.targetValue)}</td>
+          <td>${value(ind.currentValue)}</td>
+          <td><span class="status" style="background:${STATUS_COLOURS[ind.status] ?? '#9ca3af'}">${escapeHtml(ind.status.replace(/_/g, ' '))}</span></td>
         </tr>
       `).join('')}
     </tbody>
   </table>
 
   <div class="footer">
-    <p>Generated by RAQIB M&E Platform — Momentum Labs</p>
+    <p>Generated by RAQIB M&amp;E Platform — Momentum Labs</p>
   </div>
 </body>
 </html>`;

@@ -1,5 +1,6 @@
 import { CollectionMethod, Frequency, IndicatorDirection, IndicatorLevel, Prisma, Sector } from '@prisma/client';
 import { FRAMEWORK_PROMPT_VERSION } from './prompts/framework';
+import { redactPersonalData } from './redact';
 
 /**
  * Pure helpers for the AI framework generator (BUILD_GUIDE Phase 2 task 7).
@@ -82,6 +83,30 @@ function orNull(value: string): string | null {
 function textList(value: unknown, max: number): string[] {
   if (!Array.isArray(value)) return [];
   return value.map(text).filter(Boolean).slice(0, max);
+}
+
+/**
+ * A shallow copy without unknown values: "" (the structured-output answer's "unknown"), null and
+ * blank list items are dropped, and so are lists left empty. The prompt then shows known facts only.
+ */
+function compactObject(value: Json): Json {
+  const out: Json = {};
+  for (const [key, v] of Object.entries(value)) {
+    if (Array.isArray(v)) {
+      const items = v.filter(item => item !== null && item !== undefined && !(typeof item === 'string' && item.trim() === ''));
+      if (items.length > 0) out[key] = items;
+    } else if (v !== null && v !== undefined && !(typeof v === 'string' && v.trim() === '')) {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+/** The compacted object, or null when nothing known is left. */
+function compactOrNull(value: unknown): Json | null {
+  if (!isObject(value)) return null;
+  const compact = compactObject(value);
+  return Object.keys(compact).length > 0 ? compact : null;
 }
 
 const enumKey = (value: string) => value.trim().toLowerCase().replace(/[\s\-/]+/g, '_');
@@ -257,10 +282,12 @@ function statement(parts: { text: string; textAr: string }, code: string): Resul
 
 /**
  * Normalises the model's project structure into a coded results chain.
- * Accepts the coded format asked for by extractProjectStructurePrompt and the
- * older uncoded one (goal as a string, outcomes/outputs/activities as text).
+ * Accepts the structured-output answer (PROJECT_STRUCTURE_SCHEMA in prompts/framework.ts)
+ * and the older uncoded format (goal as a string, outcomes/outputs/activities as text).
  * Codes the model gave are kept when unique; otherwise G, O1, O1.1 and A1.1.1
- * (activities) are assigned. Returns null when there is neither a goal nor an outcome.
+ * (activities) are assigned. "" means unknown: empty statements are dropped, and
+ * beneficiaries and timeline keep only known values. Returns null when there is
+ * neither a goal nor an outcome.
  *
  * When documentTexts are given, documentFigures whose value does not appear in
  * any document are dropped (see appearsInDocuments).
@@ -317,11 +344,13 @@ export function normalizeProjectStructure(raw: unknown, options: { documentTexts
     .filter(f => !options.documentTexts || appearsInDocuments(f.value, options.documentTexts))
     .slice(0, LIMITS.documentFigures);
 
+  const beneficiaries = compactOrNull(raw.beneficiaries);
+  const timeline = compactOrNull(raw.timeline);
   return {
     goal,
     outcomes,
-    ...(isObject(raw.beneficiaries) && { beneficiaries: raw.beneficiaries }),
-    ...(isObject(raw.timeline) && { timeline: raw.timeline }),
+    ...(beneficiaries && { beneficiaries }),
+    ...(timeline && { timeline }),
     donorRequirements: textList(raw.donorRequirements, LIMITS.structureList),
     crossCuttingThemes: textList(raw.crossCuttingThemes, LIMITS.structureList),
     documentFigures: figures,
@@ -607,7 +636,18 @@ export function stripAiAnalysis(parsedText: string): string {
   return at === -1 ? parsedText : parsedText.slice(0, at).trimEnd();
 }
 
-/** A project document's file name and its own text (see stripAiAnalysis). */
+/**
+ * A document's own text for prompts and evidence: the parser's AI analysis is cut off (model output
+ * must never "prove" a baseline or target), then phone numbers, ID numbers and email addresses are
+ * removed (CLAUDE.md rule 5). The parser already redacts what it stores; rows parsed before Phase 3
+ * may not be redacted, so this runs again. `removed` counts the matches (safe to log).
+ */
+export function documentTextForAi(parsedText: string | null | undefined): { text: string; removed: number } {
+  const { text: redacted, counts } = redactPersonalData(stripAiAnalysis(parsedText ?? ''));
+  return { text: redacted, removed: counts.phone + counts.idNumber + counts.email };
+}
+
+/** A project document's file name and its own text (see documentTextForAi). */
 export interface SourceDocument {
   fileName: string;
   text: string;
@@ -1064,10 +1104,10 @@ export function normalizeIndicator(raw: unknown, sortOrder: number, ctx: Normali
     baselineMethod: values.baselineMethod,
     targetValue: values.targetValue,
     targetJustification: values.targetJustification,
-    assumptions: orNull(clip(pick(raw, 'assumptions'), LIMITS.assumptions)),
+    assumptions: clip(pick(raw, 'assumptions'), LIMITS.assumptions) || TO_BE_CONFIRMED,
     libraryId,
     standardReferenceCode,
-    responsibility: orNull(clip(pick(raw, 'responsibility'), LIMITS.responsibility)),
+    responsibility: clip(pick(raw, 'responsibility'), LIMITS.responsibility) || TO_BE_CONFIRMED,
     phases: phases.length > 0 ? phases : ['baseline', 'midterm', 'endline'],
     ...(startDate && { startDate }),
     ...(endDate && { endDate }),
@@ -1101,8 +1141,12 @@ export function extractIndicatorList(parsed: unknown): unknown[] {
  *   added to people-level indicators that lack sex / sex_of_household_head;
  * - baselines and targets per resolveBaselineAndTarget (never invented; document
  *   values cite the document);
+ * - "" (the structured-output answer's "unknown") counts as missing everywhere:
+ *   libraryId, standardReferenceCode, calculation parts, dates, baseline and target values;
  * - empty definition, means of verification (or a generic one such as "project
- *   reports") and baseline method → "To be confirmed by the M&E officer";
+ *   reports"), baseline method, assumptions and responsibility → "To be confirmed by
+ *   the M&E officer" (me-foundations.md §3); targetJustification is always filled
+ *   (see resolveBaselineAndTarget); referenceSheetGaps lists what is still open;
  * - provenance ai_generated with the model and prompt version;
  * - indicators without text and repeats (same result, same wording) are dropped.
  */
@@ -1118,4 +1162,64 @@ export function normalizeIndicators(parsed: unknown, ctx: NormalizeIndicatorsCon
     out.push(payload);
   }
   return out;
+}
+
+// ------------------------------------------------------- reference-sheet gaps
+
+/** Reference-sheet fields checked by referenceSheetGaps, in reference-sheet order (me-foundations.md §3). */
+export const REFERENCE_SHEET_FIELDS = [
+  'definition', 'calculation', 'direction', 'disaggregation', 'meansOfVerification', 'baselineMethod',
+  'targetJustification', 'assumptions', 'responsibility',
+] as const;
+
+export type ReferenceSheetField = typeof REFERENCE_SHEET_FIELDS[number];
+
+/** The indicator fields referenceSheetGaps reads: a create payload or a stored Indicator row. */
+export interface ReferenceSheetFields {
+  indicatorText: string;
+  indicatorTextAr?: string | null;
+  unit?: string | null;
+  definition?: string | null;
+  calculation?: unknown;
+  direction?: string | null;
+  disaggregation?: unknown;
+  meansOfVerification?: string | null;
+  baselineMethod?: string | null;
+  targetJustification?: string | null;
+  assumptions?: string | null;
+  responsibility?: string | null;
+}
+
+/** Empty, or still the "to be confirmed" marker. */
+function unconfirmed(value: unknown): boolean {
+  const t = text(value);
+  return t === '' || t === TO_BE_CONFIRMED;
+}
+
+/**
+ * The reference-sheet fields an M&E officer still has to fill or confirm: empty or
+ * "To be confirmed by the M&E officer" text (a generic means of verification counts as
+ * missing), the numerator or denominator of a percentage, a missing or unknown direction,
+ * and a people-level indicator without sex disaggregation (sex or sex_of_household_head).
+ * Pure; used by tests and scripts/ai-smoke.ts to check generated frameworks.
+ */
+export function referenceSheetGaps(indicator: ReferenceSheetFields): ReferenceSheetField[] {
+  const gaps = new Set<ReferenceSheetField>();
+  if (unconfirmed(indicator.definition)) gaps.add('definition');
+  if (isPercentUnit(indicator.unit ?? '', indicator.indicatorText)) {
+    const calc = isObject(indicator.calculation) ? indicator.calculation : {};
+    if (unconfirmed(calc.numerator) || unconfirmed(calc.denominator)) gaps.add('calculation');
+  }
+  if (normalizeDirection(indicator.direction) === null) gaps.add('direction');
+  if (isPeopleLevelIndicator(indicator.indicatorText, indicator.indicatorTextAr)) {
+    const keys = Array.isArray(indicator.disaggregation) ? indicator.disaggregation.map(text) : [];
+    if (!SEX_KEYS.some(key => keys.includes(key))) gaps.add('disaggregation');
+  }
+  const means = text(indicator.meansOfVerification);
+  if (unconfirmed(means) || isGenericMeansOfVerification(means)) gaps.add('meansOfVerification');
+  if (unconfirmed(indicator.baselineMethod)) gaps.add('baselineMethod');
+  if (unconfirmed(indicator.targetJustification)) gaps.add('targetJustification');
+  if (unconfirmed(indicator.assumptions)) gaps.add('assumptions');
+  if (unconfirmed(indicator.responsibility)) gaps.add('responsibility');
+  return REFERENCE_SHEET_FIELDS.filter(field => gaps.has(field));
 }

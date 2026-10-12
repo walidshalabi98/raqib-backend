@@ -1,11 +1,23 @@
-import Anthropic from '@anthropic-ai/sdk';
+/**
+ * AI framework generation (BUILD_GUIDE Phase 2 task 7, Phase 3): two structured-output calls on the
+ * main tier through the AI client, then deterministic normalisation (frameworkNormalize.ts).
+ * 1. "framework.structure": the coded results chain and the figures quoted in the documents
+ *    (skipped without documents; the results chain is then built from the project's metadata).
+ * 2. "framework.indicators": one draft reference sheet per indicator.
+ * Only aggregates and redacted document text reach the model; logs hold counts and ids only.
+ */
+
 import { IndicatorLevel, Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
-import { env } from '../../config/env';
-import { SYSTEM_CONTEXT } from './prompts/system';
+import { generateStructured } from './client';
+import { AiInvalidOutputError, AiOutputTruncatedError } from './errors';
 import {
+  FRAMEWORK_INDICATORS_SCHEMA,
+  FRAMEWORK_INDICATORS_SYSTEM,
   FRAMEWORK_PROMPT_VERSION,
+  FRAMEWORK_STRUCTURE_SYSTEM,
   FrameworkProjectInfo,
+  PROJECT_STRUCTURE_SCHEMA,
   extractProjectStructurePrompt,
   generateFrameworkPrompt,
 } from './prompts/framework';
@@ -14,6 +26,7 @@ import {
   ProjectStructure,
   SourceDocument,
   buildStructureFromMetadata,
+  documentTextForAi,
   extractIndicatorList,
   librarySectorsFor,
   linkedLibraryIds,
@@ -22,14 +35,12 @@ import {
   planResultNodes,
   projectSectors,
   selectLibraryCandidates,
-  stripAiAnalysis,
   structureForPrompt,
 } from './frameworkNormalize';
 
-const anthropic = new Anthropic({ apiKey: env.anthropicApiKey });
-
-/** Model used for framework generation; stored on each indicator (Indicator.aiModel). Phase 3 moves model ids to config. */
-export const FRAMEWORK_MODEL = 'claude-sonnet-4-20250514';
+/** Token limits and timeouts (thinking counts towards max tokens; the client retries a cut-off answer once with twice the limit). */
+const STRUCTURE_CALL = { maxTokens: 12_000, timeoutMs: 180_000 } as const;
+const INDICATORS_CALL = { maxTokens: 32_000, timeoutMs: 300_000 } as const;
 
 const LEVEL_ORDER: IndicatorLevel[] = ['impact', 'outcome', 'output', 'activity'];
 
@@ -38,13 +49,6 @@ const LIBRARY_ENTRY_SELECT = {
   id: true, sector: true, name: true, definition: true, unit: true, level: true, methods: true, frequency: true,
   disaggregation: true, standardReference: true, isStandard: true, notes: true, meansOfVerification: true, calculation: true,
 } satisfies Prisma.IndicatorLibraryEntrySelect;
-
-function responseText(response: Anthropic.Messages.Message): string {
-  return response.content
-    .filter(block => block.type === 'text')
-    .map(block => block.type === 'text' ? block.text : '')
-    .join('');
-}
 
 export async function generateFramework(frameworkId: string, projectId: string): Promise<void> {
   const project = await prisma.project.findUnique({
@@ -66,13 +70,18 @@ export async function generateFramework(frameworkId: string, projectId: string):
     throw new Error(`Framework ${frameworkId} already has results or indicators; generate a new framework version instead`);
   }
 
-  // Parsed document text is redacted by the document parser (no phone or ID numbers). The parser appends its own
-  // AI analysis after a marker; only the document's own text is used (prompts and evidence), so model output never
-  // "proves" a baseline or target.
+  // Only the documents' own, redacted text is used, for the prompt and as evidence for baselines and targets.
+  let removed = 0;
   const documents: SourceDocument[] = project.documents
-    .map(d => ({ fileName: d.fileName, text: stripAiAnalysis(d.parsedText ?? '') }))
+    .map(d => {
+      const own = documentTextForAi(d.parsedText);
+      removed += own.removed;
+      return { fileName: d.fileName, text: own.text };
+    })
     .filter(d => d.text.trim() !== '');
   const documentTexts = documents.map(d => d.text);
+  if (removed > 0) console.warn(`[FrameworkGenerator] Removed ${removed} phone, ID or email matches from unredacted document text`);
+  const context = { organizationId: project.organizationId, projectId };
 
   const sectors = projectSectors(project);
   const projectInfo: FrameworkProjectInfo = {
@@ -96,19 +105,25 @@ export async function generateFramework(frameworkId: string, projectId: string):
     console.log(`[FrameworkGenerator] Step 1: Extracting project structure from ${documentTexts.length} documents`);
     const structurePrompt = extractProjectStructurePrompt(documentTexts, projectInfo);
 
-    const structureResponse = await anthropic.messages.create({
-      model: FRAMEWORK_MODEL,
-      max_tokens: 8192,
-      system: SYSTEM_CONTEXT,
-      messages: [{ role: 'user', content: structurePrompt }],
-    });
-
     try {
-      structure = normalizeProjectStructure(JSON.parse(cleanJsonResponse(responseText(structureResponse))), { documentTexts });
-    } catch {
-      structure = null;
+      const answer = await generateStructured({
+        feature: 'framework.structure',
+        model: 'main',
+        effort: 'medium',
+        ...STRUCTURE_CALL,
+        system: FRAMEWORK_STRUCTURE_SYSTEM,
+        messages: [{ role: 'user', content: structurePrompt }],
+        schema: PROJECT_STRUCTURE_SCHEMA,
+        promptVersion: FRAMEWORK_PROMPT_VERSION,
+        context,
+      });
+      structure = normalizeProjectStructure(answer.data, { documentTexts });
+      if (!structure) console.warn('[FrameworkGenerator] The AI structure has no goal or outcomes, using metadata fallback');
+    } catch (err) {
+      // An unusable answer falls back to the metadata structure; refusals and request failures stop the job.
+      if (!(err instanceof AiInvalidOutputError || err instanceof AiOutputTruncatedError)) throw err;
+      console.warn(`[FrameworkGenerator] Unusable AI structure answer (${err.name}), using metadata fallback`);
     }
-    if (!structure) console.warn('[FrameworkGenerator] Failed to parse AI structure response, using metadata fallback');
   } else {
     // Step 1b: No documents — build the results chain from project metadata
     console.log(`[FrameworkGenerator] Step 1: No documents available, using project metadata`);
@@ -141,20 +156,21 @@ export async function generateFramework(frameworkId: string, projectId: string):
     { hasDocuments: documentTexts.length > 0 },
   );
 
-  const frameworkResponse = await anthropic.messages.create({
-    model: FRAMEWORK_MODEL,
-    max_tokens: 16000,
-    system: SYSTEM_CONTEXT,
+  // Errors propagate: the framework stays as it was and the job fails.
+  const indicatorAnswer = await generateStructured({
+    feature: 'framework.indicators',
+    model: 'main',
+    effort: 'medium',
+    ...INDICATORS_CALL,
+    system: FRAMEWORK_INDICATORS_SYSTEM,
     messages: [{ role: 'user', content: frameworkPrompt }],
+    schema: FRAMEWORK_INDICATORS_SCHEMA,
+    promptVersion: FRAMEWORK_PROMPT_VERSION,
+    context,
   });
-
-  let parsedIndicators: unknown;
-  try {
-    parsedIndicators = JSON.parse(cleanJsonResponse(responseText(frameworkResponse)));
-  } catch {
-    const cutOff = frameworkResponse.stop_reason === 'max_tokens' ? ' (the response was cut off at max_tokens)' : '';
-    throw new Error(`Failed to parse indicators from AI response${cutOff}`);
-  }
+  const parsedIndicators = indicatorAnswer.data;
+  // The served model (it may differ from the configured one after a server-side fallback).
+  const aiModel = indicatorAnswer.model;
 
   if (extractIndicatorList(parsedIndicators).length === 0) {
     throw new Error('AI returned empty or invalid indicator set');
@@ -203,7 +219,7 @@ export async function generateFramework(frameworkId: string, projectId: string):
       knownLibraryIds,
       libraryEntries,
       documents,
-      aiModel: FRAMEWORK_MODEL,
+      aiModel,
       promptVersion: FRAMEWORK_PROMPT_VERSION,
     });
     if (payloads.length === 0) throw new Error('AI returned empty or invalid indicator set');
@@ -214,7 +230,7 @@ export async function generateFramework(frameworkId: string, projectId: string):
     // Update framework status
     await tx.framework.update({
       where: { id: frameworkId },
-      data: { status: 'expert_review', aiModelUsed: FRAMEWORK_MODEL },
+      data: { status: 'expert_review', aiModelUsed: aiModel },
     });
 
     // Update project status
@@ -247,16 +263,4 @@ export async function generateFramework(frameworkId: string, projectId: string):
   }
 
   console.log(`[FrameworkGenerator] Framework generation complete for ${project.name} (${resultCount} results, ${indicatorCount} indicators)`);
-}
-
-/**
- * Clean AI response that might have markdown code fences
- */
-function cleanJsonResponse(text: string): string {
-  let cleaned = text.trim();
-  // Remove markdown code fences
-  if (cleaned.startsWith('```json')) cleaned = cleaned.slice(7);
-  else if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
-  if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
-  return cleaned.trim();
 }
