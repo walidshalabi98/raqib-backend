@@ -32,12 +32,32 @@ export const DOCUMENT_ANALYSIS_SCHEMA = z.object({
 
 export type DocumentAnalysisAnswer = z.infer<typeof DOCUMENT_ANALYSIS_SCHEMA>;
 
+/** A target the model reported, checked against the document text. */
+export interface VerifiedTargetMention {
+  indicator: string;
+  target: string;
+  timeline: string;
+  /**
+   * True only when the target is found in the document's redacted text by string match (as written,
+   * or every figure in it). False: the document may not contain it; check before use.
+   */
+  verified: boolean;
+}
+
+/** The normalised answer after the check against the document text (documentParser.verifyDocumentAnalysis). */
+export interface VerifiedDocumentAnalysis extends Omit<DocumentAnalysisAnswer, 'targetsMentioned'> {
+  targetsMentioned: VerifiedTargetMention[];
+  /** Numbers in the summary and key findings that the document text does not contain (years and single digits are not checked). */
+  unverifiedFigures: string[];
+}
+
 /**
  * What is stored in Document.aiAnalysis (contract with the services and the frontend).
- * Legacy rows instead hold the analysis in parsedText after the marker "---AI_ANALYSIS---"
- * (snake_case keys indicators_mentioned / targets_mentioned); readers accept both.
+ * Rows stored before the check lack `verified` and `unverifiedFigures`: readers treat a missing
+ * `verified` as false. Legacy analyses moved out of parsedText by the Phase 3 migration hold the old
+ * JSON (snake_case keys indicators_mentioned / targets_mentioned) or { legacyText }; readers accept all of these.
  */
-export interface StoredDocumentAnalysis extends DocumentAnalysisAnswer {
+export interface StoredDocumentAnalysis extends VerifiedDocumentAnalysis {
   /** Model that produced the analysis (served model id). */
   model: string;
   promptVersion: string;

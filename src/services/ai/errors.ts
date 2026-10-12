@@ -28,10 +28,24 @@ export class AiRefusalError extends AiError {
   }
 }
 
-/** The answer was cut off at max_tokens, even after one retry with a higher limit. */
+/**
+ * The answer was cut off: at max_tokens even after one retry with a higher limit, or because
+ * the prompt and answer filled the model's context window (no retry: more tokens cannot help).
+ */
 export class AiOutputTruncatedError extends AiError {
-  constructor(feature: string, public readonly maxTokens: number) {
-    super(`The AI answer was cut off at ${maxTokens} tokens (${feature}).`, feature);
+  constructor(
+    feature: string,
+    /** Output token limit of the last request. */
+    public readonly maxTokens: number,
+    /** API stop_reason that cut the answer off. */
+    public readonly stopReason: 'max_tokens' | 'model_context_window_exceeded' = 'max_tokens',
+  ) {
+    super(
+      stopReason === 'model_context_window_exceeded'
+        ? `The AI answer was cut off because the model's context window is full (${feature}).`
+        : `The AI answer was cut off at ${maxTokens} tokens (${feature}).`,
+      feature,
+    );
     this.name = 'AiOutputTruncatedError';
   }
 }

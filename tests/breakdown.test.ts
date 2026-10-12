@@ -3,6 +3,7 @@ import {
   BREAKDOWN_LIMITS, breakdownRules, formatNumber, isCountUnit, isPercentIndicatorText, isPercentUnit, parseNumeric,
   validateBreakdown,
 } from '../src/services/dataPoints/breakdown';
+import { INDICATOR_UNITS } from '../src/services/ai/prompts/framework';
 
 /** Runs validateBreakdown and returns its errors (fails the test when it passes). */
 function errorsOf(breakdown: unknown, value = '218', unit: string | null = 'number'): string[] {
@@ -34,6 +35,34 @@ describe('isCountUnit', () => {
     null, undefined, '', '   ', 'percent', '%', 'score', 'currency_ils', 'litres_per_person_per_day', 'hectares', 'yes_no', 'days', 'USD',
   ])('does not treat %j as a count (a blank unit is not a count)', unit => {
     expect(isCountUnit(unit as string | null | undefined)).toBe(false);
+  });
+
+  // The shared unit list (prompts/framework.ts INDICATOR_UNITS): only 'number' is a count.
+  it('treats only "number" of the shared unit list as a count', () => {
+    expect(INDICATOR_UNITS.filter(unit => isCountUnit(unit))).toEqual(['number']);
+    for (const unit of ['ratio', 'index', 'score', 'currency_usd', 'currency_eur', 'currency_jod', 'currency_ils', 'days', 'hours', 'minutes', 'km']) {
+      expect(breakdownRules(unit, 'Number of people per functioning latrine'), unit).toBe('none');
+    }
+  });
+
+  it.each([
+    'number per 1,000 live births', 'Number per 100k', 'number_per_1000', 'number/km2', 'number ratio', 'number index', 'number rate',
+  ])('does not treat the rate or ratio %j as a count', unit => {
+    expect(isCountUnit(unit)).toBe(false);
+  });
+});
+
+describe('validateBreakdown with ratio, index and other non-count units', () => {
+  it('accepts categories that do not add up to the value (a ratio is no count)', () => {
+    // 55 people per latrine overall; 48 in one location and 62 in the other.
+    const location = { location: { khan_younis: 48, deir_al_balah: 62 } };
+    expect(breakdownOf(location, '55', 'ratio')).toEqual(location);
+    expect(breakdownOf({ sex: { female: 0.97, male: 1.03 } }, '1', 'index')).toEqual({ sex: { female: 0.97, male: 1.03 } });
+    expect(breakdownOf({ location: { north: 320, south: 410 } }, '365', 'currency_usd')).toEqual({ location: { north: 320, south: 410 } });
+    expect(breakdownOf({ location: { north: 40, south: 25 } }, '32', 'minutes')).toEqual({ location: { north: 40, south: 25 } });
+    expect(breakdownOf(location, '55', 'number per 1,000 people')).toEqual(location);
+    // The same breakdown is rejected for a count.
+    expect(errorsOf(location, '55', 'number')).toEqual(['location: categories add up to 110 but the value is 55']);
   });
 });
 

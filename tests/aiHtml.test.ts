@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { escapeHtml, htmlList, htmlParagraphs } from '../src/services/ai/html';
+import { escapeHtml, figureWarning, htmlList, htmlParagraphs } from '../src/services/ai/html';
 import { parseIndicatorNumber, progressTowardTarget, valueTrend } from '../src/services/ai/indicatorFigures';
 
 describe('escapeHtml', () => {
@@ -54,6 +54,20 @@ describe('htmlList', () => {
     expect(htmlList([])).toBe('');
     expect(htmlList(['', '  '])).toBe('');
     expect(htmlList(null)).toBe('');
+  });
+});
+
+describe('figureWarning', () => {
+  it('lists the unverified figures in one visible, escaped line', () => {
+    expect(figureWarning(['36%', ' 1,500 '])).toBe('<p class="figure-check">Check these figures: 36%, 1,500 — not found in the data provided</p>');
+    expect(figureWarning(['<b>36</b>'])).toBe('<p class="figure-check">Check these figures: &lt;b&gt;36&lt;/b&gt; — not found in the data provided</p>');
+  });
+
+  it('returns "" when there is nothing to check', () => {
+    expect(figureWarning([])).toBe('');
+    expect(figureWarning([' '])).toBe('');
+    expect(figureWarning(undefined)).toBe('');
+    expect(figureWarning(null)).toBe('');
   });
 });
 

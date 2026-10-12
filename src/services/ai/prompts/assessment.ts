@@ -8,9 +8,10 @@
  * (knowledge/me-foundations.md §6).
  */
 import * as z from 'zod/v4';
+import { PROGRESS_NO_BASELINE_NOTE } from '../indicatorFigures';
 import { donorLabel } from './donors';
 
-export const ASSESSMENT_PROMPT_VERSION = 'assessment-report-v2';
+export const ASSESSMENT_PROMPT_VERSION = 'assessment-report-v3';
 
 /** The phrase the model must use when a figure is missing. */
 export const ASSESSMENT_DATA_NOT_AVAILABLE = 'data not available';
@@ -61,6 +62,7 @@ export const ASSESSMENT_SYSTEM = `You write assessment reports (baseline, midter
 
 Rules:
 - Use only the figures given (indicator values, status counts, achievement rate, progress toward target, participant counts, document figures). Never invent, estimate, extrapolate or calculate new numbers, percentages or statistics; copy figures exactly as given. Where a figure is needed but not given, write "${ASSESSMENT_DATA_NOT_AVAILABLE}".
+- "progressPercent" is already calculated from baseline to target; when an indicator has "progressNote": "${PROGRESS_NO_BASELINE_NOTE}", it is the current value as a share of the target, and you say so whenever you quote it.
 - Base every finding on the evidence given and name that evidence (indicator, qualitative entry type or document). Do not claim causes or results the data do not show; list missing data under data gaps.
 - Never output names of people, phone numbers, ID numbers, email addresses or addresses. Summarise what participants said without identifying anyone; paraphrase quotes that contain identifying details.
 - Placeholders such as "[phone removed]", "[ID number removed]" or "[email removed]" mark personal data removed for privacy: do not repeat them or guess what they hid.
@@ -76,9 +78,12 @@ export interface AssessmentIndicatorInput {
   baseline: string | null;
   target: string | null;
   current: string | null;
-  /** Percent of the way from baseline to target, calculated in code; null when it cannot be calculated. */
+  /** Progress in percent, calculated in code (indicatorFigures.indicatorProgress); null when it cannot be calculated. */
   progressPercent: number | null;
+  /** PROGRESS_NO_BASELINE_NOTE when progressPercent is current / target × 100 (no baseline recorded); absent otherwise. */
+  progressNote?: string;
   trend: string;
+  /** Values and areas redacted. */
   recentDataPoints: Array<{ value: string; date: string; method: string; area: string | null }>;
 }
 
@@ -92,6 +97,7 @@ export interface AssessmentQualitativeInput {
   /** Redacted excerpt. */
   excerpt: string;
   participants: number | null;
+  /** Redacted. */
   location: string | null;
 }
 
@@ -112,6 +118,7 @@ export interface AssessmentPromptInput {
     startDate: string;
     endDate: string;
     targetBeneficiaries: number | null;
+    /** Redacted. */
     geographicScope: string | null;
     budgetUsd: string | null;
   };
@@ -122,7 +129,7 @@ export interface AssessmentPromptInput {
   documents: AssessmentDocumentInput[];
 }
 
-/** The user message. Qualitative and document texts must already be redacted. */
+/** The user message. Free texts (qualitative and document texts, areas, locations, scope, values) must already be redacted. */
 export function assessmentPrompt(input: AssessmentPromptInput): string {
   const { project, statusCounts } = input;
   const notGiven = ASSESSMENT_DATA_NOT_AVAILABLE;

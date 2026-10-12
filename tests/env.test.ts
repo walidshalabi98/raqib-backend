@@ -88,10 +88,26 @@ describe('AI client settings', () => {
     expect(env).toMatchObject({ aiRequestTimeoutMs: 60000, aiMaxRetries: 3, aiRefusalFallback: 'default', voyageModel: 'voyage-4' });
   });
 
+  it('uses the default model ids for blank values and trims configured ones', () => {
+    // e.g. docker-compose `AI_MODEL_MAIN=${AI_MODEL_MAIN}` with the variable unset
+    expect(parseEnv({ ...valid, AI_MODEL_MAIN: '', AI_MODEL_FAST: '   ' })).toMatchObject({ aiModelMain: 'claude-sonnet-5-5', aiModelFast: 'claude-haiku-5-5' });
+    expect(parseEnv({ ...valid, AI_MODEL_MAIN: ' claude-opus-5-5 ', AI_MODEL_FAST: '\tclaude-haiku-4-5\n' })).toMatchObject({
+      aiModelMain: 'claude-opus-5-5',
+      aiModelFast: 'claude-haiku-4-5',
+    });
+  });
+
+  it('accepts a request timeout of up to one hour', () => {
+    expect(parseEnv({ ...valid, AI_REQUEST_TIMEOUT_MS: '3600000' }).aiRequestTimeoutMs).toBe(3_600_000);
+  });
+
   it.each([
     ['AI_REQUEST_TIMEOUT_MS', '999', /AI_REQUEST_TIMEOUT_MS: must be at least 1000/],
     ['AI_REQUEST_TIMEOUT_MS', 'sixty', /AI_REQUEST_TIMEOUT_MS: must be a number/],
     ['AI_REQUEST_TIMEOUT_MS', '1500.5', /AI_REQUEST_TIMEOUT_MS: must be a whole number/],
+    ['AI_REQUEST_TIMEOUT_MS', '3600001', /AI_REQUEST_TIMEOUT_MS: must be at most 3600000 \(one hour\)/],
+    // Above 2^31-1 ms Node's setTimeout fires after 1 ms, so every request would time out at once.
+    ['AI_REQUEST_TIMEOUT_MS', '9999999999999', /AI_REQUEST_TIMEOUT_MS: must be at most 3600000/],
     ['AI_MAX_RETRIES', '11', /AI_MAX_RETRIES: must be between 0 and 10/],
     ['AI_MAX_RETRIES', '-1', /AI_MAX_RETRIES: must be between 0 and 10/],
     ['AI_MAX_RETRIES', '2.5', /AI_MAX_RETRIES: must be a whole number/],

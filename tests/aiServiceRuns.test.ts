@@ -1,5 +1,6 @@
+import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { hasTestDatabase, resetDatabase } from './helpers';
+import { bearer, hasTestDatabase, resetDatabase } from './helpers';
 
 // The five AI services end to end against the test database; only generateStructured is
 // mocked (never the SDK, never the network).
@@ -13,12 +14,13 @@ vi.mock('../src/services/ai/client', () => ({
   resolveModel: (tier: string) => (tier === 'fast' ? 'claude-haiku-5-5' : 'claude-sonnet-5-5'),
 }));
 
+import app from '../src/app';
 import { prisma } from '../src/config/prisma';
 import { generateIndicatorAlternatives } from '../src/services/ai/indicatorAlternative';
 import { codeQualitativeEntry } from '../src/services/ai/qualitativeCoder';
 import { generateReportNarrative } from '../src/services/ai/reportNarrative';
 import { analyzeProjectRisks } from '../src/services/ai/riskAnalyzer';
-import { generateAutoAssessment } from '../src/services/ai/assessmentGenerator';
+import { ASSESSMENT_SAVE_FAILED, generateAutoAssessment } from '../src/services/ai/assessmentGenerator';
 import { AiInvalidOutputError, AiRefusalError, AiRequestError } from '../src/services/ai/errors';
 import { ALTERNATIVES_PROMPT_VERSION, ALTERNATIVES_SCHEMA, ALTERNATIVES_SYSTEM } from '../src/services/ai/prompts/alternatives';
 import { QUALITATIVE_PROMPT_VERSION, QUALITATIVE_SCHEMA, QUALITATIVE_SYSTEM } from '../src/services/ai/prompts/qualitative';
@@ -92,17 +94,25 @@ type Seed = Awaited<ReturnType<typeof seedProject>>;
 async function addIndicator(seed: Seed, data: {
   indicatorText: string;
   status?: 'on_track' | 'at_risk' | 'off_track' | 'not_started' | 'completed';
+  level?: 'outcome' | 'output';
+  unit?: string;
+  direction?: 'increase' | 'decrease' | 'maintain';
   baselineValue?: string;
   targetValue?: string;
   currentValue?: string;
   values?: string[];
+  /** Area of each value (default Hebron). */
+  areas?: string[];
+  breakdown?: object;
   sortOrder?: number;
+  frameworkId?: string;
 }) {
   const indicator = await prisma.indicator.create({
     data: {
-      frameworkId: seed.framework.id, resultId: seed.result.id, indicatorText: data.indicatorText, level: 'outcome',
+      frameworkId: data.frameworkId ?? seed.framework.id, resultId: data.frameworkId ? undefined : seed.result.id, indicatorText: data.indicatorText,
+      level: data.level ?? 'outcome', direction: data.direction,
       dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: ['baseline', 'endline'], status: data.status ?? 'not_started',
-      baselineValue: data.baselineValue, targetValue: data.targetValue, currentValue: data.currentValue, unit: 'percentage',
+      baselineValue: data.baselineValue, targetValue: data.targetValue, currentValue: data.currentValue, unit: data.unit ?? 'percentage',
       definition: 'Households reporting income in each of the last three months', sortOrder: data.sortOrder ?? 0,
     },
   });
@@ -111,12 +121,21 @@ async function addIndicator(seed: Seed, data: {
     await prisma.dataPoint.create({
       data: {
         indicatorId: indicator.id, projectId: seed.project.id, value, collectionDate: new Date(Date.UTC(2026, 8 - i * 3, 1)),
-        collectionMethod: 'hh_survey', geographicArea: 'Hebron', createdBy: seed.officer.id,
-        notes: `Enumerator called ${PHONE}`, breakdown: { sex: { female: 60, male: 40 } },
+        collectionMethod: 'hh_survey', geographicArea: data.areas?.[i] ?? 'Hebron', createdBy: seed.officer.id,
+        notes: `Enumerator called ${PHONE}`, breakdown: data.breakdown ?? { sex: { female: 60, male: 40 } },
       },
     });
   }
   return indicator;
+}
+
+/** A newer framework version whose AI generation failed, with an indicator that must never be used. */
+async function addFailedVersion(seed: Seed, status: 'draft' | 'approved' = 'approved') {
+  const failed = await prisma.framework.create({
+    data: { projectId: seed.project.id, version: 2, status, generationError: 'AI generation failed: the AI service could not be reached. Try again later.' },
+  });
+  await addIndicator(seed, { indicatorText: 'Indicator of the failed version', status: 'off_track', frameworkId: failed.id, values: ['1', '2'] });
+  return failed;
 }
 
 describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () => {
@@ -243,6 +262,23 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
       expect(stored.content).toBe(CONTENT);
     });
 
+    it('links only to indicators of the current framework, never of a failed newer version', async () => {
+      const seed = await seedProject();
+      const income = await addIndicator(seed, { indicatorText: '% of households with a stable monthly income' });
+      const failed = await addFailedVersion(seed);
+      await addIndicator(seed, { indicatorText: 'Stable monthly household income (failed version)', frameworkId: failed.id });
+      const entry = await prisma.qualitativeEntry.create({ data: { projectId: seed.project.id, entryType: 'field_notes', title: 'Notes', content: 'Income is stable.' } });
+      mocks.generateStructured.mockResolvedValue(structuredResult({
+        themes: ['Income'], sentiment: 'positive', keyQuotes: [], summary: 'S',
+        suggestedIndicatorLinks: [{ indicatorKeywords: 'stable monthly household income', relevance: 'Income.' }],
+      }, QUALITATIVE_PROMPT_VERSION));
+
+      await codeQualitativeEntry(entry.id, seed.project.id);
+
+      const stored = await prisma.qualitativeEntry.findUniqueOrThrow({ where: { id: entry.id } });
+      expect(stored.linkedIndicators).toEqual([income.id]);
+    });
+
     it('logs ids and counts only', async () => {
       const seed = await seedProject();
       const entry = await prisma.qualitativeEntry.create({
@@ -313,8 +349,8 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
       expect(prompt).toContain('Baseline: data not available | Target: data not available | Current: data not available | Progress toward target: data not available');
       expect(prompt).toContain('REPORTING PERIOD: 2026-07-01 to 2026-09-30');
       expect(prompt).toContain('DG ECHO');
-      // Aggregated breakdowns are sent (jsonb may reorder the keys).
-      expect(prompt).toMatch(/40 \(2026-09-01; area Hebron; breakdown \{"sex":\{("male":40,"female":60|"female":60,"male":40)\}\}\)/);
+      // Aggregated breakdowns are sent per dimension (jsonb may reorder the keys).
+      expect(prompt).toMatch(/40 \(2026-09-01; area Hebron; breakdown sex: (male 40, female 60|female 60, male 40)\)/);
       // Data point notes are free text and never sent.
       expect(prompt).not.toContain(PHONE);
 
@@ -328,7 +364,46 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
       expect(html).toContain('<h2>Progress Against Targets</h2>');
       expect(html).toContain('<p>Cooperatives: data not available.</p>');
       expect(html).toContain('<li>Call [phone removed] for details</li>');
-      expect(html).toContain(`report-narrative-v2; ${MAIN_MODEL}`);
+      expect(html).toContain(`report-narrative-v3; ${MAIN_MODEL}`);
+      // Every figure of this answer was sent: no warning.
+      expect(html).not.toContain('class="figure-check"');
+    });
+
+    it('uses the current framework, redacts areas, values and labels, labels no-baseline progress and flags invented figures', async () => {
+      const seed = await seedProject();
+      await addIndicator(seed, {
+        indicatorText: 'Number of people receiving trucked water', level: 'output', unit: 'number', status: 'at_risk',
+        targetValue: '12,000', currentValue: '8,000', values: ['8000', `6000 (enumerator ${PHONE})`],
+        areas: [`Rafah, office ${PHONE}`, 'Rafah'], breakdown: { sex: { female: 4100, male: 3900 }, location: { [`Shelter ${ID_NUMBER}`]: 8000 } },
+      });
+      await addFailedVersion(seed);
+      const report = await prisma.report.create({ data: { projectId: seed.project.id, type: 'monthly_progress', title: 'September' } });
+      mocks.generateStructured.mockResolvedValue(structuredResult({
+        executiveSummary: '8,000 of 12,000 people reached (67% of target; no baseline recorded).',
+        progress: 'Coverage rose by 33% since June.',
+        challenges: 'None.',
+        patterns: 'Women 4,100; men 3,900.',
+        recommendations: ['Reach 4,000 more people by December.'],
+      }, NARRATIVE_PROMPT_VERSION, MAIN_MODEL));
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      await generateReportNarrative(report.id, seed.project.id);
+
+      const prompt = callParams().messages[0].content;
+      expect(prompt).not.toContain('Indicator of the failed version');
+      expect(prompt).toContain('Progress toward target: 67% (of target; no baseline recorded)');
+      for (const value of [PHONE, ID_NUMBER]) expect(prompt).not.toContain(value);
+      expect(prompt).toContain('area Rafah, office [phone removed]');
+      expect(prompt).toContain('6000 (enumerator [phone removed])');
+      expect(prompt).toContain('Shelter [ID number removed] 8000');
+
+      const html = (await prisma.report.findUniqueOrThrow({ where: { id: report.id } })).aiNarrative!;
+      expect(html).toContain('<p>Coverage rose by 33% since June.</p><p class="figure-check">Check these figures: 33% — not found in the data provided</p>');
+      expect(html).toContain('Check these figures: 4,000 — not found in the data provided');
+      expect(html.split('class="figure-check"').length - 1).toBe(2);
+      const lines = log.mock.calls.map(args => args.join(' ')).join('\n');
+      expect(lines).toContain('2 unverified figures');
+      expect(lines).not.toContain('33%');
     });
 
     it('propagates AI errors and leaves the report untouched', async () => {
@@ -352,6 +427,14 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
       });
       const bareReport = await prisma.report.create({ data: { projectId: bare.id, type: 'monthly_progress', title: 'R' } });
       await expect(generateReportNarrative(bareReport.id, bare.id)).rejects.toThrow(/No framework/);
+
+      // A project whose only framework version failed has no current framework.
+      const failedOnly = await prisma.project.create({
+        data: { organizationId: seed.org.id, name: 'Failed', sector: 'health', donor: 'X', donorType: 'other', startDate: new Date('2026-01-01'), endDate: new Date('2026-12-31') },
+      });
+      await prisma.framework.create({ data: { projectId: failedOnly.id, version: 1, generationError: 'AI generation failed.' } });
+      const failedReport = await prisma.report.create({ data: { projectId: failedOnly.id, type: 'monthly_progress', title: 'R' } });
+      await expect(generateReportNarrative(failedReport.id, failedOnly.id)).rejects.toThrow(/No framework/);
       expect(mocks.generateStructured).not.toHaveBeenCalled();
     });
   });
@@ -393,6 +476,33 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
       expect(risks.map(r => r.indicatorId)).not.toContain('not-an-input-id');
     });
 
+    it('ignores a failed newer version, keeps the computed trend and replaces texts with invented figures', async () => {
+      const seed = await seedProject();
+      // A "decrease" indicator rising from 22% to 30% in Rafah; a Gaza value in between must not be compared.
+      const worse = await addIndicator(seed, {
+        indicatorText: 'Households resorting to negative coping', status: 'off_track', direction: 'decrease',
+        baselineValue: '22%', targetValue: '10%', currentValue: '30%', values: ['30%', '45%', '22%'], areas: ['Rafah', 'Gaza', 'Rafah'],
+      });
+      await addFailedVersion(seed);
+      mocks.generateStructured.mockResolvedValue(structuredResult({
+        risks: [{ indicatorId: worse.id, riskLevel: 'low', trend: 'improving', analysis: 'Rose from 22% to 30%, showing strong improvement of 36%.', suggestedActions: ['Food vouchers'], estimatedImpact: 'Outcome 2 delayed.' }],
+      }, RISK_PROMPT_VERSION));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      const risks = await analyzeProjectRisks(seed.project.id);
+
+      const prompt = callParams().messages[0].content;
+      expect(prompt).not.toContain('Indicator of the failed version');
+      expect(prompt).toContain('"computedTrend": "declining"');
+      expect(risks).toEqual([expect.objectContaining({
+        indicatorId: worse.id, riskLevel: 'low', trend: 'declining',
+        aiAnalysis: 'This outcome indicator is off track and requires attention.', suggestedActions: ['Food vouchers'], estimatedImpact: 'Outcome 2 delayed.',
+      })]);
+      const warned = warn.mock.calls.map(args => args.join(' ')).join('\n');
+      expect(warned).toContain('1 AI texts held figures not in the data');
+      expect(warned).not.toContain('36%');
+    });
+
     it('falls back to the deterministic assessment on any AI error and logs the error class only', async () => {
       const seed = await seedProject();
       await addIndicator(seed, { indicatorText: 'Households reached', status: 'off_track', values: ['400', '450'] });
@@ -421,6 +531,27 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
 
       expect(await analyzeProjectRisks('00000000-0000-0000-0000-000000000000')).toEqual([]);
       expect(mocks.generateStructured).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('dashboard routes read the current framework', () => {
+    it('project dashboard and overview ignore failed and older versions', async () => {
+      const seed = await seedProject();
+      await addIndicator(seed, { indicatorText: 'Current off-track indicator', status: 'off_track' });
+      await addFailedVersion(seed);
+      const old = await prisma.framework.create({ data: { projectId: seed.project.id, version: 0, status: 'approved' } });
+      await addIndicator(seed, { indicatorText: 'Old off-track indicator', status: 'off_track', frameworkId: old.id });
+      const auth = bearer(seed.admin);
+
+      const dashboard = await request(app).get(`/api/dashboard/projects/${seed.project.id}/dashboard`).set('Authorization', auth);
+      expect(dashboard.status).toBe(200);
+      expect(dashboard.body.framework).toMatchObject({ id: seed.framework.id, version: 1, totalIndicators: 1 });
+      expect(dashboard.body.trends.map((t: { indicatorText: string }) => t.indicatorText)).toEqual(['Current off-track indicator']);
+
+      const overview = await request(app).get('/api/dashboard/overview').set('Authorization', auth);
+      expect(overview.status).toBe(200);
+      expect(overview.body.projects[0]).toMatchObject({ totalIndicators: 1, indicatorStatus: expect.objectContaining({ off_track: 1 }) });
+      expect(overview.body.alerts).toEqual([{ indicatorId: expect.any(String), indicatorText: 'Current off-track indicator', projectName: seed.project.name }]);
     });
   });
 
@@ -537,6 +668,108 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
       await generateAutoAssessment(seed.assessment.id, seed.project.id, 'midterm');
       const assessment = await prisma.assessment.findUniqueOrThrow({ where: { id: seed.assessment.id } });
       expect(assessment).toMatchObject({ status: 'analysis', scopeDescription: expect.stringMatching(/^AI generation failed: the AI model declined/) });
+    });
+
+    it('uses the current framework, leaves transcripts out of the documents and redacts locations, scope, areas and values', async () => {
+      const seed = await seedAssessment();
+      await addFailedVersion(seed, 'draft');
+      await prisma.project.update({ where: { id: seed.project.id }, data: { geographicScope: `Hebron; coordinator ${PHONE}` } });
+      await prisma.qualitativeEntry.updateMany({ where: { projectId: seed.project.id }, data: { location: `KII at home of informant, ${PHONE}` } });
+      const indicator = await prisma.indicator.findFirstOrThrow({ where: { frameworkId: seed.framework.id, indicatorText: '% of households with a stable income' } });
+      await prisma.dataPoint.updateMany({ where: { indicatorId: indicator.id }, data: { geographicArea: `Hebron, office ${PHONE}`, value: `40 (call ${PHONE})` } });
+      await prisma.document.create({
+        data: {
+          projectId: seed.project.id, uploadedBy: seed.officer.id, fileName: 'fgd-transcript.txt', fileUrl: 'x', fileType: 'other', parsingStatus: 'completed',
+          parsedText: 'Transcript: Umm Ahmad said the grant arrived late.', qualitativeSource: true,
+          aiAnalysis: { summary: 'Transcript summary of Umm Ahmad.', keyFindings: ['Transcript finding'] },
+        },
+      });
+      mocks.generateStructured.mockResolvedValue(structuredResult(ANSWER, ASSESSMENT_PROMPT_VERSION, MAIN_MODEL));
+
+      await generateAutoAssessment(seed.assessment.id, seed.project.id, 'midterm');
+
+      const text = sentText(callParams());
+      expect(text).not.toContain('Indicator of the failed version');
+      expect(text).not.toContain('fgd-transcript.txt');
+      expect(text).not.toContain('Umm Ahmad');
+      expect(text).not.toContain(PHONE);
+      expect(text).toContain('Hebron; coordinator [phone removed]');
+      expect(text).toContain('KII at home of informant, [phone removed]');
+      expect(text).toContain('Hebron, office [phone removed]');
+      expect(text).toContain('40 (call [phone removed])');
+      expect((await prisma.assessment.findUniqueOrThrow({ where: { id: seed.assessment.id } })).status).toBe('delivered');
+    });
+
+    it('lists invented figures in the stored JSON and the report, and labels progress without a baseline', async () => {
+      const seed = await seedAssessment();
+      await addIndicator(seed, { indicatorText: 'People receiving trucked water', level: 'output', unit: 'number', status: 'on_track', targetValue: '12,000', currentValue: '8,000', sortOrder: 2 });
+      mocks.generateStructured.mockResolvedValue(structuredResult({
+        ...ANSWER,
+        executiveSummary: 'Achievement is 50%; trucked water reached 67% of target.',
+        keyFindings: [{ area: 'Income', finding: 'Income rose by 17.5 points.', evidence: 'Current 40% against target 60%.', rating: 'moderate' }],
+        nextSteps: ['Survey 350 households'],
+      }, ASSESSMENT_PROMPT_VERSION, MAIN_MODEL));
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      await generateAutoAssessment(seed.assessment.id, seed.project.id, 'midterm');
+
+      const text = sentText(callParams());
+      expect(text).toContain('"progressPercent": 67,\n    "progressNote": "of target; no baseline recorded"');
+      const assessment = await prisma.assessment.findUniqueOrThrow({ where: { id: seed.assessment.id } });
+      expect(JSON.parse(assessment.scopeDescription!).unverifiedFigures).toEqual(['17.5', '350']);
+      const [report] = await prisma.report.findMany({ where: { projectId: seed.project.id } });
+      expect(report.aiNarrative).toContain('Check these figures: 17.5 — not found in the data provided');
+      expect(report.aiNarrative).toContain('Check these figures: 350 — not found in the data provided');
+      const lines = log.mock.calls.map(args => args.join(' ')).join('\n');
+      expect(lines).toContain('2 unverified figures');
+      expect(lines).not.toContain('350');
+    });
+
+    it('marks the assessment failed with a safe message when gathering the data fails, without calling the model', async () => {
+      const seed = await seedAssessment();
+      vi.spyOn(prisma.framework, 'findFirst').mockRejectedValue(new Error(`connection lost while reading ${PHONE}`));
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      await expect(generateAutoAssessment(seed.assessment.id, seed.project.id, 'midterm')).resolves.toBeUndefined();
+
+      expect(mocks.generateStructured).not.toHaveBeenCalled();
+      const assessment = await prisma.assessment.findUniqueOrThrow({ where: { id: seed.assessment.id } });
+      expect(assessment).toMatchObject({ status: 'analysis', scopeDescription: 'AI generation failed: an unexpected error occurred. Try again.', deliveredAt: null });
+      const logged = error.mock.calls.map(args => args.join(' ')).join('\n');
+      expect(logged).not.toContain(PHONE);
+    });
+
+    it('never discards a delivered answer: when the report transaction fails, the assessment alone is saved', async () => {
+      const seed = await seedAssessment();
+      mocks.generateStructured.mockResolvedValue(structuredResult(ANSWER, ASSESSMENT_PROMPT_VERSION, MAIN_MODEL));
+      vi.spyOn(prisma, '$transaction').mockRejectedValue(new Error('report insert failed'));
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      await generateAutoAssessment(seed.assessment.id, seed.project.id, 'midterm');
+
+      const assessment = await prisma.assessment.findUniqueOrThrow({ where: { id: seed.assessment.id } });
+      expect(assessment.status).toBe('delivered');
+      expect(assessment.deliveredAt).not.toBeNull();
+      expect(JSON.parse(assessment.scopeDescription!)).toMatchObject({ model: MAIN_MODEL, nextSteps: ['Collect Q4 data'], unverifiedFigures: [] });
+      // Nothing of the failed transaction was written.
+      expect(await prisma.report.count({ where: { projectId: seed.project.id } })).toBe(0);
+      expect(await prisma.notification.count()).toBe(0);
+    });
+
+    it('records a safe message when the answer cannot be saved at all', async () => {
+      const seed = await seedAssessment();
+      mocks.generateStructured.mockResolvedValue(structuredResult(ANSWER, ASSESSMENT_PROMPT_VERSION, MAIN_MODEL));
+      vi.spyOn(prisma, '$transaction').mockRejectedValue(new Error('database unavailable'));
+      const update = prisma.assessment.update.bind(prisma.assessment);
+      vi.spyOn(prisma.assessment, 'update').mockImplementation(((args: { data: { status?: string } }) => (
+        args.data.status === 'delivered' ? Promise.reject(new Error('database unavailable')) : update(args as never)
+      )) as never);
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      await generateAutoAssessment(seed.assessment.id, seed.project.id, 'midterm');
+
+      const assessment = await prisma.assessment.findUniqueOrThrow({ where: { id: seed.assessment.id } });
+      expect(assessment).toMatchObject({ status: 'analysis', scopeDescription: ASSESSMENT_SAVE_FAILED, deliveredAt: null });
     });
 
     it('refuses an assessment of another project without touching it', async () => {

@@ -8,12 +8,14 @@
  * only: no database access, so the rules are unit-tested (CLAUDE.md rule 7).
  *
  * Which rules apply (breakdownRules):
- *   - a count unit (number, people, households…): every dimension adds up to the value;
+ *   - a count unit ('number' and its aliases people, households…): every dimension adds up to the value;
  *   - a percent unit: every category is between 0 and 100, no sum check;
  *   - no unit: inferred from the indicator text ("% of…", "proportion", "rate",
  *     نسبة, معدل… → percent rules), otherwise no sum check, because a blank
  *     unit does not tell us the indicator counts something;
- *   - any other unit (score, currency…): no sum check.
+ *   - any other unit of the shared unit list (prompts/framework.ts INDICATOR_UNITS: score, ratio,
+ *     index, currency_*, days, hours, minutes, km, litres…), or a "number per …" rate: no sum check,
+ *     since the categories of an average, a ratio or an amount do not add up to the total.
  */
 
 export type Breakdown = Record<string, Record<string, number>>;
@@ -41,13 +43,20 @@ function normaliseUnit(unit: string | null | undefined): string {
   return (unit ?? '').trim().toLowerCase();
 }
 
+/** A rate or ratio written as a number: "number per 1,000 live births", "number/km2", "number_per_100k". */
+const RATE_WORDS = /(^|[\s_])(per|ratio|rate|index)([\s_]|$)|\//;
+
 /**
  * True when the unit says the indicator counts something, so each breakdown
- * dimension must add up to the value. A blank unit is not a count (see breakdownRules).
+ * dimension must add up to the value: 'number' and its aliases ("count", "people",
+ * "number of households"…), but not a rate ("number per 1,000 people"). A blank unit
+ * is not a count (see breakdownRules); neither is a ratio, an index, a score, an
+ * amount of money, a duration or a distance.
  */
 export function isCountUnit(unit: string | null | undefined): boolean {
   const u = normaliseUnit(unit);
-  return u !== '' && (COUNT_UNITS.has(u) || u.startsWith('number'));
+  if (u === '' || RATE_WORDS.test(u)) return false;
+  return COUNT_UNITS.has(u) || u.startsWith('number');
 }
 
 /** True for '%', 'percent', 'percentage' (and forms such as "% of households"). */

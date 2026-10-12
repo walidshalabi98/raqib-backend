@@ -34,7 +34,8 @@ describe('upload validation', () => {
     ['report.pdf', 'application/pdf', true],
     ['logframe.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', true],
     ['proposal.docx', 'application/octet-stream', true],
-    ['old.doc', 'application/msword', true],
+    ['old.doc', 'application/msword', false], // Word 97–2003: cannot be parsed, refused with advice
+    ['old.doc', 'application/octet-stream', false],
     ['old.xls', 'application/vnd.ms-excel', false],
     ['script.js', 'application/javascript', false],
     ['image.pdf', 'image/png', false],
@@ -47,7 +48,7 @@ describe('upload validation', () => {
     expect(hasExpectedSignature('a.pdf', Buffer.from('%PDF-1.7'))).toBe(true);
     expect(hasExpectedSignature('a.pdf', Buffer.from('PK\x03\x04'))).toBe(false);
     expect(hasExpectedSignature('a.docx', Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14]))).toBe(true);
-    expect(hasExpectedSignature('a.doc', Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1]))).toBe(true);
+    expect(hasExpectedSignature('a.doc', Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1]))).toBe(false);
     expect(hasExpectedSignature('a.xlsx', Buffer.from('%PDF'))).toBe(false);
     expect(hasExpectedSignature('a.pdf', Buffer.from('%P'))).toBe(false);
   });

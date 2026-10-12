@@ -6,7 +6,8 @@
  *
  * Prices are USD per million tokens (Anthropic first-party API, checked October 2026).
  * An unknown model (e.g. a new id set in AI_MODEL_MAIN) gets no effort, no fallback and
- * a null cost rather than a guess.
+ * no cost estimate rather than a guess (client.ts leaves its tokens out of the cost and logs
+ * a warning). Every model a server-side fallback can route to must be listed here.
  */
 
 export interface ModelPrice {
@@ -47,6 +48,13 @@ export const MODELS: Readonly<Record<string, ModelInfo>> = {
     price: { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
     supportsEffort: true,
     serverFallback: true,
+  },
+  // Anthropic's "default" fallback target for cyber-category refusals on Opus 5 and Opus 5.5:
+  // it can serve a call made to those models, so its tokens need a price.
+  'claude-opus-4-8': {
+    price: { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
+    supportsEffort: true,
+    serverFallback: false,
   },
   'claude-sonnet-5-5': {
     price: { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.2 },

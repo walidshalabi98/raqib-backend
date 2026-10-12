@@ -4,7 +4,14 @@ import app from '../src/app';
 import { prisma } from '../src/config/prisma';
 import type { GenerateStructuredParams, StructuredResult } from '../src/services/ai/client';
 import { AiRefusalError } from '../src/services/ai/errors';
-import { TO_BE_CONFIRMED, appearsInDocuments, isPeopleLevelIndicator, referenceSheetGaps } from '../src/services/ai/frameworkNormalize';
+import {
+  BASELINE_DATE_TO_BE_CONFIRMED,
+  INTERMEDIATE_TARGETS_TO_BE_CONFIRMED,
+  TO_BE_CONFIRMED,
+  appearsInDocuments,
+  isPeopleLevelIndicator,
+  referenceSheetGaps,
+} from '../src/services/ai/frameworkNormalize';
 import {
   FRAMEWORK_INDICATORS_SCHEMA,
   FRAMEWORK_INDICATORS_SYSTEM,
@@ -15,9 +22,11 @@ import { redactPersonalData } from '../src/services/ai/redact';
 import { seedLibrary } from '../src/services/library/seed';
 import {
   AI_CALL_HEADER,
+  NOT_SHARED_FLAG,
   SEED_PROJECT_NAME,
   aiCallRows,
   apiKeyProblem,
+  databaseProblem,
   formatTable,
   gapRows,
   levelRows,
@@ -31,10 +40,12 @@ import { createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './
  * Phase 3 acceptance criterion (docs/BUILD_GUIDE.md): "A framework generation on the seed project
  * completes and stores indicators with all new fields filled or explicitly marked 'to be confirmed'."
  *
- * The project, document and library match the dev seed (prisma/seed.ts: the DG ECHO project without a
- * framework, and knowledge/indicator-library.json). The AI client is mocked with realistic, schema-valid
- * answers in which some fields are deliberately empty and some figures invented; everything after the
- * model call (normalisation, rules, storage) is the real code. The real-API run is scripts/ai-smoke.ts.
+ * The project and the library match the dev seed (prisma/seed.ts: the DG ECHO project without a
+ * framework, and knowledge/indicator-library.json). The dev seed has no document, so this test adds a
+ * made-up proposal to also run the structure step; `npm run ai:smoke` on the seed project runs the
+ * indicator step only. The AI client is mocked with realistic, schema-valid answers in which some fields
+ * are deliberately empty and some figures invented; everything after the model call (normalisation,
+ * rules, storage) is the real code. The real-API run is scripts/ai-smoke.ts.
  */
 
 // tests/setup.ts mocks the generator for route tests; this file runs the real one.
@@ -54,14 +65,16 @@ const DOCUMENT_NAME = 'gaza-wash-cash-proposal.pdf';
 const PROPOSAL = [
   'Gaza Emergency WASH and Cash Response: proposal to DG ECHO (2026).',
   'Context. The rapid needs assessment carried out in December 2025 found that displaced households in Khan Younis and Deir al-Balah had access to an average of 6 litres of water per person per day. 38% of assessed households reported having no soap.',
-  'Results. Specific objective 1: displaced and host-community households have sufficient safe water and practise safe hygiene. Result 1.1: 12,000 people receive trucked drinking water for nine months. Result 1.2: 2,400 hygiene kits are distributed to displaced households.',
-  'Specific objective 2: households meet their basic needs in dignity. Result 2.1: 1,800 households receive three rounds of multipurpose cash.',
+  'Results. Specific objective 1: displaced and host-community households have sufficient safe water and practise safe hygiene. Result 1.1: 12,000 people receive trucked drinking water for nine months (6,000 by the end of March 2026). Result 1.2: 2,400 hygiene kits are distributed to displaced households.',
+  'Specific objective 2: households meet their basic needs in dignity. Result 2.1: 1,800 households receive three rounds of multipurpose cash, the first on 15 March 2026.',
+  'Budget. Post-distribution monitoring survey: 400 households, 80 ILS per interview, 32,000 ILS.',
   'Field coordinator: 0599 123 456, coordinator@example.org (staff ID 401234567).',
 ].join('\n\n');
 const PERSONAL_DATA = ['0599 123 456', 'coordinator@example.org', '401234567'];
 
-const EMPTY_CALCULATION = { numerator: '', denominator: '', formula: '' };
+const EMPTY_CALCULATION = { numerator: '', denominator: '', formula: '', rounding: '' };
 const PERCENT = 'numerator ÷ denominator × 100';
+const PERCENT_CALCULATION = { formula: PERCENT, rounding: '1 decimal place' };
 
 const STRUCTURE_ANSWER = {
   goal: {
@@ -94,11 +107,15 @@ const STRUCTURE_ANSWER = {
   crossCuttingThemes: ['gender', 'disability_inclusion', 'accountability_to_affected_people'],
   documentFigures: [
     { resultCode: 'O1', kind: 'baseline', value: '6', description: 'litres of water per person per day', quote: 'access to an average of 6 litres of water per person per day' },
-    { resultCode: 'O1.1', kind: 'target', value: '12,000', description: 'people receiving trucked water', quote: 'Result 1.1: 12,000 people receive trucked drinking water for nine months.' },
+    { resultCode: 'O1', kind: 'baseline', value: '38%', description: 'households without soap', quote: '38% of assessed households reported having no soap.' },
+    { resultCode: 'O1.1', kind: 'target', value: '12,000', description: 'people receiving trucked water', quote: 'Result 1.1: 12,000 people receive trucked drinking water for nine months' },
+    { resultCode: 'O1.1', kind: 'target', value: '6,000', description: 'people receiving trucked water by March 2026', quote: '(6,000 by the end of March 2026)' },
     { resultCode: 'O1.2', kind: 'target', value: '2,400', description: 'hygiene kits', quote: 'Result 1.2: 2,400 hygiene kits are distributed to displaced households.' },
-    { resultCode: 'O2.1', kind: 'target', value: '1,800', description: 'households receiving cash', quote: 'Result 2.1: 1,800 households receive three rounds of multipurpose cash.' },
+    { resultCode: 'O2.1', kind: 'target', value: '1,800', description: 'households receiving cash', quote: 'Result 2.1: 1,800 households receive three rounds of multipurpose cash' },
     // Invented: not in the document, so it never reaches the indicator prompt.
-    { resultCode: 'O2', kind: 'target', value: '70%', description: 'households meeting basic needs', quote: '' },
+    { resultCode: 'O2', kind: 'target', value: '70%', description: 'households meeting basic needs', quote: '70% of households meet their basic needs' },
+    // A date is no figure: the 15 of "15 March 2026" does not stand alone.
+    { resultCode: 'O2.1', kind: 'target', value: '15', description: 'first cash round', quote: 'the first on 15 March 2026' },
   ],
 };
 
@@ -107,8 +124,8 @@ function indicator(overrides: Record<string, unknown>): Record<string, unknown> 
   return {
     resultCode: 'O1', level: 'outcome', indicatorText: '', indicatorTextAr: '', libraryId: '', standardReferenceCode: '', definition: '',
     unit: 'number', calculation: EMPTY_CALCULATION, direction: 'increase', disaggregation: [], dataCollectionMethod: 'document_review',
-    frequency: 'quarterly', meansOfVerification: '', baselineValue: '', baselineBasis: 'none', baselineMethod: '', targetValue: '',
-    targetBasis: 'none', targetJustification: '', assumptions: '', responsibility: '', phases: ['baseline', 'midterm', 'endline'],
+    frequency: 'quarterly', meansOfVerification: '', baselineValue: '', baselineBasis: 'none', baselineDate: '', baselineMethod: '', targetValue: '',
+    targetBasis: 'none', targetJustification: '', intermediateTargets: [], assumptions: '', responsibility: '', phases: ['baseline', 'midterm', 'endline'],
     startDate: '2026-01-15', endDate: '2026-12-31', milestones: [{ label: 'Baseline data collection', date: '2026-02-15', completed: false }],
     aiRationale: 'Measures the result with a standard, verifiable source.',
     ...overrides,
@@ -117,77 +134,84 @@ function indicator(overrides: Record<string, unknown>): Record<string, unknown> 
 
 const INDICATORS_ANSWER = {
   indicators: [
-    // 0. Impact, from secondary data; target only as a method.
+    // 0. Impact, from secondary data; target only as a method; a planned baseline date.
     indicator({
       resultCode: 'G', level: 'impact', indicatorText: 'Prevalence of acute watery diarrhoea among children under five in target areas',
       indicatorTextAr: 'معدل انتشار الإسهال المائي الحاد بين الأطفال دون سن الخامسة في المناطق المستهدفة',
       definition: 'Children under five reported with acute watery diarrhoea in the two weeks before data collection.', unit: 'percent',
-      calculation: { numerator: 'Children under five with acute watery diarrhoea in the past two weeks', denominator: 'Children under five in surveyed households', formula: PERCENT },
+      calculation: { numerator: 'Children under five with acute watery diarrhoea in the past two weeks', denominator: 'Children under five in surveyed households', ...PERCENT_CALCULATION },
       direction: 'decrease', disaggregation: ['sex', 'age', 'location'], dataCollectionMethod: 'secondary_data', frequency: 'baseline_endline',
       meansOfVerification: 'Health cluster surveillance data and Ministry of Health reports for Khan Younis and Deir al-Balah',
-      baselineMethod: 'Health cluster surveillance at project start (January 2026)', targetBasis: 'method_only',
+      baselineDate: '2026-01-31', baselineMethod: 'Health cluster surveillance at project start (January 2026)', targetBasis: 'method_only',
       targetJustification: 'baseline − 20%, set once the baseline is known', assumptions: 'Surveillance data remain available for the target areas.',
       responsibility: 'M&E Manager',
     }),
-    // 1. Library entry with a document baseline and the Sphere threshold of the linked entry.
+    // 1. Library entry with a document baseline (measured in December 2025) and the Sphere threshold of the linked entry.
     indicator({
       resultCode: 'O1', indicatorText: 'Average volume of water available per person per day in target households', libraryId: 'WA-01',
       indicatorTextAr: 'متوسط كمية المياه المتاحة للفرد يوميًا في الأسر المستهدفة', standardReferenceCode: 'Sphere',
       definition: 'Litres of water available for drinking, cooking and hygiene per person per day, from all sources.', unit: 'litres_per_person_per_day',
       disaggregation: ['location', 'displacement_status'], dataCollectionMethod: 'hh_survey', frequency: 'quarterly',
       meansOfVerification: 'Household survey water module (n≈380) and water-trucking delivery logs',
-      baselineValue: '6', baselineBasis: 'document', baselineMethod: 'Rapid needs assessment, December 2025',
+      baselineValue: '6', baselineBasis: 'document', baselineDate: '2025-12-01', baselineMethod: 'Rapid needs assessment, December 2025',
       targetValue: '15', targetBasis: 'standard_threshold', targetJustification: 'Sphere minimum for drinking, cooking and hygiene',
       assumptions: 'Water sources and fuel for trucking remain accessible; remote phone survey if field access is restricted.', responsibility: 'WASH Officer',
     }),
-    // 2. Deliberately incomplete: no definition, calculation parts, baseline method or assumptions; an invented target.
+    // 2. Deliberately incomplete: no Arabic name, definition, calculation parts, baseline date or method, or assumptions;
+    //    an invented target that only matches a budget cell ("80 ILS per interview").
     indicator({
       resultCode: 'O1', indicatorText: '% of target households with a handwashing facility with soap and water observed', libraryId: 'WA-05',
       unit: 'percent', calculation: EMPTY_CALCULATION, dataCollectionMethod: 'observation', frequency: 'biannual',
       meansOfVerification: 'Household observation checklist during the post-distribution monitoring survey',
-      targetValue: '90%', targetBasis: 'document', targetJustification: 'Target of 90% agreed by the team', responsibility: 'WASH Officer',
+      targetValue: '80', targetBasis: 'document', targetJustification: 'Target of 80 agreed by the team', responsibility: 'WASH Officer',
     }),
-    // 3. Output count from the document; the library entry adds sex disaggregation.
+    // 3. Output count from the document, with the document's intermediate target; the library entry adds sex disaggregation. Complete.
     indicator({
       resultCode: 'O1.1', level: 'output', indicatorText: 'Number of people receiving trucked drinking water', libraryId: 'WA-04',
       indicatorTextAr: 'عدد الأشخاص الذين يحصلون على مياه الشرب المنقولة بالصهاريج',
       definition: 'People in households registered at a served delivery point who received water at least once in the month.',
       disaggregation: ['age', 'displacement_status'], frequency: 'monthly', meansOfVerification: 'Water-trucking delivery logs and delivery-point registers',
-      baselineMethod: 'Zero at start: new service', targetValue: '12,000', targetBasis: 'document', targetJustification: 'Result 1.1 of the proposal',
+      baselineDate: '2026-01-01', baselineMethod: 'Zero at start: new service', targetValue: '12,000', targetBasis: 'document',
+      targetJustification: 'Result 1.1 of the proposal', intermediateTargets: [{ date: '2026-03-31', value: '6,000' }],
       assumptions: 'Crossings remain open for fuel and spare parts.', responsibility: 'Field Team',
     }),
-    // 4. Generic means of verification and no responsibility.
+    // 4. No Arabic name, a generic means of verification, no responsibility and an invented intermediate target.
     indicator({
       resultCode: 'O1.2', level: 'output', indicatorText: 'Number of hygiene kits distributed to displaced households',
-      definition: 'Kits signed for by the receiving household.', meansOfVerification: 'Project reports', baselineMethod: 'Zero at start: new activity',
-      targetValue: '2,400', targetBasis: 'document', targetJustification: 'Result 1.2 of the proposal', assumptions: 'Kits clear customs on time.',
+      definition: 'Kits signed for by the receiving household.', meansOfVerification: 'Project reports', baselineDate: '2026-01-01',
+      baselineMethod: 'Zero at start: new activity', targetValue: '2,400', targetBasis: 'document', targetJustification: 'Result 1.2 of the proposal',
+      intermediateTargets: [{ date: '2026-06-30', value: '1,200' }], assumptions: 'Kits clear customs on time.',
     }),
-    // 5. Unknown library id and an invented baseline; the target is a method.
+    // 5. Unknown library id and an invented baseline (its date goes with it); the target is a method.
     indicator({
       resultCode: 'O2', indicatorText: '% of assisted households reporting they can meet their basic needs', libraryId: 'CA-99',
+      indicatorTextAr: 'نسبة الأسر المستفيدة التي تفيد بقدرتها على تلبية احتياجاتها الأساسية',
       definition: 'Households reporting they can meet all or most of their basic needs as they define them.', unit: 'percent',
-      calculation: { numerator: 'Households reporting they meet all or most basic needs', denominator: 'Households surveyed', formula: PERCENT },
+      calculation: { numerator: 'Households reporting they meet all or most basic needs', denominator: 'Households surveyed', ...PERCENT_CALCULATION },
       disaggregation: ['sex_of_household_head', 'displacement_status'], dataCollectionMethod: 'hh_survey', frequency: 'per_cohort',
       meansOfVerification: 'Post-distribution monitoring survey (phone), sample of assisted households',
-      baselineValue: '35%', baselineBasis: 'document', baselineMethod: 'Baseline phone survey before the first cash round', targetBasis: 'method_only',
-      targetJustification: 'baseline + 15 percentage points', assumptions: 'Market prices stay within the transfer value.', responsibility: 'Cash Officer',
-    }),
-    // 6. Linked to an activity code: it measures the activity's output.
-    indicator({
-      resultCode: 'A2.1.2', level: 'output', indicatorText: 'Number of households receiving multipurpose cash transfers',
-      definition: 'Households that received at least one full transfer.', disaggregation: ['sex_of_household_head'],
-      meansOfVerification: 'Financial service provider payment reconciliation reports', baselineMethod: 'Zero at start: new activity',
-      targetValue: '1,800', targetBasis: 'document', targetJustification: 'Result 2.1 of the proposal', assumptions: 'The payment network stays operational.',
+      baselineValue: '35%', baselineBasis: 'document', baselineDate: '2026-02-01', baselineMethod: 'Baseline phone survey before the first cash round',
+      targetBasis: 'method_only', targetJustification: 'baseline + 15 percentage points', assumptions: 'Market prices stay within the transfer value.',
       responsibility: 'Cash Officer',
     }),
-    // 7. Accountability to affected people (humanitarian project).
+    // 6. Linked to an activity code: it measures the activity's output. A target figure used as a baseline (wrong kind).
+    indicator({
+      resultCode: 'A2.1.2', level: 'output', indicatorText: 'Number of households receiving multipurpose cash transfers',
+      indicatorTextAr: 'عدد الأسر التي تتلقى تحويلات نقدية متعددة الأغراض',
+      definition: 'Households that received at least one full transfer.', disaggregation: ['sex_of_household_head'],
+      meansOfVerification: 'Financial service provider payment reconciliation reports', baselineValue: '1,800', baselineBasis: 'document',
+      baselineMethod: 'Zero at start: new activity', targetValue: '1,800', targetBasis: 'document', targetJustification: 'Result 2.1 of the proposal',
+      assumptions: 'The payment network stays operational.', responsibility: 'Cash Officer',
+    }),
+    // 7. Accountability to affected people (humanitarian project); the model left the Arabic name empty.
     indicator({
       resultCode: 'O2', indicatorText: '% of assisted people who know how to give feedback or make a complaint', libraryId: 'AC-01', standardReferenceCode: 'CHS 5',
       definition: 'Assisted people who can name at least one feedback or complaint channel of the project.', unit: 'percent',
-      calculation: { numerator: 'Respondents naming at least one channel', denominator: 'Respondents surveyed', formula: PERCENT },
+      calculation: { numerator: 'Respondents naming at least one channel', denominator: 'Respondents surveyed', ...PERCENT_CALCULATION },
       disaggregation: ['sex', 'age', 'disability'], dataCollectionMethod: 'hh_survey', frequency: 'biannual',
-      meansOfVerification: 'Post-distribution monitoring survey, accountability module', baselineMethod: 'First post-distribution monitoring round',
-      targetBasis: 'none', assumptions: 'Respondents feel safe answering by phone.', responsibility: 'MEAL Officer',
+      meansOfVerification: 'Post-distribution monitoring survey, accountability module', baselineDate: '2026-04-15',
+      baselineMethod: 'First post-distribution monitoring round', targetBasis: 'none', assumptions: 'Respondents feel safe answering by phone.',
+      responsibility: 'MEAL Officer',
     }),
   ],
 };
@@ -302,9 +326,12 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
       expect(promptOf('framework.indicators')).not.toContain(value);
     }
     expect(promptOf('framework.structure')).toContain('[phone removed]');
-    // The invented figure is dropped before the indicator step; the documented ones are passed on.
+    // Invented figures and dates are dropped before the indicator step; the documented ones are passed on.
     expect(promptOf('framework.indicators')).toContain('"value": "12,000"');
+    expect(promptOf('framework.indicators')).toContain('"value": "6,000"');
     expect(promptOf('framework.indicators')).not.toContain('70%');
+    expect(promptOf('framework.indicators')).not.toContain('"value": "15"');
+    expect(promptOf('framework.indicators')).not.toContain('documentFigures is empty');
     expect(promptOf('framework.indicators')).toContain('WA-01 [outcome]');
     expect(promptOf('framework.indicators')).toContain('AC-01 [outcome]');
 
@@ -320,12 +347,13 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
 
     for (const i of indicators) {
       const label = i.indicatorText;
+      const gaps = referenceSheetGaps(i);
       // Provenance
       expect(i, label).toMatchObject({ provenance: 'ai_generated', aiModel: SERVED_MODEL, promptVersion: 'framework-v4', isApproved: false });
       expect(i.level, label).not.toBe('activity');
       expect(i.resultId, label).not.toBeNull();
       // Every new reference-sheet field is filled or explicitly "to be confirmed".
-      for (const field of ['definition', 'meansOfVerification', 'baselineMethod', 'targetJustification', 'assumptions', 'responsibility'] as const) {
+      for (const field of ['definition', 'meansOfVerification', 'baselineMethod', 'targetJustification', 'assumptions', 'responsibility', 'unit'] as const) {
         expect(i[field]?.trim(), `${label}: ${field}`).toBeTruthy();
       }
       expect(i.direction, label).not.toBeNull();
@@ -334,57 +362,88 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
         expect((i.disaggregation as string[]).some(k => k === 'sex' || k === 'sex_of_household_head'), `${label}: sex disaggregation`).toBe(true);
       }
       if (i.unit === 'percent') {
-        expect(i.calculation, label).toMatchObject({ numerator: expect.any(String), denominator: expect.any(String), formula: expect.any(String) });
+        expect(i.calculation, label).toMatchObject({
+          numerator: expect.any(String), denominator: expect.any(String), formula: expect.any(String), rounding: expect.any(String),
+        });
       }
+      // The Arabic name is never invented: an empty one is a listed gap.
+      expect(Boolean(i.indicatorTextAr) || gaps.includes('indicatorTextAr'), `${label}: Arabic name`).toBe(true);
+      // Baseline date: a date, or "Baseline date: to be confirmed." at the end of the baseline method.
+      expect(i.baselineDate !== null || i.baselineMethod!.endsWith(BASELINE_DATE_TO_BE_CONFIRMED), `${label}: baseline date`).toBe(true);
+      // Intermediate targets: document values, or "to be confirmed" at the end of the justification.
+      const intermediate = (i.intermediateTargets ?? []) as Array<{ date: string; value: string }>;
+      expect(intermediate.length > 0 || i.targetJustification!.endsWith(INTERMEDIATE_TARGETS_TO_BE_CONFIRMED), `${label}: intermediate targets`).toBe(true);
       // Never invented: every kept value is written in the document or in the linked library entry.
       if (i.baselineValue) expect(appearsInDocuments(i.baselineValue, [redacted]), `${label}: baseline`).toBe(true);
       if (i.targetValue && i.libraryId !== 'WA-01') expect(appearsInDocuments(i.targetValue, [redacted]), `${label}: target`).toBe(true);
+      for (const t of intermediate) expect(appearsInDocuments(t.value, [redacted]), `${label}: intermediate target`).toBe(true);
     }
 
     const [impact, water, handwashing, trucked, kits, basicNeeds, cash, feedback] = indicators;
     const gaps = Object.fromEntries(indicators.map(i => [i.indicatorText, referenceSheetGaps(i)]));
 
-    // Complete answers have no gaps; the deliberately incomplete ones are marked "to be confirmed".
+    // Only the indicator with a documented intermediate target is complete; the rest are marked "to be confirmed".
     expect(gaps).toEqual({
-      [impact.indicatorText]: [],
-      [water.indicatorText]: [],
-      [handwashing.indicatorText]: ['definition', 'calculation', 'baselineMethod', 'assumptions'],
+      [impact.indicatorText]: ['intermediateTargets'],
+      [water.indicatorText]: ['intermediateTargets'],
+      [handwashing.indicatorText]: ['indicatorTextAr', 'definition', 'calculation', 'baselineDate', 'baselineMethod', 'intermediateTargets', 'assumptions'],
       [trucked.indicatorText]: [],
-      [kits.indicatorText]: ['meansOfVerification', 'responsibility'],
-      [basicNeeds.indicatorText]: [],
-      [cash.indicatorText]: [],
-      [feedback.indicatorText]: [],
+      [kits.indicatorText]: ['indicatorTextAr', 'meansOfVerification', 'intermediateTargets', 'responsibility'],
+      [basicNeeds.indicatorText]: ['baselineDate', 'intermediateTargets'],
+      [cash.indicatorText]: ['intermediateTargets'],
+      [feedback.indicatorText]: ['indicatorTextAr', 'intermediateTargets'],
     });
     expect(handwashing).toMatchObject({
-      definition: TO_BE_CONFIRMED, baselineMethod: TO_BE_CONFIRMED, assumptions: TO_BE_CONFIRMED,
-      calculation: { numerator: TO_BE_CONFIRMED, denominator: TO_BE_CONFIRMED, formula: PERCENT },
+      indicatorTextAr: null, definition: TO_BE_CONFIRMED, assumptions: TO_BE_CONFIRMED, baselineDate: null,
+      baselineMethod: `${TO_BE_CONFIRMED}. ${BASELINE_DATE_TO_BE_CONFIRMED}`,
+      calculation: { numerator: TO_BE_CONFIRMED, denominator: TO_BE_CONFIRMED, formula: PERCENT, rounding: TO_BE_CONFIRMED },
     });
-    expect(kits).toMatchObject({ meansOfVerification: TO_BE_CONFIRMED, responsibility: TO_BE_CONFIRMED, disaggregation: ['sex'] });
+    expect(kits).toMatchObject({ indicatorTextAr: null, meansOfVerification: TO_BE_CONFIRMED, responsibility: TO_BE_CONFIRMED, disaggregation: ['sex'] });
+    expect(impact).toMatchObject({ baselineDate: new Date('2026-01-31'), baselineMethod: 'Health cluster surveillance at project start (January 2026)' });
+    expect(impact.calculation).toMatchObject({ rounding: '1 decimal place' });
 
-    // Document values are kept on an exact match and cited; the standard threshold comes from the linked entry.
+    // Document values are kept when they are verified figures of the same kind, and cited; the standard threshold comes from the linked entry.
     expect(water).toMatchObject({
-      baselineValue: '6', baselineMethod: `Rapid needs assessment, December 2025 (source: ${DOCUMENT_NAME})`, targetValue: '15', libraryId: 'WA-01',
+      baselineValue: '6', baselineDate: new Date('2025-12-01'), baselineMethod: `Rapid needs assessment, December 2025 (source: ${DOCUMENT_NAME})`,
+      targetValue: '15', libraryId: 'WA-01', intermediateTargets: null,
       standardReferenceCode: 'Sphere Water supply standard — minimum 15 l/p/d (aim for 20)', disaggregation: ['sex', 'location', 'displacement_status'],
     });
-    expect(water.targetJustification).toMatch(/^Proposed standard threshold \(Sphere Water supply standard/);
+    expect(water.targetJustification).toMatch(/^Proposed standard threshold \(Sphere Water supply standard.* — confirm it applies to this project\. Intermediate targets: to be confirmed after the baseline\.$/);
     expect(trucked).toMatchObject({
-      targetValue: '12,000', targetJustification: `Result 1.1 of the proposal (source: ${DOCUMENT_NAME})`, libraryId: 'WA-04',
+      targetValue: '12,000', libraryId: 'WA-04', baselineDate: new Date('2026-01-01'), intermediateTargets: [{ date: '2026-03-31', value: '6,000' }],
+      targetJustification: `Result 1.1 of the proposal (source: ${DOCUMENT_NAME}). Intermediate targets taken from the project documents (source: ${DOCUMENT_NAME}).`,
       standardReferenceCode: 'EU GERF 2.38', disaggregation: ['sex', 'age', 'displacement_status'],
     });
-    expect(kits).toMatchObject({ targetValue: '2,400', targetJustification: `Result 1.2 of the proposal (source: ${DOCUMENT_NAME})` });
-    expect(cash).toMatchObject({ targetValue: '1,800', resultId: byCode['O2.1'].id, level: 'output' });
+    expect(kits).toMatchObject({
+      targetValue: '2,400', intermediateTargets: null,
+      targetJustification: `Result 1.2 of the proposal (source: ${DOCUMENT_NAME}). Intermediate targets proposed by the AI without a target value of the project documents or a valid date were removed. ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}`,
+    });
+    expect(cash).toMatchObject({ targetValue: '1,800', baselineValue: null, resultId: byCode['O2.1'].id, level: 'output' });
+    // 1,800 is a target of the proposal, not a baseline.
+    expect(cash.targetJustification).toBe(`Result 2.1 of the proposal (source: ${DOCUMENT_NAME}). `
+      + `The baseline proposed by the AI was not found as a baseline in the project documents and was removed (pending baseline). ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}`);
+    expect(cash.baselineMethod).toBe(`Zero at start: new activity. ${BASELINE_DATE_TO_BE_CONFIRMED}`);
 
-    // Invented numbers are removed, and the justification does not repeat them.
+    // Invented numbers are removed, and the justification does not repeat them: 80 is only a budget cell.
     expect(handwashing.targetValue).toBeNull();
-    expect(handwashing.targetJustification).toMatch(/^Proposed method: .* — confirm after baseline\. The target proposed by the AI was not found/);
-    expect(handwashing.targetJustification).not.toContain('90%');
-    expect(basicNeeds).toMatchObject({ baselineValue: null, libraryId: null, baselineMethod: 'Baseline phone survey before the first cash round' });
+    expect(handwashing.targetJustification).toMatch(/^Proposed method: .* — confirm after baseline\. The target proposed by the AI was not found as a target/);
+    expect(handwashing.targetJustification).not.toContain('80');
+    expect(basicNeeds).toMatchObject({
+      baselineValue: null, baselineDate: null, libraryId: null,
+      baselineMethod: `Baseline phone survey before the first cash round. ${BASELINE_DATE_TO_BE_CONFIRMED}`,
+    });
     expect(basicNeeds.targetJustification).toMatch(/^Proposed method: baseline \+ 15 percentage points — confirm after baseline\. The baseline proposed by the AI was not found/);
-    expect(impact).toMatchObject({ targetValue: null, targetJustification: 'Proposed method: baseline − 20%, set once the baseline is known — confirm after baseline.' });
-    expect(feedback).toMatchObject({ libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)', targetValue: null });
+    expect(impact).toMatchObject({
+      targetValue: null,
+      targetJustification: `Proposed method: baseline − 20%, set once the baseline is known — confirm after baseline. ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}`,
+    });
+    expect(feedback).toMatchObject({
+      libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)', targetValue: null, indicatorTextAr: null,
+      baselineDate: new Date('2026-04-15'),
+    });
 
     // Framework and project status, the served model, and the admin notification.
-    expect(await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).toMatchObject({ status: 'expert_review', aiModelUsed: SERVED_MODEL });
+    expect(await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).toMatchObject({ status: 'expert_review', aiModelUsed: SERVED_MODEL, generationError: null });
     expect((await prisma.project.findUniqueOrThrow({ where: { id: projectId } })).status).toBe('framework_review');
     const notes = await prisma.notification.findMany({ where: { userId: fx.admin.id } });
     expect(notes.map(n => n.message)).toEqual([expect.stringContaining('8 indicators across 11 results')]);
@@ -412,7 +471,12 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
     expect(await prisma.indicator.count({ where: { frameworkId } })).toBe(8);
   });
 
-  it('leaves the new version as an empty draft when the model refuses, logging no document text', async () => {
+  it('marks the new version as failed when the model refuses: the status reports it and the project keeps its framework', async () => {
+    // The project's current framework, generated earlier.
+    const v1 = await prisma.framework.create({ data: { projectId, version: 1, status: 'expert_review', aiModelUsed: SERVED_MODEL } });
+    await prisma.indicator.create({
+      data: { frameworkId: v1.id, indicatorText: 'Number of people receiving trucked drinking water', level: 'output', dataCollectionMethod: 'document_review', frequency: 'monthly', phases: [] },
+    });
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
     mockAi({ 'framework.structure': STRUCTURE_ANSWER, 'framework.indicators': async () => { throw new AiRefusalError('framework.indicators', null); } });
 
@@ -421,9 +485,27 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
     const { frameworkId } = res.body as { frameworkId: string };
     await vi.waitFor(() => expect(errors).toHaveBeenCalled(), { timeout: 10_000, interval: 50 });
 
-    expect(await prisma.framework.findUniqueOrThrow({ where: { id: frameworkId } })).toMatchObject({ status: 'draft' });
+    const failed = await prisma.framework.findUniqueOrThrow({ where: { id: frameworkId } });
+    expect(failed).toMatchObject({ version: 2, status: 'draft', generationError: 'The AI model declined the request (framework.indicators).' });
     expect(await prisma.resultNode.count({ where: { frameworkId } })).toBe(0);
     expect(await prisma.indicator.count({ where: { frameworkId } })).toBe(0);
+
+    // The wizard's poll stops with "failed" and a safe message.
+    const status = await request(app).get(`/api/frameworks/${frameworkId}/status`).set('Authorization', fx.officerAuth);
+    expect(status.status).toBe(200);
+    expect(status.body).toEqual({ frameworkId, status: 'failed', message: 'The AI model declined the request (framework.indicators).' });
+    // The empty failed version does not hide the framework the project already has.
+    const current = await request(app).get(`/api/projects/${projectId}/framework`).set('Authorization', fx.officerAuth);
+    expect(current.body).toMatchObject({ id: v1.id, version: 1 });
+    expect(current.body.indicators).toHaveLength(1);
+    // The next generation gets version 3: version numbers are never reused.
+    mockAi({ 'framework.structure': STRUCTURE_ANSWER, 'framework.indicators': INDICATORS_ANSWER });
+    const again = await request(app).post(`/api/projects/${projectId}/framework/generate`).set('Authorization', fx.officerAuth);
+    await vi.waitFor(async () => {
+      expect(await prisma.framework.findUniqueOrThrow({ where: { id: again.body.frameworkId } })).toMatchObject({ version: 3, status: 'expert_review' });
+    }, { timeout: 10_000, interval: 50 });
+    expect((await request(app).get(`/api/projects/${projectId}/framework`).set('Authorization', fx.officerAuth)).body).toMatchObject({ version: 3 });
+
     const logged = errors.mock.calls.flat().map(String).join('\n');
     expect(logged).toContain('AiRefusalError');
     for (const value of [...PERSONAL_DATA, '12,000 people']) expect(logged).not.toContain(value);
@@ -437,10 +519,11 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
 const FAKE_KEY = ['sk', 'ant', 'api03', 'Ab9'.repeat(30)].join('-');
 
 describe('scripts/ai-smoke: helpers', () => {
-  it('parses --yes, --project and --help, and rejects unknown options', () => {
-    expect(parseSmokeArgs([])).toEqual({ yes: false, projectId: null, help: false });
-    expect(parseSmokeArgs(['--yes', '--project', 'p-1'])).toEqual({ yes: true, projectId: 'p-1', help: false });
-    expect(parseSmokeArgs(['--project=p-2', '-h'])).toEqual({ yes: false, projectId: 'p-2', help: true });
+  it('parses --yes, --project, --i-know-this-is-not-shared and --help, and rejects unknown options', () => {
+    expect(parseSmokeArgs([])).toEqual({ yes: false, projectId: null, help: false, notShared: false });
+    expect(parseSmokeArgs(['--yes', '--project', 'p-1'])).toEqual({ yes: true, projectId: 'p-1', help: false, notShared: false });
+    expect(parseSmokeArgs(['--project=p-2', '-h'])).toEqual({ yes: false, projectId: 'p-2', help: true, notShared: false });
+    expect(parseSmokeArgs(['--yes', NOT_SHARED_FLAG])).toMatchObject({ yes: true, notShared: true });
     expect(parseSmokeArgs(['--project', '  '])).toMatchObject({ projectId: null });
     expect(() => parseSmokeArgs(['--force'])).toThrow();
     expect(() => parseSmokeArgs(['p-3'])).toThrow();
@@ -458,20 +541,42 @@ describe('scripts/ai-smoke: helpers', () => {
     expect(apiKeyProblem(FAKE_KEY)).toBeNull();
   });
 
-  it('refuses in production, with a placeholder key and without --yes (in that order)', () => {
-    expect(smokeRefusal({ nodeEnv: 'production', apiKey: FAKE_KEY, yes: true })).toMatch(/NODE_ENV is "production"/);
-    expect(smokeRefusal({ nodeEnv: 'production', apiKey: 'sk-ant-...', yes: false })).toMatch(/production/);
-    expect(smokeRefusal({ nodeEnv: 'development', apiKey: 'sk-ant-...', yes: true })).toMatch(/^Refusing to run: ANTHROPIC_API_KEY does not look like/);
-    expect(smokeRefusal({ nodeEnv: 'development', apiKey: 'sk-ant-test-not-a-real-key', yes: true })).toMatch(/placeholder/);
-    expect(smokeRefusal({ nodeEnv: 'development', apiKey: FAKE_KEY, yes: false })).toMatch(/--yes/);
-    expect(smokeRefusal({ nodeEnv: 'development', apiKey: FAKE_KEY, yes: true })).toBeNull();
+  it('refuses in production, with a placeholder key, on a database that may be shared and without --yes (in that order)', () => {
+    const LOCAL = 'postgresql://raqib:pw@localhost:5432/raqib';
+    const SHARED = 'postgresql://postgres.abcd:s3cret@aws-0-eu-central-1.pooler.supabase.com:6543/postgres';
+    expect(smokeRefusal({ nodeEnv: 'production', apiKey: FAKE_KEY, yes: true, databaseUrl: LOCAL })).toMatch(/NODE_ENV is "production"/);
+    expect(smokeRefusal({ nodeEnv: 'production', apiKey: 'sk-ant-...', yes: false, databaseUrl: SHARED })).toMatch(/production/);
+    expect(smokeRefusal({ nodeEnv: 'development', apiKey: 'sk-ant-...', yes: true, databaseUrl: LOCAL })).toMatch(/^Refusing to run: ANTHROPIC_API_KEY does not look like/);
+    expect(smokeRefusal({ nodeEnv: 'development', apiKey: 'sk-ant-test-not-a-real-key', yes: true, databaseUrl: LOCAL })).toMatch(/placeholder/);
+    expect(smokeRefusal({ nodeEnv: 'development', apiKey: FAKE_KEY, yes: true, databaseUrl: SHARED })).toMatch(/^Refusing to run: DATABASE_URL points at database "postgres"/);
+    expect(smokeRefusal({ nodeEnv: 'development', apiKey: FAKE_KEY, yes: false, databaseUrl: SHARED })).toMatch(/DATABASE_URL/);
+    expect(smokeRefusal({ nodeEnv: 'development', apiKey: FAKE_KEY, yes: false, databaseUrl: LOCAL })).toMatch(/--yes/);
+    expect(smokeRefusal({ nodeEnv: 'development', apiKey: FAKE_KEY, yes: true, databaseUrl: LOCAL })).toBeNull();
+    // The flag allows a database that does not look like a development one.
+    expect(smokeRefusal({ nodeEnv: 'development', apiKey: FAKE_KEY, yes: true, databaseUrl: SHARED, notShared: true })).toBeNull();
+  });
+
+  it('accepts only databases that look like development databases, and never prints the URL', () => {
+    for (const url of [
+      'postgresql://raqib:pw@localhost:5432/raqib', 'postgresql://raqib:pw@127.0.0.1/raqib', 'postgresql://raqib:pw@[::1]:5432/raqib',
+      'postgresql://u:pw@db.example.com:5432/raqib_dev', 'postgresql://u:pw@db.example.com/raqib-test?sslmode=require', 'postgres://u:pw@LOCALHOST/x',
+    ]) expect(databaseProblem(url), url).toBeNull();
+    for (const url of ['postgresql://u:s3cret@db.abcd.supabase.co:5432/postgres', 'postgresql://u:s3cret@10.0.0.5/raqib', 'postgresql://u:s3cret@prod-db/']) {
+      const problem = databaseProblem(url);
+      expect(problem, url).toMatch(/does not look like a development database/);
+      expect(problem, url).toContain(NOT_SHARED_FLAG);
+      expect(problem, url).not.toContain('s3cret');
+    }
+    expect(databaseProblem(undefined)).toBe('DATABASE_URL is not a valid database URL.');
+    expect(databaseProblem('not a url')).toBe('DATABASE_URL is not a valid database URL.');
   });
 
   it('formats padded tables and the report rows', () => {
     expect(formatTable(['a', 'bb'], [['1', '2'], ['333', '4']])).toBe('a    bb\n---  --\n1    2\n333  4');
     const sheet = {
-      unit: 'number', definition: 'd', direction: 'increase', disaggregation: ['sex'], meansOfVerification: 'Registers',
-      baselineMethod: 'b', targetJustification: 't', assumptions: 'a', responsibility: 'r',
+      indicatorTextAr: 'مؤشر', unit: 'number', definition: 'd', direction: 'increase', disaggregation: ['sex'], meansOfVerification: 'Registers',
+      baselineDate: '2026-01-01', baselineMethod: 'b', targetJustification: 't', intermediateTargets: [{ date: '2026-06-30', value: '5' }],
+      assumptions: 'a', responsibility: 'r',
     };
     const rows = [
       { ...sheet, level: 'impact' as const, resultCode: 'G', indicatorText: 'Water points functional' },
@@ -511,11 +616,15 @@ describe.skipIf(!hasTestDatabase)('scripts/ai-smoke: run (AI client mocked)', ()
     err = [];
   });
 
-  it('refuses with the test key, in production, without --yes and on bad options, before any AI call or write', async () => {
+  it('refuses with the test key, in production, on a shared database, without --yes and on bad options, before any AI call or write', async () => {
     expect(await runAiSmoke(['--yes'], io())).toBe(1);
     expect(err.join('\n')).toMatch(/placeholder/);
     expect(await runAiSmoke(['--yes'], { ...io(), apiKey: FAKE_KEY, nodeEnv: 'production' })).toBe(1);
     expect(err.join('\n')).toMatch(/NODE_ENV is "production"/);
+    const shared = 'postgresql://postgres:s3cret@db.abcd.supabase.co:5432/postgres';
+    expect(await runAiSmoke(['--yes'], { ...io(), apiKey: FAKE_KEY, nodeEnv: 'development', databaseUrl: shared })).toBe(1);
+    expect(err.join('\n')).toMatch(/does not look like a development database/);
+    expect(err.join('\n')).not.toContain('s3cret');
     expect(await runAiSmoke([], { ...io(), apiKey: FAKE_KEY, nodeEnv: 'development' })).toBe(1);
     expect(err.join('\n')).toMatch(/Re-run with --yes/);
     expect(await runAiSmoke(['--everything'], io())).toBe(1);
@@ -545,9 +654,10 @@ describe.skipIf(!hasTestDatabase)('scripts/ai-smoke: run (AI client mocked)', ()
     expect(report).toMatch(/^outcome\s+4$/m);
     expect(report).toMatch(/^output\s+3$/m);
     expect(report).toMatch(/^total\s+8$/m);
-    expect(report).toContain('6 of 8 indicators complete');
-    expect(report).toMatch(/^O1\s+outcome\s+% of target households with a handwashing facility.*\s{2}definition, calculation, baselineMethod, assumptions$/m);
-    expect(report).toMatch(/^O1\.2\s+output\s+Number of hygiene kits distributed to displaced households\s+meansOfVerification, responsibility$/m);
+    expect(report).toContain('1 of 8 indicators complete');
+    expect(report).toMatch(/^O1\s+outcome\s+% of target households with a handwashing facility.*\s{2}indicatorTextAr, definition, calculation, baselineDate, baselineMethod, intermediateTargets, assumptions$/m);
+    expect(report).toMatch(/^O1\.2\s+output\s+Number of hygiene kits distributed to displaced households\s+indicatorTextAr, meansOfVerification, intermediateTargets, responsibility$/m);
+    expect(report).toMatch(/^O1\.1\s+output\s+Number of people receiving trucked drinking water\s+none$/m);
     expect(report).toMatch(/^framework\.structure\s+success\s+configured-main-model\s+claude-sonnet-5-5-20261001\s+1\s+4200\s+7600/m);
     expect(report).toMatch(/^framework\.indicators\s+success/m);
     expect(report).toMatch(/^total\s+2\s+8400\s+15200\s+19600\s+0\s+82000\s+0\.1704$/m);
@@ -555,14 +665,14 @@ describe.skipIf(!hasTestDatabase)('scripts/ai-smoke: run (AI client mocked)', ()
     for (const value of [...PERSONAL_DATA, 'trucked drinking water for nine months']) expect(report).not.toContain(value);
   });
 
-  it('reports a failed generation, keeps the empty draft and shows the refused call', async () => {
+  it('reports a failed generation, marks the version as failed and shows the refused call', async () => {
     mockAi({ 'framework.structure': STRUCTURE_ANSWER, 'framework.indicators': async () => { throw new AiRefusalError('framework.indicators', null); } });
 
     expect(await runAiSmoke(['--yes'], { ...io(), apiKey: FAKE_KEY, nodeEnv: 'development' })).toBe(1);
     expect(err.join('\n')).toMatch(/^Generation failed: AiRefusalError: The AI model declined the request \(framework\.indicators\)\.$/m);
-    expect(err.join('\n')).toMatch(/Framework version 1 is left as an empty draft/);
+    expect(err.join('\n')).toMatch(/Framework version 1 \(.+\) is marked as failed and is not the project's current framework: The AI model declined the request/);
     const framework = await prisma.framework.findFirstOrThrow({ where: { projectId } });
-    expect(framework.status).toBe('draft');
+    expect(framework).toMatchObject({ status: 'draft', generationError: 'The AI model declined the request (framework.indicators).' });
     expect(await prisma.indicator.count({ where: { frameworkId: framework.id } })).toBe(0);
     expect(out.join('\n')).toMatch(/^framework\.indicators\s+refusal/m);
     expect(out.join('\n')).not.toContain('Reference-sheet gaps');
@@ -577,6 +687,27 @@ describe.skipIf(!hasTestDatabase)('scripts/ai-smoke: run (AI client mocked)', ()
     expect(out.join('\n')).toContain('Documents: none parsed; the results chain comes from the project metadata');
     expect(calls().map(c => c.feature)).toEqual(['framework.indicators']);
     expect(await prisma.framework.findFirstOrThrow({ where: { projectId: fx.project.id, version: 2 } })).toMatchObject({ status: 'expert_review' });
+  });
+
+  it('prints only the class name of an unexpected error', async () => {
+    generateStructured.mockImplementation(async () => { throw new Error('relation "Project" row (name)=(Gaza 0599 123 456) violates a check'); });
+    expect(await runAiSmoke(['--yes'], { ...io(), apiKey: FAKE_KEY, nodeEnv: 'development' })).toBe(1);
+    expect(err.join('\n')).toMatch(/^Generation failed: Error$/m);
+    expect(err.join('\n')).toContain('Framework generation failed because of an internal error (Error).');
+    expect(err.join('\n')).not.toContain('0599');
+  });
+
+  it('counts parsed documents without FGD or KII transcripts', async () => {
+    await prisma.document.create({
+      data: {
+        projectId, uploadedBy: fx.officer.id, fileName: 'kii-transcript.txt', fileUrl: `projects/${projectId}/kii.txt`, fileType: 'other',
+        parsedText: 'KII transcript.', parsingStatus: 'completed', qualitativeSource: true,
+      },
+    });
+    mockAi({ 'framework.structure': STRUCTURE_ANSWER, 'framework.indicators': INDICATORS_ANSWER });
+    expect(await runAiSmoke(['--yes'], { ...io(), apiKey: FAKE_KEY, nodeEnv: 'development' })).toBe(0);
+    expect(out.join('\n')).toContain('Documents: 1 parsed');
+    expect(promptOf('framework.structure')).not.toContain('KII transcript.');
   });
 
   it('fails when the dev seed project is missing', async () => {

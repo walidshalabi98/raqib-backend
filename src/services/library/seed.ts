@@ -1,6 +1,7 @@
 import { Prisma, PrismaClient } from '@prisma/client';
-import type { EmbeddingProvider } from '../ai/embeddings';
-import { clearLibraryEmbeddings, embedLibraryEntries, findLibraryIdsWithoutEmbedding, libraryEmbeddingText } from './embed';
+// The env-free provider module: the library seed must run with DATABASE_URL alone.
+import type { EmbeddingProvider } from '../ai/embeddingProviders';
+import { allLibraryIds, clearLibraryEmbeddings, embedLibraryEntries, findLibraryIdsToEmbed, libraryEmbeddingText } from './embed';
 import { LibraryEntryInput, loadLibraryFile } from './load';
 
 export interface SeedLibraryResult {
@@ -11,11 +12,11 @@ export interface SeedLibraryResult {
   version: string;
   /** Ids stored in the database but missing from the file. They are kept, never deleted. */
   notInFile: string[];
-  /** Entries embedded in this run (0 when skipped or when every entry already had a vector). */
+  /** Entries embedded in this run (0 when skipped or when every entry already had a vector from the provider's model). */
   embedded: number;
   /** Why no embeddings were made, e.g. "VOYAGE_API_KEY is not set (keyword search is used)"; null when the provider ran. */
   embeddingsSkipped: string | null;
-  /** Why embedding stopped early (content and earlier batches are saved; missing vectors are made on the next run), or null. */
+  /** Why embedding stopped early (content and earlier batches are saved; the rest are embedded on the next run), or null. */
   embeddingError: string | null;
 }
 
@@ -24,16 +25,17 @@ export interface SeedLibraryOptions {
   path?: string;
   logger?: { warn: (message: string) => void };
   /**
-   * Embedding provider (scripts/seed-library.ts passes getEmbeddingProvider()). When it is
-   * enabled, every file entry without a vector is embedded after the upsert. Omitted or
-   * disabled: nothing is embedded and the library is searched by keyword.
+   * Embedding provider (`npm run seed:library` passes createEmbeddingProvider() with the Voyage
+   * settings). When it is enabled, every stored entry without a vector from the provider's model
+   * is embedded after the upsert. Omitted or disabled: nothing is embedded and the library is
+   * searched by keyword.
    */
   embeddings?: EmbeddingProvider;
-  /** Re-embed every file entry, not only those without a vector (after changing VOYAGE_MODEL: vectors of different models cannot be compared). */
+  /** Re-embed every stored entry, even those that already have a vector from the provider's model. */
   reembedAll?: boolean;
 }
 
-/** Columns that hold library content. `version` and the timestamps are bookkeeping; `embedding` is derived (see seedLibrary). */
+/** Columns that hold library content. `version` and the timestamps are bookkeeping; `embedding` and `embeddingModel` are derived (see seedLibrary). */
 const CONTENT_FIELDS = [
   'sector', 'tags', 'level', 'name', 'nameAr', 'definition', 'unit', 'calculation', 'direction', 'disaggregation',
   'methods', 'frequency', 'meansOfVerification', 'standardReference', 'standardFramework', 'isStandard', 'notes',
@@ -104,9 +106,11 @@ export function libraryContentDiffers(fromFile: LibraryContent, stored: Partial<
  *
  * Embeddings: an update that changes the embedded text (name, Arabic name, definition, tags)
  * clears the entry's vector in the same transaction, so a stale vector is never searched.
- * Then, with an enabled provider, every file entry without a vector is embedded; a second
- * run embeds nothing. An embedding failure is reported in `embeddingError`, not thrown:
- * the content is saved and the missing vectors are made on the next run.
+ * Then, with an enabled provider, every stored entry whose vector is missing or was made by
+ * another model (`embeddingModel`) is embedded, entries kept outside the file included; a
+ * second run embeds nothing, and a model change re-embeds everything on the next plain run.
+ * An embedding failure is reported in `embeddingError`, not thrown: the content is saved and
+ * the remaining vectors are made on the next run.
  */
 export async function seedLibrary(prisma: PrismaClient, options: SeedLibraryOptions = {}): Promise<SeedLibraryResult> {
   const logger = options.logger ?? console;
@@ -145,7 +149,7 @@ export async function seedLibrary(prisma: PrismaClient, options: SeedLibraryOpti
     logger.warn(`Indicator library: ${notInFile.length} stored entr${notInFile.length === 1 ? 'y is' : 'ies are'} not in the file and were kept: ${notInFile.join(', ')}`);
   }
 
-  const embedding = await embedEntries(prisma, ids, options);
+  const embedding = await embedEntries(prisma, options);
 
   return {
     created: toCreate.length,
@@ -158,10 +162,9 @@ export async function seedLibrary(prisma: PrismaClient, options: SeedLibraryOpti
   };
 }
 
-/** The embedding step of seedLibrary: file entries without a vector (or all with reembedAll). */
+/** The embedding step of seedLibrary: stored entries without a vector from the provider's model (or all with reembedAll). */
 async function embedEntries(
   prisma: PrismaClient,
-  ids: string[],
   options: SeedLibraryOptions,
 ): Promise<Pick<SeedLibraryResult, 'embedded' | 'embeddingsSkipped' | 'embeddingError'>> {
   const provider = options.embeddings;
@@ -170,7 +173,8 @@ async function embedEntries(
     const reason = provider.disabledReason ?? `the ${provider.name} embedding provider is disabled`;
     return { embedded: 0, embeddingsSkipped: `${reason} (keyword search is used)`, embeddingError: null };
   }
-  const pending = options.reembedAll ? ids : await findLibraryIdsWithoutEmbedding(prisma, ids);
+  // A provider without a model name gets every entry here; embedLibraryEntries then refuses it with a clear error.
+  const pending = options.reembedAll || !provider.model ? await allLibraryIds(prisma) : await findLibraryIdsToEmbed(prisma, provider.model);
   const { embedded, error } = await embedLibraryEntries(prisma, provider, pending);
   return { embedded, embeddingsSkipped: null, embeddingError: error };
 }

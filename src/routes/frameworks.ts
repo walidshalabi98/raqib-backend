@@ -23,17 +23,31 @@ const FRAMEWORK_DETAIL_INCLUDE = {
   indicators: { orderBy: INDICATOR_ORDER, include: INDICATOR_LIST_INCLUDE },
 } satisfies Prisma.FrameworkInclude;
 
+/**
+ * The project's current framework: the newest version whose AI generation did not fail. A failed
+ * version keeps its safe message in generationError and never replaces the previous framework.
+ */
+const CURRENT_FRAMEWORK = { generationError: null } satisfies Prisma.FrameworkWhereInput;
+
+/**
+ * A draft that is still empty this long after it was created belongs to an interrupted run (a normal
+ * run takes a few minutes). If a very slow run still finishes later, its status becomes "completed".
+ */
+export const INTERRUPTED_GENERATION_MS = 15 * 60 * 1000;
+
+export const INTERRUPTED_GENERATION_MESSAGE = 'Framework generation did not finish (the run was interrupted). Generate a new version to try again.';
+
 /** Result nodes ordered impact, outcome, output, activity, then sortOrder, then code. */
 function withOrderedResults<T extends { resultNodes: Parameters<typeof sortResultNodes>[0] }>(framework: T): T {
   return { ...framework, resultNodes: sortResultNodes(framework.resultNodes) };
 }
 
-// GET /api/projects/:id/framework — Latest framework with its results chain and indicators
+// GET /api/projects/:id/framework — Current framework with its results chain and indicators
 router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
   const framework = await prisma.framework.findFirst({
-    where: { projectId: req.params.id },
+    where: { projectId: req.params.id, ...CURRENT_FRAMEWORK },
     orderBy: { version: 'desc' },
     include: FRAMEWORK_DETAIL_INCLUDE,
   });
@@ -49,7 +63,7 @@ router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Req
 router.post('/projects/:id/framework/generate', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
-  // Get current max version
+  // The highest version number so far, failed versions included (version numbers are never reused).
   const latest = await prisma.framework.findFirst({
     where: { projectId: req.params.id },
     orderBy: { version: 'desc' },
@@ -65,14 +79,10 @@ router.post('/projects/:id/framework/generate', authenticate, authorize('org_adm
     },
   });
 
-  // Run AI generation inline (async, don't block the response)
+  // Run AI generation inline (async, don't block the response). On failure the generator records
+  // generationError on the version; GET /frameworks/:id/status then reports "failed".
   generateFramework(framework.id, req.params.id).catch(err => {
     console.error(`[Framework] Generation failed for ${framework.id}: ${safeErrorSummary(err)}`);
-    // Update framework status to indicate failure
-    prisma.framework.update({
-      where: { id: framework.id },
-      data: { status: 'draft' },
-    }).catch(() => {});
   });
 
   res.status(202).json({
@@ -81,7 +91,22 @@ router.post('/projects/:id/framework/generate', authenticate, authorize('org_adm
   });
 }));
 
-// GET /api/frameworks/:id/status — Check generation status
+/**
+ * Why an AI framework version is known to have failed, or null: the generator recorded a
+ * generationError, or the version is still an empty AI draft long after it was created (the run
+ * was interrupted, e.g. by a restart, before it could record anything). Manual frameworks never fail.
+ */
+export function generationFailure(
+  framework: { generationError: string | null; status: string; aiModelUsed: string | null; generatedAt: Date; resultCount: number; indicatorCount: number },
+  now: Date = new Date(),
+): string | null {
+  if (framework.generationError) return framework.generationError;
+  const emptyAiDraft = framework.status === 'draft' && framework.aiModelUsed !== 'manual' && framework.resultCount === 0 && framework.indicatorCount === 0;
+  if (emptyAiDraft && now.getTime() - framework.generatedAt.getTime() > INTERRUPTED_GENERATION_MS) return INTERRUPTED_GENERATION_MESSAGE;
+  return null;
+}
+
+// GET /api/frameworks/:id/status — Check generation status: processing, completed or failed (with a safe message)
 router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertFrameworkAccess(req, req.params.id);
   const framework = await prisma.framework.findUniqueOrThrow({
@@ -90,6 +115,13 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
   });
 
   const hasIndicators = framework.indicators.length > 0;
+  const failure = hasIndicators ? null : generationFailure({
+    ...framework, resultCount: framework.resultNodes.length, indicatorCount: framework.indicators.length,
+  });
+  if (failure) {
+    res.json({ frameworkId: framework.id, status: 'failed', message: failure });
+    return;
+  }
 
   res.json({
     frameworkId: framework.id,
@@ -102,6 +134,8 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
 // PATCH /api/frameworks/:id/approve — approving the framework approves its indicators
 router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
   const framework = await assertFrameworkAccess(req, req.params.id);
+  // A failed version is never the project's framework; approving it would only mark the project active.
+  if (framework.generationError) throw new AppError(409, 'This framework version failed to generate and cannot be approved. Generate a new version.');
 
   // One transaction; the indicators are approved first so the response shows them approved.
   const [, updated] = await prisma.$transaction([
@@ -132,7 +166,7 @@ router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'pl
 router.post('/projects/:id/framework/manual', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const project = await assertProjectAccess(req, req.params.id);
 
-  // Get current max version
+  // The highest version number so far, failed versions included (version numbers are never reused).
   const latest = await prisma.framework.findFirst({
     where: { projectId: req.params.id },
     orderBy: { version: 'desc' },

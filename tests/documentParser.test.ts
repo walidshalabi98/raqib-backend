@@ -15,7 +15,15 @@ vi.mock('../src/services/ai/client', () => ({
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
 import { buildDocumentKey, getStorage } from '../src/services/storage';
-import { chunkText, normalizeDocumentAnalysis, parseDocument } from '../src/services/ai/documentParser';
+import {
+  chunkText,
+  joinPdfTextItems,
+  normalizeDocumentAnalysis,
+  parseDocument,
+  parsePdf,
+  PdfTextItem,
+  verifyDocumentAnalysis,
+} from '../src/services/ai/documentParser';
 import { AiRefusalError, AiRequestError } from '../src/services/ai/errors';
 import { redactPersonalData, REDACTION_PLACEHOLDERS } from '../src/services/ai/redact';
 import {
@@ -27,6 +35,7 @@ import {
   documentAnalysisPrompt,
   truncateForPrompt,
 } from '../src/services/ai/prompts/documentAnalysis';
+import { BENEFICIARY_TABLE, tablePdf } from './pdfFixture';
 
 const SERVED_MODEL = 'claude-haiku-5-5-20261001';
 
@@ -185,6 +194,127 @@ describe('normalizeDocumentAnalysis', () => {
   });
 });
 
+describe('verifyDocumentAnalysis: figures checked against the document text', () => {
+  const TEXT = [
+    'Outcome 1: 22% of households have a stable income by December 2027 (baseline 14%, 2025).',
+    'The project reaches 1,200 households in 3 governorates; 12.5 km of pipes. Grant ENI/2026/412345678.',
+    'الهدف: ٤٥٪ من النساء، ١٬٥٠٠ أسرة',
+    'Target\tHouseholds reached\t2500',
+    '[phone removed]',
+  ].join('\n');
+  const answer = (over: Partial<DocumentAnalysisAnswer>): DocumentAnalysisAnswer => ({ ...ANSWER, summary: '', keyFindings: [], targetsMentioned: [], ...over });
+  const target = (value: string) => ({ indicator: 'x', target: value, timeline: '' });
+  const verified = (value: string) => verifyDocumentAnalysis(answer({ targetsMentioned: [target(value)] }), TEXT).targetsMentioned[0].verified;
+
+  it('marks a target verified only when the document contains it', () => {
+    expect(verified('22%')).toBe(true);
+    expect(verified('22 %')).toBe(true);
+    expect(verified('1,200')).toBe(true);
+    expect(verified('1200')).toBe(true); // written with a thousands separator in the document
+    expect(verified('1,200 households')).toBe(true);
+    expect(verified('2,500 households')).toBe(true); // the figure is in a table cell; the unit is in its header
+    expect(verified('22% by December 2027')).toBe(true);
+    expect(verified('٢٢٪')).toBe(true);
+    expect(verified('45%')).toBe(true); // written ٤٥٪ in the document
+    expect(verified('1500')).toBe(true); // written ١٬٥٠٠
+    expect(verified('80%')).toBe(false); // invented
+    expect(verified('2%')).toBe(false); // "22%" holds "2%" but not as a whole number
+    expect(verified('22% by 2030')).toBe(false); // every figure must be in the text
+    expect(verified('1,2')).toBe(false); // a decimal comma: not the 1,200 of the document
+    expect(verified('12,5 km')).toBe(true); // a decimal comma for the document's 12.5
+    expect(verified('All governorates')).toBe(false);
+    expect(verified('stable income')).toBe(true); // a target without figures must be written as given
+    expect(verified('')).toBe(false);
+  });
+
+  it('lists numbers in the summary and key findings that the document does not contain', () => {
+    const result = verifyDocumentAnalysis(answer({
+      summary: 'Reaches 1,200 households (22%) and 950 youth; ٤٥٪ of women; 12.5 km; 80 % coverage.',
+      keyFindings: ['Baseline 14% in 2025', 'Budget of 3,400,000 EUR', 'Covers 3 governorates and 7 schools', 'Reaches 950 youth'],
+    }), TEXT);
+    // Years (2025) and single-digit counts (3, 7) are not checked; each figure is listed once.
+    expect(result.unverifiedFigures).toEqual(['950', '80 %', '3,400,000']);
+    expect(result.summary).toBe('Reaches 1,200 households (22%) and 950 youth; ٤٥٪ of women; 12.5 km; 80 % coverage.');
+  });
+
+  it('keeps every entry (nothing is dropped) and lists at most 20 figures', () => {
+    const many = Array.from({ length: 30 }, (_, i) => `${100 + i} items`);
+    const result = verifyDocumentAnalysis(answer({ keyFindings: many, targetsMentioned: [target('80%'), target('22%')] }), TEXT);
+    expect(result.keyFindings).toHaveLength(30);
+    expect(result.targetsMentioned.map(t => t.verified)).toEqual([false, true]);
+    expect(result.unverifiedFigures).toHaveLength(20);
+  });
+
+  it('is fast on a long document', () => {
+    const long = `${TEXT}\n${'The project reached 1,250 households in 2026 with 45 schools. '.repeat(16_000)}`; // about 1 MB
+    const started = Date.now();
+    const result = verifyDocumentAnalysis(answer({
+      summary: Array.from({ length: 20 }, (_, i) => `${1000 + i} people`).join(', '),
+      targetsMentioned: Array.from({ length: 20 }, (_, i) => target(`${45 + i} schools`)),
+    }), long);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(result.targetsMentioned[0].verified).toBe(true);
+    expect(result.targetsMentioned[1].verified).toBe(false);
+  });
+});
+
+describe('PDF text extraction', () => {
+  /** A text item at (x, y) with the given width and a 10-point font. */
+  const item = (str: string, x: number, y: number, width: number): PdfTextItem => ({ str, transform: [10, 0, 0, 10, x, y], width, height: 10 });
+
+  it('separates items on the same line by a space or a tab, and lines by a line break', () => {
+    expect(joinPdfTextItems([
+      item('Ahmad Ali', 50, 700, 45),
+      item('401234567', 160, 700, 45), // a table cell: wide gap
+      item('0599123456', 260, 700, 50),
+      item('Gaza', 380, 700, 20),
+      item('Next', 50, 680, 20), // a new line
+      item('word', 72.8, 680, 20), // a word gap (2.8 points)
+      item('ing', 92.5, 680, 15), // touching: same word in another font
+      item(' spaced', 108, 680, 30), // the space is already there
+    ])).toBe('Ahmad Ali\t401234567\t0599123456\tGaza\nNext wording spaced');
+  });
+
+  it('separates right-to-left items and keeps a raised footnote mark on its line', () => {
+    expect(joinPdfTextItems([
+      item('أحمد علي', 500, 700, 40),
+      item('٤٠١٢٣٤٥٦٨', 400, 700, 45),
+      item('٠٥٩٩١٢٣٤٥٨', 300, 700, 50),
+      item('1', 353, 703, 4),
+    ])).toBe('أحمد علي\t٤٠١٢٣٤٥٦٨\t٠٥٩٩١٢٣٤٥٨ 1');
+  });
+
+  it('ignores empty and malformed items', () => {
+    expect(joinPdfTextItems([item('', 50, 700, 0), { str: 'a' } as PdfTextItem, item('b', 80, 0, 5)])).toBe('a\tb');
+  });
+
+  it('keeps table cells apart in a real PDF, so every phone and ID number in the table is redacted (regression)', async () => {
+    const pdf = tablePdf(BENEFICIARY_TABLE);
+    // pdf-parse's own renderer runs the cells together, and nothing can be recognised.
+    const pdfParse = (await import('pdf-parse')).default;
+    const joined = (await pdfParse(new Uint8Array(pdf) as unknown as Buffer)).text;
+    expect(joined).toContain('Ahmad Ali4012345670599123456Gaza');
+    // Only the +970 number, alone in its cell's run, was found; the ID numbers and local mobiles were not.
+    expect(redactPersonalData(joined).counts).toEqual({ phone: 1, idNumber: 0, email: 0 });
+
+    const text = await parsePdf(pdf);
+    expect(text).toContain('Ahmad Ali\t401234567\t0599123456\tGaza');
+    const redacted = redactPersonalData(text);
+    expect(redacted.counts).toEqual({ phone: 3, idNumber: 3, email: 0 });
+    expect(redacted.text).toContain(`Sara Omar\t${REDACTION_PLACEHOLDERS.idNumber}\t${REDACTION_PLACEHOLDERS.phone}\tKhan Younis`);
+    expect(redacted.text).toContain('target: 1,200 households by 2027');
+    expect(personalDataIn(redacted.text)).toEqual([]);
+  });
+
+  it('parses each small PDF on its own (pdf.js must not read Node\'s shared buffer pool)', async () => {
+    const first = tablePdf({ rows: [['first', 'file']], columns: [50, 120] });
+    const second = tablePdf({ rows: [['second', 'file']], columns: [50, 120] });
+    expect(second.byteOffset).toBeGreaterThan(0); // both share Node's buffer pool
+    expect((await parsePdf(first)).trim()).toBe('first\tfile');
+    expect((await parsePdf(second)).trim()).toBe('second\tfile');
+  });
+});
+
 describe('chunkText', () => {
   it('splits text into overlapping chunks and always ends', () => {
     const text = 'abcdefghij'.repeat(300); // 3 000 characters
@@ -275,6 +405,9 @@ describe.skipIf(!hasTestDatabase)('parseDocument (stored file, mocked AI client)
     const analysis = stored.aiAnalysis as Record<string, unknown>;
     expect(analysis).toMatchObject({ ...ANSWER, model: SERVED_MODEL, promptVersion: 'document-analysis-v2' });
     expect(new Date(analysis.analysedAt as string).toISOString()).toBe(analysis.analysedAt);
+    // Checked against the redacted text: the 22% target is in the workbook; "45%" (a key finding) is not.
+    expect(analysis.targetsMentioned).toEqual([{ ...ANSWER.targetsMentioned[0], verified: true }]);
+    expect(analysis.unverifiedFigures).toEqual(['45%']);
 
     // Logs hold ids, counts and token numbers only.
     expect(logs).toContain(doc.id);
@@ -286,19 +419,29 @@ describe.skipIf(!hasTestDatabase)('parseDocument (stored file, mocked AI client)
     expect(logs).not.toContain(ANSWER.summary);
   });
 
-  it('returns aiAnalysis and the redacted text in the project document list', async () => {
+  it('lists display fields, textLength and the checked aiAnalysis, never parsedText or the storage key', async () => {
     mocks.generateStructured.mockResolvedValue(structuredResult(ANSWER));
     const doc = await storeDocument('list.xlsx', workbook);
     await parseDocument(doc.id);
+    const stored = await prisma.document.findUniqueOrThrow({ where: { id: doc.id } });
 
     const res = await request(app).get(`/api/projects/${a.project.id}/documents`).set('Authorization', a.officerAuth);
     expect(res.status).toBe(200);
     const listed = res.body.find((d: { id: string }) => d.id === doc.id);
+    expect(Object.keys(listed).sort()).toEqual([
+      'aiAnalysis', 'fileName', 'fileSizeBytes', 'fileType', 'id', 'parsingStatus', 'projectId', 'qualitativeSource',
+      'textLength', 'uploadedAt', 'uploader',
+    ]);
     expect(listed.parsingStatus).toBe('completed');
+    expect(listed.textLength).toBe(stored.parsedText!.length);
+    expect(listed.uploader).toEqual({ fullName: a.officer.fullName });
     expect(listed.aiAnalysis).toMatchObject({ documentType: 'proposal', summary: ANSWER.summary, model: SERVED_MODEL, promptVersion: 'document-analysis-v2' });
-    expect(personalDataIn(listed.parsedText)).toEqual([]);
+    expect(listed.aiAnalysis.targetsMentioned[0]).toEqual({ ...ANSWER.targetsMentioned[0], verified: true });
+    expect(JSON.stringify(res.body)).not.toContain(stored.fileUrl);
+    expect(JSON.stringify(res.body)).not.toContain('Participant');
     const fixture = res.body.find((d: { id: string }) => d.id === a.document.id);
     expect(fixture.aiAnalysis).toBeNull();
+    expect(fixture.textLength).toBe(0);
   });
 
   it.each([
@@ -385,6 +528,48 @@ describe.skipIf(!hasTestDatabase)('parseDocument (stored file, mocked AI client)
     expect(logs).toContain('UnsupportedFileTypeError: Unsupported file type: .txt');
     const stored = await prisma.document.findUniqueOrThrow({ where: { id: doc.id } });
     expect(stored.parsingStatus).toBe('failed');
+    expect(mocks.generateStructured).not.toHaveBeenCalled();
+  });
+
+  it('stores a PDF table with its phone and ID numbers removed', async () => {
+    mocks.generateStructured.mockResolvedValue(structuredResult(ANSWER));
+    const doc = await storeDocument('annex 2.pdf', tablePdf(BENEFICIARY_TABLE));
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await parseDocument(doc.id);
+
+    const stored = await prisma.document.findUniqueOrThrow({ where: { id: doc.id } });
+    expect(stored.parsingStatus).toBe('completed');
+    expect(personalDataIn(stored.parsedText!)).toEqual([]);
+    expect(stored.parsedText).toContain(`Ahmad Ali\t${REDACTION_PLACEHOLDERS.idNumber}\t${REDACTION_PLACEHOLDERS.phone}\tGaza`);
+    expect(stored.parsedText).not.toMatch(/0599|40[1-3]\d{6}|912 345/);
+    const prompt: string = mocks.generateStructured.mock.calls[0][0].messages[0].content;
+    expect(personalDataIn(prompt)).toEqual([]);
+  });
+
+  it('stores a qualitative transcript redacted but never sends it for document analysis', async () => {
+    const doc = await storeDocument('fgd.xlsx', workbook);
+    await prisma.document.update({ where: { id: doc.id }, data: { qualitativeSource: true } });
+
+    const logs = await captureConsole(() => parseDocument(doc.id));
+
+    const stored = await prisma.document.findUniqueOrThrow({ where: { id: doc.id } });
+    expect(stored.parsingStatus).toBe('completed');
+    expect(stored.parsedText!.length).toBeGreaterThan(DOCUMENT_ANALYSIS_MAX_CHARS);
+    expect(personalDataIn(stored.parsedText!)).toEqual([]);
+    expect(stored.aiAnalysis).toBeNull();
+    expect(mocks.generateStructured).not.toHaveBeenCalled();
+    expect(logs).toContain(`Document ${doc.id} is a qualitative transcript`);
+  });
+
+  it('refuses a Word 97–2003 (.doc) file: only .docx can be read', async () => {
+    const doc = await storeDocument('old.doc', Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+
+    let thrown: unknown;
+    await captureConsole(() => parseDocument(doc.id).catch(err => { thrown = err; }));
+
+    expect((thrown as Error).message).toBe('Unsupported file type: .doc');
+    expect((await prisma.document.findUniqueOrThrow({ where: { id: doc.id } })).parsingStatus).toBe('failed');
     expect(mocks.generateStructured).not.toHaveBeenCalled();
   });
 

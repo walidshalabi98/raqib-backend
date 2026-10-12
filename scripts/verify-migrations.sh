@@ -3,32 +3,43 @@
 # shared database, in rollout order:
 #   prisma/sql/2026-10-11_phase0_webhook_tokens.sql (Phase 0: WebhookToken; already part of the BASE_REV schema)
 #   prisma/sql/2026-10-11_phase2_data_model.sql     (Phase 2: results chain, reference sheet, library)
-#   prisma/sql/2026-10-12_phase3_ai_foundation.sql  (Phase 3: AiCall, Document.aiAnalysis)
+#   prisma/sql/2026-10-12_phase3_ai_foundation.sql  (Phase 3: AiCall, Document.aiAnalysis and qualitativeSource,
+#                                                    Framework.generationError, IndicatorLibraryEntry.embeddingModel)
 #
-#   0. STATIC     no file contains a DROP statement; the Phase 3 file is one transaction.
+#   0. STATIC     no file contains a DROP statement; the Phase 3 file is one transaction that sets lock_timeout first.
 #   1. FRESH      create a database and `prisma db push` the current schema: no drift, the Phase 3 SQL is refused there
 #                 ("already applied") without changes, and the app's Prisma client creates and reads AiCall rows.
 #   2. EMPTY      the Phase 3 SQL on a database without the Phase 0 schema is refused and creates nothing; with a
 #                 leftover AiCallStatus type it is refused as "already partly applied".
+#   2b. PARTIAL   on copies of a database at the Phase 2 schema, each column the Phase 3 SQL adds, left over alone
+#                 (e.g. Document.aiAnalysis without AiCall), makes it refuse as "already partly applied", unchanged.
 #   3. SEED COPY  create a database with the schema at BASE_REV (022e09a: today's shared schema plus the Phase 0 SQL),
 #                 load the seed from that revision with a Prisma client generated from that schema, add edge-case
-#                 fixtures (frameworks, indicators, a beneficiary, legacy documents), snapshot row counts and checksums
-#                 of every column of every table, check that the Phase 3 SQL is refused before Phase 2, then:
+#                 fixtures (frameworks, indicators, a beneficiary, legacy documents, qualitative entries), snapshot row
+#                 counts and checksums of every column of every table, check that the Phase 3 SQL is refused before
+#                 Phase 2, then:
 #      3a/3b. Phase 2: apply the SQL with psql, then check counts and checksums unchanged, every indicator linked to a
 #                 result, results chain placeholders follow the hierarchy rule, result codes unique per framework,
 #                 primary sector in sectors, provenance (including an indicator added by hand to an AI-generated
 #                 framework later), RLS on the new tables, the app's Prisma client can read the data, a second run is
 #                 refused without changes, and `prisma migrate diff` against the schema at PHASE2_REV reports no drift.
-#      3c/3d. Phase 3: apply the SQL with psql, then check the AiCall table (columns, types, defaults, enum, indexes,
-#                 foreign keys and their SET NULL / CASCADE behaviour), RLS on AiCall, Document.aiAnalysis, the legacy
-#                 analysis move (valid JSON moved as JSON, invalid JSON as {legacyText}, documents without the marker
-#                 untouched, nothing lost), counts and checksums of everything else unchanged, the app's Prisma client
-#                 creates and reads AiCall rows and reads the moved analyses, a second run is refused without changes,
-#                 and `prisma migrate diff` against prisma/schema.prisma reports no drift.
+#      3c.    Phase 3, negative runs first: while another session holds a lock on Document the file gives up after
+#                 lock_timeout; copies of the file with a deliberate bug (no duplicate-key check, split at the first
+#                 marker, transcripts not marked) are stopped by its self-check. Each run rolls back with every table
+#                 unchanged. Then the real file is applied with psql.
+#      3d.    checks after Phase 3: the AiCall table (columns, types, defaults, enum, indexes, foreign keys and their
+#                 SET NULL / CASCADE behaviour), RLS on AiCall, the new columns, the legacy analysis move (split at the
+#                 last marker; valid JSON moved as JSON, anything else as {legacyText}; documents without the marker
+#                 untouched; nothing lost), transcripts marked, counts and checksums of everything else unchanged, the
+#                 app's Prisma client creates and reads AiCall rows and reads the moved data, a second run is refused
+#                 without changes, and `prisma migrate diff` against prisma/schema.prisma reports no drift.
 #   4. CHAIN      the whole rollout order on the schema the shared Supabase database has today (PRE_PHASE0_REV,
 #                 before Phase 0): the Phase 3 SQL is refused first, then the Phase 0, Phase 2 and Phase 3 files apply
 #                 in order, RLS is on for every new table and `prisma migrate diff` reports no drift.
-#   5. CLEANUP    drop the throwaway databases (set KEEP_DBS=1 to keep them for inspection).
+#   5. SUPABASE   the same rollout with pgvector in an `extensions` schema and the search_path Supabase gives its
+#                 roles: the files apply, the extension stays where it is, no drift; with search_path = public (what
+#                 a Prisma URL with ?schema=public sets) a bare ::vector cast fails and the column's own type works.
+#   6. CLEANUP    drop the throwaway databases (set KEEP_DBS=1 to keep them for inspection).
 #
 # Usage:   scripts/verify-migrations.sh            (npm run verify:migration)
 # Options (environment variables):
@@ -68,12 +79,19 @@ TSX="$ROOT/node_modules/.bin/tsx"
 RUN_ID="$(date +%s)_$$_${RANDOM}"
 FRESH_DB="raqib_mverify_fresh_${RUN_ID}_test"
 EMPTY_DB="raqib_mverify_empty_${RUN_ID}_test"
+PARTIAL_DB="raqib_mverify_partial_${RUN_ID}_test"
 SEED_DB="raqib_mverify_seed_${RUN_ID}_test"
 CHAIN_DB="raqib_mverify_chain_${RUN_ID}_test"
+EXT_DB="raqib_mverify_ext_${RUN_ID}_test"
 FRESH_URL="$PG_BASE_URL/$FRESH_DB"
 EMPTY_URL="$PG_BASE_URL/$EMPTY_DB"
+PARTIAL_URL="$PG_BASE_URL/$PARTIAL_DB"
 SEED_URL="$PG_BASE_URL/$SEED_DB"
 CHAIN_URL="$PG_BASE_URL/$CHAIN_DB"
+EXT_URL="$PG_BASE_URL/$EXT_DB"
+# application_name of the session that holds a lock on Document in section 3c.
+BLOCKER_APP="raqib_mverify_blocker_${RUN_ID}"
+BLOCKER_PID=""
 ADMIN_URL="$PG_BASE_URL/postgres"
 # For messages: the server without its password (in the user info or in a password= parameter).
 SHOWN_URL="$(printf '%s' "$PG_BASE_URL" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#; s#([?&]password=)[^&]*#\1***#g')"
@@ -132,15 +150,32 @@ expect_eq() {
   if [[ "$got" == "$expected" ]]; then pass "$label"; else fail "$label (expected '$expected', got '$got')"; fi
 }
 
+# Creates a database, optionally as a copy of another one this run created (TEMPLATE; it must have no connections).
 create_db() {
-  local name="$1"
+  local name="$1" template="${2:-}" sql
   [[ "$name" == *test* ]] || die "refusing to create database '$name': its name must contain \"test\""
-  psql "$ADMIN_URL" -X -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$name\"" >/dev/null
+  sql="CREATE DATABASE \"$name\""
+  if [[ -n "$template" ]]; then
+    [[ " ${CREATED_DBS[*]} " == *" $template "* ]] || die "refusing to copy '$template': this run did not create it"
+    sql="$sql TEMPLATE \"$template\""
+  fi
+  psql "$ADMIN_URL" -X -q -v ON_ERROR_STOP=1 -c "$sql" >/dev/null
   CREATED_DBS+=("$name")
+}
+
+# Ends the session that holds a lock on Document in section 3c, if it is still there.
+stop_blocker() {
+  if [[ -n "$BLOCKER_PID" ]]; then
+    psql "$ADMIN_URL" -X -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '$BLOCKER_APP'" >/dev/null 2>&1 || true
+    kill "$BLOCKER_PID" 2>/dev/null || true
+    wait "$BLOCKER_PID" 2>/dev/null || true
+    BLOCKER_PID=""
+  fi
 }
 
 cleanup() {
   local status=$?
+  stop_blocker
   if [[ ${#CREATED_DBS[@]} -gt 0 ]]; then
     if [[ "$KEEP_DBS" == "1" ]]; then
       printf '\nKept databases: %s\n' "${CREATED_DBS[*]}"
@@ -209,6 +244,28 @@ expect_refused() {
   fi
 }
 
+# Copies a SQL file with one deliberate change (a "mutant"), for runs that the file's self-check must stop. Aborts
+# unless the original text occurs exactly once, so a later edit of the file cannot silently make the mutant a no-op.
+mutate() {
+  local src="$1" dst="$2" from="$3" to="$4" content n
+  n="$(grep -oF -- "$from" "$src" | wc -l | tr -d ' ')"
+  [[ "$n" == "1" ]] || die "mutation: expected the text to change exactly once in $(basename "$src"), found it $n times: $from"
+  content="$(cat "$src")"
+  printf '%s\n' "${content/"$from"/"$to"}" >"$dst"
+  cmp -s "$src" "$dst" && die "mutation did not change $(basename "$src")"
+  return 0
+}
+
+# Schema objects in public (tables, indexes, sequences, types, functions, columns with types and defaults), as one
+# md5: equal before and after a refused run means the run created and changed nothing.
+SCHEMA_FP_SQL="SELECT count(*) || ' ' || md5(string_agg(x, ',' ORDER BY x)) FROM (
+  SELECT 'class:' || relname || ':' || relkind::text FROM pg_class WHERE relnamespace = 'public'::regnamespace
+  UNION ALL SELECT 'type:' || typname FROM pg_type WHERE typnamespace = 'public'::regnamespace
+  UNION ALL SELECT 'proc:' || proname FROM pg_proc WHERE pronamespace = 'public'::regnamespace
+  UNION ALL SELECT 'column:' || table_name || '.' || column_name || ':' || udt_name || ':' || is_nullable || ':' || coalesce(column_default, '')
+            FROM information_schema.columns WHERE table_schema = 'public'
+) s(x)"
+
 # --- preconditions -----------------------------------------------------------------------------------------------
 
 section "Preconditions"
@@ -265,6 +322,11 @@ if [[ "$(grep -Ec '^BEGIN;$' "$PHASE3_SQL")" == "1" && "$(grep -Ec '^COMMIT;$' "
 else
   fail "$(basename "$PHASE3_SQL") is not exactly one transaction"
 fi
+if [[ "$(sed 's/--.*$//' "$PHASE3_SQL" | grep -v '^[[:space:]]*$' | sed -n 2p)" == "SET LOCAL lock_timeout = '5s';" ]]; then
+  pass "$(basename "$PHASE3_SQL") sets lock_timeout right after BEGIN (fails fast on a busy table; checked in 3c)"
+else
+  fail "$(basename "$PHASE3_SQL") does not start with BEGIN; SET LOCAL lock_timeout = '5s';"
+fi
 
 # The app's Prisma client creates, reads and deletes AiCall rows; with EXPECT_LEGACY_DOCS=1 it also reads the moved
 # document analyses of the fixtures below.
@@ -308,12 +370,15 @@ async function main() {
       problems.push('refused call not stored as written');
     }
 
-    // The queries the indexes are for: recent calls of a feature, an organisation's recent calls, cost by status.
+    // The queries the indexes are for: recent calls of a feature, an organisation's and a project's recent calls,
+    // cost by status.
     const recent = await prisma.aiCall.findMany({ where: { feature: 'verify.migration', createdAt: { gte: new Date(Date.now() - 3_600_000) } }, orderBy: { createdAt: 'desc' } });
     if (recent.length !== 2) problems.push(`expected 2 recent calls, got ${recent.length}`);
     if (project) {
       const orgCalls = await prisma.aiCall.count({ where: { organizationId: project.organizationId } });
       if (orgCalls !== 1) problems.push(`expected 1 call for the organisation, got ${orgCalls}`);
+      const projectCalls = await prisma.aiCall.findMany({ where: { projectId: project.id }, orderBy: { createdAt: 'desc' }, take: 10 });
+      if (projectCalls.length !== 1) problems.push(`expected 1 call for the project, got ${projectCalls.length}`);
     }
     const byStatus = await prisma.aiCall.groupBy({ by: ['status'], where: { feature: 'verify.migration' }, _sum: { estimatedCostUsd: true, inputTokens: true } });
     if (byStatus.length !== 2) problems.push('groupBy status did not return both statuses');
@@ -322,17 +387,40 @@ async function main() {
     const left = await prisma.aiCall.count();
     if (left !== 0) problems.push(`${left} AiCall row(s) left`);
 
+    // The other Phase 3 columns, as the app queries them: the current framework is the newest version without a
+    // generationError; library entries without an embeddingModel are re-embedded; transcripts are left out of AI use.
+    const failedVersions = await prisma.framework.count({ where: { generationError: { not: null } } });
+    if (failedVersions !== 0) problems.push(`${failedVersions} framework(s) with a generationError`);
+    if (project) {
+      const frameworks = await prisma.framework.count({ where: { projectId: project.id } });
+      const current = await prisma.framework.findFirst({ where: { projectId: project.id, generationError: null }, orderBy: { version: 'desc' }, select: { id: true } });
+      if ((frameworks > 0) !== (current !== null)) problems.push('current framework (generationError: null) not found');
+    }
+    const libraryWithModel = await prisma.indicatorLibraryEntry.count({ where: { embeddingModel: { not: null } } });
+    if (libraryWithModel !== 0) problems.push(`${libraryWithModel} library entr(ies) with an embeddingModel`);
+    const forAi = await prisma.document.count({ where: { qualitativeSource: false } });
+    const allDocuments = await prisma.document.count();
+
     let documents = 0;
     if (process.env.EXPECT_LEGACY_DOCS === '1') {
-      const docs = await prisma.document.findMany({ select: { id: true, parsedText: true, aiAnalysis: true } });
+      const docs = await prisma.document.findMany({ select: { id: true, parsedText: true, aiAnalysis: true, qualitativeSource: true } });
       documents = docs.length;
       const byId = new Map(docs.map((d) => [d.id, d]));
       const json = byId.get('p3v-doc-json')?.aiAnalysis;
       if (!isObject(json) || json.summary !== 'Livelihoods proposal.' || !Array.isArray(json.targets_mentioned)) problems.push('legacy JSON analysis not read as an object');
       const bad = byId.get('p3v-doc-bad')?.aiAnalysis;
       if (!isObject(bad) || typeof bad.legacyText !== 'string') problems.push('legacy text analysis not read as {legacyText}');
+      const deep = byId.get('p3v-doc-deep')?.aiAnalysis;
+      if (!isObject(deep) || typeof deep.legacyText !== 'string') problems.push('deeply nested legacy analysis not read as {legacyText}');
       if (byId.get('p3v-doc-plain')?.aiAnalysis !== null) problems.push('a document without the marker has an analysis');
-      if (docs.some((d) => d.parsedText?.includes(MARKER))) problems.push('a parsedText still contains the marker');
+      // Only a document whose own text quotes the marker keeps it (the analysis after the last marker moved).
+      const withMarker = docs.filter((d) => d.parsedText?.includes(MARKER)).map((d) => d.id).sort();
+      if (withMarker.join(',') !== 'p3v-doc-twice') problems.push(`parsedText with the marker: ${withMarker.join(',') || 'none'} (expected p3v-doc-twice)`);
+      const transcripts = docs.filter((d) => d.qualitativeSource).map((d) => d.id).sort();
+      if (transcripts.join(',') !== 'p3v-doc-kii,p3v-doc-transcript') problems.push(`qualitativeSource documents: ${transcripts.join(',') || 'none'}`);
+      if (forAi !== allDocuments - 2) problems.push(`expected ${allDocuments - 2} documents for AI use, got ${forAi}`);
+    } else if (forAi !== allDocuments) {
+      problems.push('a document is marked qualitativeSource');
     }
 
     console.log(JSON.stringify({ aiCallsWritten: 2, aiCallsLeft: left, documents, problems }));
@@ -394,6 +482,41 @@ else
   fail "Phase 3 SQL on a database with a leftover AiCallStatus type:"
   sed 's/^/        /' "$WORK/partly.log" | tail -n 20
 fi
+
+# --- 2b. partly applied ------------------------------------------------------------------------------------------
+
+section "2b. Partly applied: one leftover Phase 3 object on a database at the Phase 2 schema ($PHASE2_REV)"
+create_db "$PARTIAL_DB"
+info "created $PARTIAL_DB"
+run_quiet "schema at $PHASE2_REV pushed (what the Phase 3 SQL upgrades)" \
+  in_dir "$WORK" env DATABASE_URL="$PARTIAL_URL" DIRECT_URL="$PARTIAL_URL" "$PRISMA" db push --schema "$PHASE2_SCHEMA" --skip-generate
+# Each case on its own copy of that database: the leftover, then the name the refusal must give.
+PARTIAL_CASES=(
+  'ALTER TABLE "Document" ADD COLUMN "aiAnalysis" JSONB|column "Document"."aiAnalysis"'
+  'ALTER TABLE "Document" ADD COLUMN "qualitativeSource" BOOLEAN NOT NULL DEFAULT false|column "Document"."qualitativeSource"'
+  'ALTER TABLE "Framework" ADD COLUMN "generationError" TEXT|column "Framework"."generationError"'
+  'ALTER TABLE "IndicatorLibraryEntry" ADD COLUMN "embeddingModel" TEXT|column "IndicatorLibraryEntry"."embeddingModel"'
+  "CREATE TYPE \"AiCallStatus\" AS ENUM ('success')|type \"AiCallStatus\""
+)
+PARTIAL_N=0
+for partial_case in "${PARTIAL_CASES[@]}"; do
+  PARTIAL_N=$((PARTIAL_N + 1))
+  IFS='|' read -r leftover_sql leftover_name <<<"$partial_case"
+  copy_db="raqib_mverify_partial${PARTIAL_N}_${RUN_ID}_test"
+  create_db "$copy_db" "$PARTIAL_DB"
+  copy_url="$PG_BASE_URL/$copy_db"
+  q "$copy_url" "$leftover_sql" >/dev/null
+  fp_before="$(q "$copy_url" "$SCHEMA_FP_SQL")"
+  if psql "$copy_url" -X -q -v ON_ERROR_STOP=1 -f "$PHASE3_SQL" >"$WORK/partial$PARTIAL_N.log" 2>&1; then
+    fail "Phase 3 SQL ran on a Phase 2 database with a leftover $leftover_name"
+  elif grep -qF "ERROR:  Phase 3 migration already partly applied: $leftover_name exist(s) without table \"AiCall\"" "$WORK/partial$PARTIAL_N.log" \
+    && [[ "$(q "$copy_url" "$SCHEMA_FP_SQL")" == "$fp_before" ]]; then
+    pass "Phase 3 SQL refused on a Phase 2 database with a leftover $leftover_name (\"already partly applied\", named), nothing changed"
+  else
+    fail "Phase 3 SQL on a Phase 2 database with a leftover $leftover_name:"
+    sed 's/^/        /' "$WORK/partial$PARTIAL_N.log" | tail -n 20
+  fi
+done
 
 # --- 3. copy of the current seed -----------------------------------------------------------------------------------
 
@@ -470,14 +593,34 @@ FROM (SELECT id FROM "Project" ORDER BY "createdAt", id LIMIT 1) p,
        ('p3v-doc-dup', 'logframe', E'Logframe.\n\n---AI_ANALYSIS---\n{"summary":"first","summary":"second"}'),
        ('p3v-doc-dupnested', 'logframe', E'Logframe v2.\n\n---AI_ANALYSIS---\n{"summary":"ok","targets_mentioned":[{"target":"60%","target":"70%"}]}'),
        ('p3v-doc-twice', 'donor_guidelines', E'Guidelines quoting ---AI_ANALYSIS--- in the text.\n\n---AI_ANALYSIS---\n{"summary":"s"}'),
+       ('p3v-doc-quoteonly', 'other', 'A note that quotes ---AI_ANALYSIS--- but got no analysis.'),
+       ('p3v-doc-overlap', 'other', E'Overlap.\n\n---AI_ANALYSIS---AI_ANALYSIS---\n{"summary":"overlap"}'),
+       ('p3v-doc-deep', 'baseline_report', E'Deep.\n\n---AI_ANALYSIS---\n{"a":' || repeat('[', 600) || '1' || repeat(']', 600) || '}'),
+       ('p3v-doc-transcript', 'other', E'Participant 3 said the water point is far.\n\n---AI_ANALYSIS---\n{"summary":"FGD on water access."}'),
+       ('p3v-doc-transcript2', 'other', 'Transcript attached from another project''s entry.'),
+       ('p3v-doc-kii', 'other', 'KII notes: the clinic opens twice a week.'),
        ('p3v-doc-empty', 'other', E'Text only.\n\n---AI_ANALYSIS---\n  \n'),
        ('p3v-doc-arabic', 'proposal', E'مقترح مشروع سبل العيش في الخليل.\n\n---AI_ANALYSIS---\n{"summary":"ملخص المقترح","keyFindings":["نسبة الأسر ٤١٪"]}'),
        ('p3v-doc-only', 'theory_of_change', E'---AI_ANALYSIS---\n{"summary":"only the analysis"}'),
        ('p3v-doc-nul', 'other', E'Text.\n\n---AI_ANALYSIS---\n' || '{"summary":"a\u0000b"}'),
        ('p3v-doc-crlf', 'baseline_report', E'Survey text \t\r\n\r\n---AI_ANALYSIS---\r\n{"summary":"crlf"}\r\n')
      ) AS x(id, ft, pt);
+-- Qualitative entries as the old upload route created them ({documentId, fileName} in attachments) and look-alikes
+-- that must not mark a document: an entry of another project, attachments that are an object, a string or a number.
+INSERT INTO "QualitativeEntry" (id, "projectId", "entryType", title, content, attachments)
+SELECT x.id, CASE WHEN x.other THEN p2.id ELSE p1.id END, x.et::"QualitativeType", x.id, 'Fixture content.', x.att::jsonb
+FROM (SELECT id FROM "Project" ORDER BY "createdAt", id LIMIT 1) p1,
+     (SELECT id FROM "Project" ORDER BY "createdAt", id OFFSET 1 LIMIT 1) p2,
+     (VALUES
+       ('p3v-qe-upload', 'fgd_transcript', false, '[{"documentId":"p3v-doc-transcript","fileName":"p3v-doc-transcript.pdf"}]'),
+       ('p3v-qe-second', 'kii_notes', false, '[{"fileName":"no-id.pdf"}, {"documentId":"p3v-doc-kii","fileName":"p3v-doc-kii.pdf"}]'),
+       ('p3v-qe-otherproject', 'fgd_transcript', true, '[{"documentId":"p3v-doc-transcript2","fileName":"p3v-doc-transcript2.pdf"}]'),
+       ('p3v-qe-object', 'field_notes', false, '{"documentId":"p3v-doc-plain"}'),
+       ('p3v-qe-scalars', 'field_notes', false, '["p3v-doc-like", {"documentId": 42}, null, {"documentId": ["p3v-doc-json"]}]'),
+       ('p3v-qe-none', 'msc_story', false, NULL)
+     ) AS x(id, et, other, att);
 SQL
-run_quiet "legacy document fixtures added (14 documents, 11 with the ---AI_ANALYSIS--- marker)" \
+run_quiet "legacy document fixtures added (20 documents, 15 with the ---AI_ANALYSIS--- marker; 6 qualitative entries)" \
   psql "$SEED_URL" -X -q -v ON_ERROR_STOP=1 -f "$WORK/documents.sql"
 
 # Snapshot queries are built now, from the OLD columns, and reused after the migration.
@@ -652,6 +795,91 @@ psql "$S" -X -q -v ON_ERROR_STOP=1 -c "\\copy (SELECT id, \"parsedText\" FROM \"
 LEGACY_DOCS="$(q "$S" "SELECT count(*) FROM \"Document\" WHERE strpos(\"parsedText\", '---AI_ANALYSIS---') > 0")"
 info "snapshot of $TABLES3 tables; $(q "$S" 'SELECT count(*) FROM "Document"') documents, $LEGACY_DOCS with the ---AI_ANALYSIS--- marker"
 
+# Negative runs first, each on its own copy of this database (so a run that wrongly commits cannot spoil the real
+# one): each must stop with the expected error and leave every column of every table (parsedText included) and the
+# schema exactly as they were.
+SNAP3_ALL_SQL="$WORK/snapshot3-all.sql"
+build_snapshot_sql "$S" "$SNAP3_ALL_SQL"
+NEG_N=0
+NEG_URL=""
+new_seed_copy() {
+  NEG_N=$((NEG_N + 1))
+  local name="raqib_mverify_neg${NEG_N}_${RUN_ID}_test"
+  create_db "$name" "$SEED_DB"
+  NEG_URL="$PG_BASE_URL/$name"
+}
+expect_rollback() {
+  local url="$1" label="$2" file="$3" message="$4" log before fp_before
+  log="$(mktemp "$WORK/rollback.XXXXXX")"
+  before="$(snapshot "$url" "$SNAP3_ALL_SQL")"
+  fp_before="$(q "$url" "$SCHEMA_FP_SQL")"
+  if psql "$url" -X -q -v ON_ERROR_STOP=1 -f "$file" >"$log" 2>&1; then
+    fail "$label (the file ran and committed)"
+  elif grep -qF "ERROR:  $message" "$log"; then
+    if [[ "$(snapshot "$url" "$SNAP3_ALL_SQL")" == "$before" && "$(q "$url" "$SCHEMA_FP_SQL")" == "$fp_before" ]]; then
+      pass "$label"
+    else
+      fail "$label (stopped, but data or schema changed)"
+    fi
+  else
+    fail "$label (failed for an unexpected reason):"
+    sed 's/^/        /' "$log" | tail -n 20
+  fi
+}
+
+# lock_timeout: another session holds a lock on Document (as a long report query would). The file must give up after
+# about 5 seconds instead of waiting (and making every later query on Document queue behind its ALTER TABLE).
+new_seed_copy
+PGAPPNAME="$BLOCKER_APP" psql "$NEG_URL" -X -q -v ON_ERROR_STOP=1 \
+  -c 'BEGIN' -c 'LOCK TABLE "Document" IN ACCESS SHARE MODE' -c 'SELECT pg_sleep(300)' -c 'COMMIT' >/dev/null 2>&1 &
+BLOCKER_PID=$!
+LOCK_HELD=0
+for _ in $(seq 1 100); do
+  if [[ "$(q "$NEG_URL" "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+        WHERE a.application_name = '$BLOCKER_APP' AND l.relation = '\"Document\"'::regclass AND l.granted")" == "1" ]]; then
+    LOCK_HELD=1
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$LOCK_HELD" == "1" ]]; then
+  LOCK_STARTED=$SECONDS
+  expect_rollback "$NEG_URL" "Phase 3 SQL gives up on a locked Document table (\"lock timeout\"), nothing changed" \
+    "$PHASE3_SQL" "canceling statement due to lock timeout"
+  LOCK_ELAPSED=$((SECONDS - LOCK_STARTED))
+  if [[ $LOCK_ELAPSED -ge 4 && $LOCK_ELAPSED -le 60 ]]; then
+    pass "it waited about lock_timeout (${LOCK_ELAPSED}s), not until the other session ended"
+  else
+    fail "it took ${LOCK_ELAPSED}s on a locked Document table (expected about 5s)"
+  fi
+else
+  fail "could not take a lock on Document in a second session"
+fi
+stop_blocker
+
+# Copies of the file with one deliberate bug each: the self-check (or, for the last one, Postgres) must stop them.
+mutate "$PHASE3_SQL" "$WORK/mutant-dupkeys.sql" \
+  'IF NOT pg_temp.raqib_phase3_has_duplicate_keys(body::json) THEN' 'IF true THEN'
+new_seed_copy
+expect_rollback "$NEG_URL" "self-check stops a file whose duplicate-key check is skipped (keys lost by jsonb), nothing changed" \
+  "$WORK/mutant-dupkeys.sql" "Phase 3 self-check failed: 2 legacy document(s) not moved exactly"
+mutate "$PHASE3_SQL" "$WORK/mutant-firstmarker.sql" \
+  "length(\"parsedText\") - strpos(reverse(\"parsedText\"), reverse('---AI_ANALYSIS---')) - length('---AI_ANALYSIS---') + 2" \
+  "strpos(\"parsedText\", '---AI_ANALYSIS---')"
+new_seed_copy
+expect_rollback "$NEG_URL" "self-check stops a file that splits at the first marker, nothing changed" \
+  "$WORK/mutant-firstmarker.sql" "Phase 3 self-check failed: 2 legacy document(s) not split at the last ---AI_ANALYSIS--- marker"
+mutate "$PHASE3_SQL" "$WORK/mutant-transcripts.sql" 'SET "qualitativeSource" = true' 'SET "qualitativeSource" = false'
+new_seed_copy
+expect_rollback "$NEG_URL" "self-check stops a file that does not mark the old transcripts, nothing changed" \
+  "$WORK/mutant-transcripts.sql" "Phase 3 self-check failed: 2 document(s) with a wrong qualitativeSource"
+# Without its exception handler the duplicate-key check runs out of stack on the deeply nested fixture: proves that
+# p3v-doc-deep exercises that path on this server, and that such an error rolls everything back.
+mutate "$PHASE3_SQL" "$WORK/mutant-nohandler.sql" '    EXCEPTION WHEN OTHERS THEN' '    EXCEPTION WHEN division_by_zero THEN'
+new_seed_copy
+expect_rollback "$NEG_URL" "without its exception handler the deeply nested legacy JSON aborts the run (stack depth), nothing changed" \
+  "$WORK/mutant-nohandler.sql" "stack depth limit exceeded"
+
 run_quiet "Phase 3 SQL applied with psql -v ON_ERROR_STOP=1" \
   psql "$SEED_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE3_SQL"
 
@@ -678,8 +906,8 @@ expect_eq "$S" "AiCall columns, types, nullability and defaults" \
 expect_eq "$S" "AiCallStatus enum values in order" "success,refusal,max_tokens,invalid_output,error" \
   "SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
    WHERE t.typname = 'AiCallStatus' AND t.typnamespace = 'public'::regnamespace"
-expect_eq "$S" "AiCall indexes: primary key on id and the three Prisma-named indexes" \
-  'AiCall_createdAt_idx:btree ("createdAt"), AiCall_feature_createdAt_idx:btree (feature, "createdAt"), AiCall_organizationId_createdAt_idx:btree ("organizationId", "createdAt"), AiCall_pkey:unique btree (id)' \
+expect_eq "$S" "AiCall indexes: primary key on id and the four Prisma-named indexes (projectId, createdAt included)" \
+  'AiCall_createdAt_idx:btree ("createdAt"), AiCall_feature_createdAt_idx:btree (feature, "createdAt"), AiCall_organizationId_createdAt_idx:btree ("organizationId", "createdAt"), AiCall_pkey:unique btree (id), AiCall_projectId_createdAt_idx:btree ("projectId", "createdAt")' \
   "SELECT string_agg(indexname || ':' || CASE WHEN indexdef LIKE 'CREATE UNIQUE%' THEN 'unique ' ELSE '' END || regexp_replace(indexdef, '^.* USING ', ''), ', ' ORDER BY indexname)
    FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'AiCall'"
 expect_eq "$S" "AiCall foreign keys to Organization and Project: ON DELETE SET NULL, ON UPDATE CASCADE" \
@@ -691,6 +919,13 @@ expect_eq "$S" "row level security enabled on AiCall, with no policies (not read
 expect_eq "$S" "Document.aiAnalysis exists: jsonb, nullable, no default" "jsonb|YES|" \
   "SELECT data_type || '|' || is_nullable || '|' || coalesce(column_default, '') FROM information_schema.columns
    WHERE table_schema = 'public' AND table_name = 'Document' AND column_name = 'aiAnalysis'"
+expect_eq "$S" "Document.qualitativeSource (boolean, not null, default false), Framework.generationError and IndicatorLibraryEntry.embeddingModel (text, nullable, no default)" \
+  "Document.qualitativeSource:boolean:NO:false, Framework.generationError:text:YES:, IndicatorLibraryEntry.embeddingModel:text:YES:" \
+  "SELECT string_agg(table_name || '.' || column_name || ':' || data_type || ':' || is_nullable || ':' || coalesce(column_default, ''), ', ' ORDER BY table_name, column_name)
+   FROM information_schema.columns WHERE table_schema = 'public'
+     AND table_name || '.' || column_name IN ('Document.qualitativeSource', 'Framework.generationError', 'IndicatorLibraryEntry.embeddingModel')"
+expect_zero "$S" "no generationError or embeddingModel invented for existing frameworks and library entries" \
+  'SELECT (SELECT count(*) FROM "Framework" WHERE "generationError" IS NOT NULL) + (SELECT count(*) FROM "IndicatorLibraryEntry" WHERE "embeddingModel" IS NOT NULL)'
 expect_zero "$S" "no AiCall rows invented by the migration" 'SELECT count(*) FROM "AiCall"'
 expect_zero "$S" "the migration's pg_temp helpers and temp table did not outlive its session" \
   "SELECT (SELECT count(*) FROM pg_proc WHERE proname LIKE 'raqib\\_phase3\\_%') + (SELECT count(*) FROM pg_class WHERE relname LIKE 'raqib\\_phase3\\_%')"
@@ -722,41 +957,85 @@ else
 fi
 
 # The legacy analysis move, document by document (fixtures from section 3).
-DOC_MARKER_COUNT="$(q "$S" "SELECT count(*) FROM \"Document\" WHERE strpos(\"parsedText\", '---AI_ANALYSIS---') > 0")"
-if [[ "$DOC_MARKER_COUNT" == "0" ]]; then pass "no parsedText contains the ---AI_ANALYSIS--- marker any more (was $LEGACY_DOCS)"; else fail "$DOC_MARKER_COUNT document(s) still contain the marker"; fi
+expect_eq "$S" "only a document whose own text quotes the marker still contains it (was $LEGACY_DOCS documents)" "p3v-doc-twice" \
+  "SELECT coalesce(string_agg(id, ',' ORDER BY id), 'none') FROM \"Document\" WHERE strpos(\"parsedText\", '---AI_ANALYSIS---') > 0"
+expect_eq "$S" "transcripts of the old qualitative upload marked qualitativeSource, nothing else" "p3v-doc-kii,p3v-doc-transcript" \
+  "SELECT coalesce(string_agg(id, ',' ORDER BY id), 'none') FROM \"Document\" WHERE \"qualitativeSource\""
+# The post-deploy marking from docs/DATA_MODEL.md §9 step 8 (keep the statement in sync): it marks a transcript that
+# the old API uploaded after the SQL ran, and nothing else (rolled back).
+cat >"$WORK/window.sql" <<'SQL'
+BEGIN;
+INSERT INTO "Document" (id, "projectId", "uploadedBy", "fileName", "fileUrl", "fileType", "parsedText", "parsingStatus")
+SELECT 'p3v-doc-window', "projectId", "uploadedBy", 'window.pdf', 'documents/verify/window.pdf', 'other', 'Window transcript.', 'completed'
+FROM "Document" WHERE id = 'p3v-doc-plain';
+INSERT INTO "QualitativeEntry" (id, "projectId", "entryType", title, content, attachments)
+SELECT 'p3v-qe-window', "projectId", 'fgd_transcript', 'Window', 'Window transcript.', '[{"documentId":"p3v-doc-window","fileName":"window.pdf"}]'
+FROM "Document" WHERE id = 'p3v-doc-window';
+WITH marked AS (
+  UPDATE "Document" d SET "qualitativeSource" = true
+  WHERE NOT d."qualitativeSource" AND EXISTS (
+    SELECT 1 FROM "QualitativeEntry" q
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(q."attachments") = 'array' THEN q."attachments" ELSE '[]'::jsonb END) AS a(item)
+    WHERE q."projectId" = d."projectId" AND jsonb_typeof(a.item) = 'object' AND a.item -> 'documentId' = to_jsonb(d."id"))
+  RETURNING d.id)
+SELECT 'marked:' || coalesce(string_agg(id, ',' ORDER BY id), 'none') FROM marked;
+ROLLBACK;
+SQL
+WINDOW_OUT="$(psql "$S" -X -At -q -v ON_ERROR_STOP=1 -f "$WORK/window.sql" 2>&1)" || true
+if [[ "$WINDOW_OUT" == "marked:p3v-doc-window" ]]; then
+  pass "the post-deploy transcript marking (DATA_MODEL §9 step 8) marks only a transcript uploaded in the window (rolled back)"
+else
+  fail "post-deploy transcript marking (expected 'marked:p3v-doc-window', got '$WINDOW_OUT')"
+fi
 
 cat >"$WORK/documents-expected.sql" <<'SQL'
-SELECT e.label, (d.id IS NOT NULL AND d."parsedText" IS NOT DISTINCT FROM e.pt AND d."aiAnalysis" IS NOT DISTINCT FROM e.ai)::text, e.id
+SELECT e.label,
+       (d.id IS NOT NULL AND d."parsedText" IS NOT DISTINCT FROM e.pt AND d."aiAnalysis" IS NOT DISTINCT FROM e.ai
+        AND d."qualitativeSource" = e.qs)::text,
+       e.id
 FROM (VALUES
   ('p3v-doc-json', 'valid JSON after the marker moved to aiAnalysis as JSON (snake_case keys kept); parsedText is the text before it',
    'Livelihoods proposal for Hebron. Baseline: 41% of households have acceptable FCS (2025 survey).',
-   '{"document_type":"proposal","summary":"Livelihoods proposal.","key_findings":["Baseline FCS 41%"],"indicators_mentioned":["% of households with acceptable FCS"],"targets_mentioned":[{"indicator":"FCS","target":"60%","timeline":"2027"}],"recommendations":["Add sex disaggregation"]}'::jsonb),
+   '{"document_type":"proposal","summary":"Livelihoods proposal.","key_findings":["Baseline FCS 41%"],"indicators_mentioned":["% of households with acceptable FCS"],"targets_mentioned":[{"indicator":"FCS","target":"60%","timeline":"2027"}],"recommendations":["Add sex disaggregation"]}'::jsonb,
+   false),
   ('p3v-doc-bad', 'invalid JSON (answer cut off) moved as {legacyText} verbatim',
-   'Baseline report text.', jsonb_build_object('legacyText', '{"summary": "Answer cut off at max_tok')),
-  ('p3v-doc-plain', 'document without the marker untouched (trailing whitespace kept), no aiAnalysis',
-   E'Plain text without an analysis.\n\n', NULL::jsonb),
-  ('p3v-doc-null', 'document without parsed text untouched, no aiAnalysis', NULL, NULL),
-  ('p3v-doc-like', 'marker look-alikes (---AIXANALYSIS---, LIKE wildcard trap) untouched, no aiAnalysis',
-   'Text with ---AIXANALYSIS--- and ---AI ANALYSIS--- look-alikes.', NULL),
+   'Baseline report text.', jsonb_build_object('legacyText', '{"summary": "Answer cut off at max_tok'), false),
+  ('p3v-doc-plain', 'document without the marker untouched (trailing whitespace kept), no aiAnalysis; an entry whose attachments are an object does not mark it',
+   E'Plain text without an analysis.\n\n', NULL::jsonb, false),
+  ('p3v-doc-null', 'document without parsed text untouched, no aiAnalysis', NULL, NULL, false),
+  ('p3v-doc-like', 'marker look-alikes (---AIXANALYSIS---, LIKE wildcard trap) untouched, no aiAnalysis; a bare string in attachments does not mark it',
+   'Text with ---AIXANALYSIS--- and ---AI ANALYSIS--- look-alikes.', NULL, false),
   ('p3v-doc-array', 'valid JSON that is not an object (array) moved as {legacyText}',
-   'Budget lines.', jsonb_build_object('legacyText', '["not", "an", "object"]')),
+   'Budget lines.', jsonb_build_object('legacyText', '["not", "an", "object"]'), false),
   ('p3v-doc-dup', 'JSON with a duplicate key moved as {legacyText} (jsonb would drop the first value)',
-   'Logframe.', jsonb_build_object('legacyText', '{"summary":"first","summary":"second"}')),
+   'Logframe.', jsonb_build_object('legacyText', '{"summary":"first","summary":"second"}'), false),
   ('p3v-doc-dupnested', 'JSON with a duplicate key deep inside moved as {legacyText}',
-   'Logframe v2.', jsonb_build_object('legacyText', '{"summary":"ok","targets_mentioned":[{"target":"60%","target":"70%"}]}')),
-  ('p3v-doc-twice', 'two markers: split at the first (as the readers do), the rest kept in {legacyText}',
-   'Guidelines quoting', jsonb_build_object('legacyText', E'in the text.\n\n---AI_ANALYSIS---\n{"summary":"s"}')),
+   'Logframe v2.', jsonb_build_object('legacyText', '{"summary":"ok","targets_mentioned":[{"target":"60%","target":"70%"}]}'), false),
+  ('p3v-doc-twice', 'two markers: split at the LAST (as the readers do); the marker quoted by the document stays in its text, the appended JSON moves',
+   'Guidelines quoting ---AI_ANALYSIS--- in the text.', '{"summary":"s"}'::jsonb, false),
+  ('p3v-doc-quoteonly', 'one marker quoted by a document that got no analysis: the text after it moves as {legacyText}, as the readers treat it (nothing lost)',
+   'A note that quotes', jsonb_build_object('legacyText', 'but got no analysis.'), false),
+  ('p3v-doc-overlap', 'overlapping markers (---AI_ANALYSIS---AI_ANALYSIS---): split where the last one starts, as lastIndexOf does',
+   E'Overlap.\n\n---AI_ANALYSIS', '{"summary":"overlap"}'::jsonb, false),
+  ('p3v-doc-deep', 'JSON nested 600 levels deep (too deep for the duplicate-key check) moved as {legacyText} instead of aborting the run',
+   'Deep.', jsonb_build_object('legacyText', '{"a":' || repeat('[', 600) || '1' || repeat(']', 600) || '}'), false),
   ('p3v-doc-empty', 'only whitespace after the marker: parsedText is the text before it, aiAnalysis stays empty',
-   'Text only.', NULL),
+   'Text only.', NULL, false),
   ('p3v-doc-arabic', 'Arabic text and Arabic JSON moved intact',
-   'مقترح مشروع سبل العيش في الخليل.', '{"summary":"ملخص المقترح","keyFindings":["نسبة الأسر ٤١٪"]}'::jsonb),
+   'مقترح مشروع سبل العيش في الخليل.', '{"summary":"ملخص المقترح","keyFindings":["نسبة الأسر ٤١٪"]}'::jsonb, false),
   ('p3v-doc-only', 'marker at the very start: parsedText becomes empty, the analysis moves',
-   '', '{"summary":"only the analysis"}'::jsonb),
+   '', '{"summary":"only the analysis"}'::jsonb, false),
   ('p3v-doc-nul', 'JSON that jsonb cannot store (\u0000) moved as {legacyText}',
-   'Text.', jsonb_build_object('legacyText', '{"summary":"a\u0000b"}')),
+   'Text.', jsonb_build_object('legacyText', '{"summary":"a\u0000b"}'), false),
   ('p3v-doc-crlf', 'CRLF line ends: trailing spaces, tabs and CR/LF trimmed from parsedText, JSON moved',
-   'Survey text', '{"summary":"crlf"}'::jsonb)
-) AS e(id, label, pt, ai)
+   'Survey text', '{"summary":"crlf"}'::jsonb, false),
+  ('p3v-doc-transcript', 'transcript of the old qualitative upload (attached to an entry of its project): qualitativeSource, its analysis moved',
+   'Participant 3 said the water point is far.', '{"summary":"FGD on water access."}'::jsonb, true),
+  ('p3v-doc-kii', 'document attached as the second item of an entry''s attachments: qualitativeSource, text untouched',
+   'KII notes: the clinic opens twice a week.', NULL, true),
+  ('p3v-doc-transcript2', 'document attached only to an entry of ANOTHER project: not marked',
+   'Transcript attached from another project''s entry.', NULL, false)
+) AS e(id, label, pt, ai, qs)
 LEFT JOIN "Document" d ON d.id = e.id
 ORDER BY e.id;
 SQL
@@ -786,12 +1065,14 @@ expect_before "every document without the marker kept its parsedText exactly and
   "SELECT count(*) FROM before_docs b LEFT JOIN \"Document\" d ON d.id = b.id
    WHERE coalesce(strpos(b.pt, '---AI_ANALYSIS---'), 0) = 0
      AND (d.id IS NULL OR d.\"parsedText\" IS DISTINCT FROM b.pt OR d.\"aiAnalysis\" IS NOT NULL)"
-expect_before "nothing lost: for every legacy document, the old parsedText is the new parsedText + whitespace + marker + the text kept in aiAnalysis" \
+# The last marker is found here with a greedy regular expression (everything up to and including the last marker),
+# independently of the reverse() arithmetic in the SQL file.
+expect_before "nothing lost: for every legacy document, the old parsedText is the new parsedText + whitespace + the LAST marker + the text kept in aiAnalysis" \
   "SELECT count(*) FROM before_docs b
-   CROSS JOIN LATERAL (SELECT strpos(b.pt, '---AI_ANALYSIS---') AS at) m
+   CROSS JOIN LATERAL (SELECT regexp_replace(b.pt, '^.*---AI_ANALYSIS---', '') AS tail) m
    LEFT JOIN \"Document\" d ON d.id = b.id
-   CROSS JOIN LATERAL (SELECT left(b.pt, m.at - 1) AS head, btrim(substr(b.pt, m.at + 17), E' \\t\\r\\n\\f\\x0B') AS body) t
-   WHERE m.at > 0
+   CROSS JOIN LATERAL (SELECT left(b.pt, length(b.pt) - length(m.tail) - 17) AS head, btrim(m.tail, E' \\t\\r\\n\\f\\x0B') AS body) t
+   WHERE strpos(b.pt, '---AI_ANALYSIS---') > 0
      AND (d.id IS NULL
           OR left(t.head, length(d.\"parsedText\")) <> d.\"parsedText\"
           OR btrim(substr(t.head, length(d.\"parsedText\") + 1), E' \\t\\r\\n\\f\\x0B') <> ''
@@ -837,6 +1118,74 @@ expect_eq "$CHAIN_URL" "row level security enabled on WebhookToken, ResultNode, 
   "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace
      AND relname IN ('WebhookToken', 'ResultNode', 'IndicatorLibraryEntry', 'AiCall') AND relrowsecurity"
 check_no_drift "$CHAIN_URL" "no drift between the database after Phase 0, Phase 2 and Phase 3 SQL and prisma/schema.prisma"
+
+# --- 5. Supabase layout: pgvector in the extensions schema ----------------------------------------------------------
+
+section "5. Supabase layout: pgvector in an \"extensions\" schema, rollout order from $PRE_PHASE0_REV"
+create_db "$EXT_DB"
+info "created $EXT_DB"
+# As on Supabase: the extension lives in its own schema, and the roles' search_path ("$user", public, extensions)
+# includes it, so psql and Prisma connections without ?schema= find the vector type.
+run_quiet "pgvector created in schema extensions; database search_path \"\$user\", public, extensions" \
+  psql "$EXT_URL" -X -q -v ON_ERROR_STOP=1 -c 'CREATE SCHEMA extensions' -c 'CREATE EXTENSION vector WITH SCHEMA extensions' \
+    -c "ALTER DATABASE \"$EXT_DB\" SET search_path TO \"\$user\", public, extensions"
+run_quiet "schema at $PRE_PHASE0_REV pushed (Prisma keeps the existing extension)" \
+  in_dir "$CHAIN" env DATABASE_URL="$EXT_URL" DIRECT_URL="$EXT_URL" "$PRISMA" db push --schema schema.prisma --skip-generate
+run_quiet "Phase 0 SQL applied" psql "$EXT_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE0_SQL"
+run_quiet "Phase 2 SQL applied (vector(1024) resolved through the search_path)" psql "$EXT_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE2_SQL"
+run_quiet "Phase 3 SQL applied" psql "$EXT_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE3_SQL"
+expect_eq "$EXT_URL" "pgvector still lives only in the extensions schema (no vector type created in public)" "extensions|0" \
+  "SELECT e.extnamespace::regnamespace::text || '|' || (SELECT count(*) FROM pg_type WHERE typname = 'vector' AND typnamespace = 'public'::regnamespace)
+   FROM pg_extension e WHERE e.extname = 'vector'"
+check_no_drift "$EXT_URL" "no drift between the database with pgvector in extensions and prisma/schema.prisma"
+run_quiet "the app's Prisma client creates, reads and deletes AiCall rows (pgvector in extensions)" \
+  in_dir "$ROOT" env DATABASE_URL="$EXT_URL" DIRECT_URL="$EXT_URL" "$TSX" "$WORK/aicall-check.ts"
+
+# What the app must cope with: a Prisma URL with ?schema=public sets search_path to public only. Then a bare ::vector
+# cast (and the bare <=> operator) cannot be found, while the column's own type, read from the catalogue
+# schema-qualified (as the embedding code resolves it at runtime), works for writing and comparing vectors.
+EXT_PUBLIC_ONLY=(env PGOPTIONS="-c search_path=public" psql "$EXT_URL" -X -At -q -v ON_ERROR_STOP=1)
+if "${EXT_PUBLIC_ONLY[@]}" -c "SELECT '[1,0,0]'::vector" >"$WORK/ext-bare.log" 2>&1; then
+  fail "with search_path = public a bare ::vector cast worked (expected type \"vector\" does not exist)"
+elif grep -qF 'type "vector" does not exist' "$WORK/ext-bare.log"; then
+  pass "with search_path = public (Prisma's ?schema=public) a bare ::vector cast fails: type \"vector\" does not exist"
+else
+  fail "bare ::vector cast with search_path = public failed for an unexpected reason:"
+  sed 's/^/        /' "$WORK/ext-bare.log" | tail -n 10
+fi
+cat >"$WORK/ext-vector.sql" <<'SQL'
+BEGIN;
+SELECT format_type(atttypid, NULL) AS t FROM pg_attribute
+WHERE attrelid = '"IndicatorLibraryEntry"'::regclass AND attname = 'embedding' \gset vector_
+SELECT 'type:' || :'vector_t';
+INSERT INTO "IndicatorLibraryEntry" (id, sector, tags, level, name, "nameAr", definition, unit, direction, disaggregation,
+                                     methods, frequency, "meansOfVerification", "isStandard", version, "updatedAt")
+VALUES ('p3v-lib', (enum_range(NULL::"Sector"))[1], '{}', 'outcome', 'Fixture entry', 'مؤشر تجريبي', 'Fixture.', 'number',
+        'increase', '{}', '{}', (enum_range(NULL::"Frequency"))[1], 'Fixture.', false, 'verify', now());
+UPDATE "IndicatorLibraryEntry"
+SET embedding = CAST('[' || array_to_string(array_fill(0.5::float4, ARRAY[1024]), ',') || ']' AS :vector_t),
+    "embeddingModel" = 'verify-model'
+WHERE id = 'p3v-lib';
+SELECT 'stored:' || extensions.vector_dims(embedding) || ':' || "embeddingModel" || ':' || (embedding OPERATOR(extensions.<=>) embedding)
+FROM "IndicatorLibraryEntry" WHERE id = 'p3v-lib';
+ROLLBACK;
+SQL
+EXT_OUT="$("${EXT_PUBLIC_ONLY[@]}" -f "$WORK/ext-vector.sql" 2>&1 | tr '\n' ';')" || true
+if [[ "$EXT_OUT" == "type:extensions.vector;stored:1024:verify-model:0;" ]]; then
+  pass "with search_path = public the column's own type (extensions.vector) stores a 1024-dimension vector and OPERATOR(extensions.<=>) compares it (rolled back)"
+else
+  fail "schema-qualified vector write with search_path = public (got '$EXT_OUT')"
+fi
+if "${EXT_PUBLIC_ONLY[@]}" -c "SELECT '[1,0]'::extensions.vector <=> '[0,1]'::extensions.vector" >"$WORK/ext-op.log" 2>&1; then
+  fail "with search_path = public the bare <=> operator worked (expected operator does not exist)"
+elif grep -qF 'operator does not exist' "$WORK/ext-op.log"; then
+  pass "with search_path = public the bare <=> operator is not found either (vector search must not hide the extensions schema)"
+else
+  fail "bare <=> with search_path = public failed for an unexpected reason:"
+  sed 's/^/        /' "$WORK/ext-op.log" | tail -n 10
+fi
+expect_zero "$EXT_URL" "the rolled-back vector write left no library row behind" \
+  "SELECT count(*) FROM \"IndicatorLibraryEntry\""
 
 # --- summary -----------------------------------------------------------------------------------------------------
 

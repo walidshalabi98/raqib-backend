@@ -1,10 +1,13 @@
 import { Prisma, PrismaClient } from '@prisma/client';
-// Type-only: the provider module reads the API env; the library seed must not need it.
-import type { EmbeddingProvider } from '../ai/embeddings';
-import { EMBEDDING_DIMENSIONS, toVectorLiteral } from './vector';
+// The env-free provider module: the library seed must run with DATABASE_URL alone.
+import type { EmbeddingProvider } from '../ai/embeddingProviders';
+import { EMBEDDING_DIMENSIONS, libraryVectorType, toVectorLiteral } from './vector';
 
 /** Entries per embed() call; each batch is stored before the next is sent, so a failure keeps the earlier batches. */
 export const LIBRARY_EMBED_BATCH = 128;
+
+/** A Prisma client or an interactive transaction: the embedding queries need no $transaction. */
+export type LibraryDb = Prisma.TransactionClient;
 
 type EmbeddableEntry = { name?: string | null; nameAr?: string | null; definition?: string | null; tags?: string[] | null };
 
@@ -20,12 +23,24 @@ export function libraryEmbeddingText(entry: EmbeddableEntry): string {
     .join('\n');
 }
 
-/** Ids among `ids` whose embedding is NULL (sorted). */
-export async function findLibraryIdsWithoutEmbedding(prisma: PrismaClient, ids: readonly string[]): Promise<string[]> {
-  const rows = await prisma.$queryRaw<{ id: string }[]>`
-    SELECT id FROM "IndicatorLibraryEntry" WHERE embedding IS NULL ORDER BY id`;
-  const wanted = new Set(ids);
-  return rows.map(r => r.id).filter(id => wanted.has(id));
+/**
+ * Ids of the stored entries (sorted) that need a vector from `model`: no embedding yet, or one
+ * made by another model (or recorded without a model). Vectors of different models cannot be
+ * compared, so a model change, or a re-embed that failed half way, heals on the next plain run.
+ * Covers every stored entry, including those kept after leaving the library file.
+ */
+export async function findLibraryIdsToEmbed(db: LibraryDb, model: string): Promise<string[]> {
+  const rows = await db.$queryRaw<{ id: string }[]>`
+    SELECT id FROM "IndicatorLibraryEntry"
+    WHERE embedding IS NULL OR "embeddingModel" IS DISTINCT FROM ${model}
+    ORDER BY id`;
+  return rows.map(r => r.id);
+}
+
+/** Ids of every stored entry (sorted), for a forced re-embed. */
+export async function allLibraryIds(db: LibraryDb): Promise<string[]> {
+  const rows = await db.indicatorLibraryEntry.findMany({ select: { id: true }, orderBy: { id: 'asc' } });
+  return rows.map(r => r.id);
 }
 
 export interface EmbedLibraryResult {
@@ -36,13 +51,16 @@ export interface EmbedLibraryResult {
 }
 
 /**
- * Embeds the given library entries (input type "document") and stores the vectors with
- * `::vector`. Raw updates leave updatedAt alone: an embedding is not a content change.
+ * Embeds the given library entries (input type "document") and stores each vector with the
+ * provider's model in `embeddingModel`. The vectors are cast to the column's own type, looked up
+ * once per call (libraryVectorType), so pgvector may live in a schema that is not on the search
+ * path (Supabase's `extensions`). Raw updates leave updatedAt alone: an embedding is not a
+ * content change. Each batch is one UPDATE, so it is stored whole or not at all.
  * Does nothing for a disabled provider. A failure stops the run and is returned, not thrown;
- * entries left without a vector are picked up by the next seed run.
+ * entries left without a current vector are picked up by the next seed run.
  */
 export async function embedLibraryEntries(
-  prisma: PrismaClient,
+  db: LibraryDb,
   provider: EmbeddingProvider,
   ids: readonly string[],
   options: { batchSize?: number } = {},
@@ -51,8 +69,17 @@ export async function embedLibraryEntries(
   if (provider.dimensions !== EMBEDDING_DIMENSIONS) {
     return { embedded: 0, error: `the ${provider.name} provider makes ${provider.dimensions}-dimension vectors; the library column holds ${EMBEDDING_DIMENSIONS}` };
   }
+  const model = provider.model?.trim();
+  if (!model) return { embedded: 0, error: `the ${provider.name} provider names no model; every stored vector records the model that made it` };
 
-  const entries = await prisma.indicatorLibraryEntry.findMany({
+  let vectorType: Prisma.Sql;
+  try {
+    vectorType = await libraryVectorType(db);
+  } catch (err) {
+    return { embedded: 0, error: describeEmbeddingFailure(err) };
+  }
+
+  const entries = await db.indicatorLibraryEntry.findMany({
     where: { id: { in: [...ids] } },
     select: { id: true, name: true, nameAr: true, definition: true, tags: true },
     orderBy: { id: 'asc' },
@@ -66,13 +93,15 @@ export async function embedLibraryEntries(
       const vectors = await provider.embed(batch.map(libraryEmbeddingText), 'document');
       if (!vectors) throw new Error(`the ${provider.name} provider returned no vectors`);
       if (vectors.length !== batch.length) throw new Error(`the ${provider.name} provider returned ${vectors.length} vectors for ${batch.length} entries`);
-      const literals = vectors.map((vector, i) => {
+      const rows = vectors.map((vector, i) => {
         if (vector.length !== EMBEDDING_DIMENSIONS) throw new Error(`vector for ${batch[i].id} has ${vector.length} dimensions (expected ${EMBEDDING_DIMENSIONS})`);
-        return toVectorLiteral(vector);
+        return Prisma.sql`(${batch[i].id}, ${toVectorLiteral(vector)})`;
       });
-      await prisma.$transaction(batch.map((entry, i) =>
-        prisma.$executeRaw`UPDATE "IndicatorLibraryEntry" SET embedding = ${literals[i]}::vector WHERE id = ${entry.id}`));
-      embedded += batch.length;
+      embedded += await db.$executeRaw`
+        UPDATE "IndicatorLibraryEntry" AS e
+        SET embedding = v.vector::${vectorType}, "embeddingModel" = ${model}
+        FROM (VALUES ${Prisma.join(rows)}) AS v(id, vector)
+        WHERE e.id = v.id`;
     } catch (err) {
       return { embedded, error: describeEmbeddingFailure(err) };
     }
@@ -80,9 +109,9 @@ export async function embedLibraryEntries(
   return { embedded, error: null };
 }
 
-/** Clears the stored vectors of these entries (their embedded text changed). For use inside a transaction. */
+/** Clears the stored vectors, and the model that made them, of these entries (their embedded text changed). For use inside a transaction. */
 export function clearLibraryEmbeddings(prisma: PrismaClient, ids: readonly string[]) {
-  return prisma.$executeRaw`UPDATE "IndicatorLibraryEntry" SET embedding = NULL WHERE id IN (${Prisma.join([...ids])})`;
+  return prisma.$executeRaw`UPDATE "IndicatorLibraryEntry" SET embedding = NULL, "embeddingModel" = NULL WHERE id IN (${Prisma.join([...ids])})`;
 }
 
 function describeEmbeddingFailure(err: unknown): string {

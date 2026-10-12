@@ -1,8 +1,8 @@
 import { prisma } from '../../config/prisma';
-import { generateStructured } from './client';
+import { generateStructured, StructuredResult } from './client';
 import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from './errors';
-import { escapeHtml, htmlList, htmlParagraphs } from './html';
-import { progressTowardTarget, valueTrend } from './indicatorFigures';
+import { escapeHtml, figureWarning, htmlList, htmlParagraphs } from './html';
+import { PROGRESS_NO_BASELINE_NOTE, indicatorProgress, unverifiedFigures, valueTrend } from './indicatorFigures';
 import {
   ASSESSMENT_PROMPT_VERSION,
   ASSESSMENT_SCHEMA,
@@ -10,6 +10,7 @@ import {
   AssessmentAnswer,
   AssessmentDocumentInput,
   AssessmentIndicatorInput,
+  AssessmentPromptInput,
   AssessmentQualitativeInput,
   assessmentPrompt,
 } from './prompts/assessment';
@@ -22,15 +23,31 @@ const DOCUMENT_FALLBACK_CHARS = 300;
 const MAX_DOCUMENT_FINDINGS = 8;
 const MAX_LIST_ITEMS = 12;
 
+/** Stored when the AI answer arrived but neither the full result nor the assessment alone could be saved. */
+export const ASSESSMENT_SAVE_FAILED = 'AI generation failed: the assessment could not be saved. Try again.';
+
 type StatusCounts = Record<'on_track' | 'at_risk' | 'off_track' | 'not_started' | 'completed', number>;
+
+/** Redacts free text typed by staff (areas, locations, scope, values); null stays null. */
+function redacted(text: string | null | undefined): string | null {
+  return text === null || text === undefined ? null : redactPersonalData(text).text;
+}
 
 /**
  * AI Assessment Generator
- * Ingests the project's data (indicators, data points, qualitative entries, document analyses),
- * generates an assessment report with the model (main tier) and stores it: the JSON in
- * Assessment.scopeDescription and the HTML in a new Report. Only aggregates and redacted text
- * reach the model. On an AI failure the assessment stays in "analysis" with a message that
- * holds no model output; logs hold ids, counts and error classes only.
+ * Ingests the project's data (indicators of the current framework, data points, qualitative
+ * entries, document analyses), generates an assessment report with the model (main tier) and
+ * stores it: the JSON in Assessment.scopeDescription and the HTML in a new Report, together with
+ * the admins' notifications, in one transaction. Only aggregates and redacted text reach the model;
+ * FGD/KII transcripts uploaded as documents (qualitativeSource) reach it only as qualitative
+ * excerpts. Numbers in the answer that were not sent are listed (unverifiedFigures in the JSON, a
+ * warning line per section in the HTML).
+ *
+ * Failures: any failure before or during the AI call leaves the assessment in "analysis" with a
+ * message that holds no model output or error text. Once the answer has arrived it is never
+ * discarded: if the transaction fails, the assessment alone is saved as delivered (no Report or
+ * notifications). Logs hold ids, counts and error classes only. Rejects only when the assessment
+ * does not belong to the project.
  */
 export async function generateAutoAssessment(
   assessmentId: string,
@@ -42,7 +59,133 @@ export async function generateAutoAssessment(
   const assessment = await prisma.assessment.findFirst({ where: { id: assessmentId, projectId }, select: { id: true } });
   if (!assessment) throw new Error(`Assessment ${assessmentId} not found`);
 
-  // Update status to scoping
+  let prepared: PreparedAssessment;
+  let result: StructuredResult<AssessmentAnswer>;
+  try {
+    prepared = await prepareAssessment(assessmentId, projectId, assessmentType);
+    result = await generateStructured({
+      feature: 'assessment.report',
+      model: 'main',
+      effort: 'medium',
+      system: ASSESSMENT_SYSTEM,
+      messages: [{ role: 'user', content: assessmentPrompt(prepared.input) }],
+      schema: ASSESSMENT_SCHEMA,
+      promptVersion: ASSESSMENT_PROMPT_VERSION,
+      maxTokens: 16000,
+      timeoutMs: 300_000,
+      context: { organizationId: prepared.organizationId, projectId },
+    });
+  } catch (err) {
+    console.error(`[AssessmentGenerator] Assessment ${assessmentId} failed: ${err instanceof Error ? err.name : 'unknown error'}`);
+    await markFailed(assessmentId, assessmentFailureMessage(err));
+    return;
+  }
+
+  // From here on the answer has been paid for: once normalised it is stored whatever else fails.
+  const { input, organizationId, statusCounts } = prepared;
+  let report: AssessmentAnswer;
+  let figureChecks: Partial<Record<AssessmentSection, string[]>>;
+  let unverified: string[];
+  let scopeDescription: string;
+  try {
+    report = normalizeAssessment(result.data);
+    // Every figure sent: the whole prompt input (project facts, indicators, counts, excerpts, document summaries).
+    figureChecks = checkAssessmentFigures(report, [JSON.stringify(input)]);
+    unverified = [...new Set(Object.values(figureChecks).flat())];
+    scopeDescription = JSON.stringify({ ...report, unverifiedFigures: unverified, model: result.model, promptVersion: result.promptVersion });
+  } catch (err) {
+    // The raw answer is never stored: it is not redacted.
+    console.error(`[AssessmentGenerator] Assessment ${assessmentId}: the answer could not be processed (${err instanceof Error ? err.name : 'unknown error'})`);
+    await markFailed(assessmentId, assessmentFailureMessage(err));
+    return;
+  }
+  const deliveredAt = new Date();
+  const summary = `${input.indicators.length} indicators, ${input.qualitative.length} qualitative entries, ${input.documents.length} documents, ${unverified.length} unverified figures; ${result.model}, ${result.usage.inputTokens} input / ${result.usage.outputTokens} output tokens`;
+
+  try {
+    // Generate HTML report (every value escaped)
+    const html = generateAssessmentHtml({
+      project: { name: input.project.name, sector: input.project.sector, donor: input.project.donor },
+      assessmentType,
+      report,
+      unverifiedFigures: figureChecks,
+      statusCounts,
+      totalIndicators: input.indicators.length,
+      model: result.model,
+      promptVersion: result.promptVersion,
+    });
+
+    await prisma.$transaction(async tx => {
+      await tx.assessment.update({
+        where: { id: assessmentId },
+        data: {
+          status: 'delivered',
+          deliveredAt,
+          reportUrl: null, // HTML stored in the Report below; the JSON in scopeDescription
+          scopeDescription,
+        },
+      });
+
+      // Also create a Report record with the HTML
+      await tx.report.create({
+        data: {
+          projectId,
+          type: assessmentType === 'baseline' ? 'assessment_report' : assessmentType === 'midterm' ? 'quarterly_summary' : 'assessment_report',
+          title: `AI ${capitalise(assessmentType)} Assessment — ${input.project.name}`,
+          aiNarrative: html,
+          status: 'draft',
+        },
+      });
+
+      // Notify the organisation's admins
+      const admins = await tx.user.findMany({
+        where: { organizationId, role: { in: ['org_admin', 'platform_admin'] } },
+        select: { id: true },
+      });
+      await tx.notification.createMany({
+        data: admins.map(admin => ({
+          userId: admin.id,
+          type: 'assessment_ready' as const,
+          title: `Assessment Complete: ${input.project.name}`,
+          message: `AI ${assessmentType} assessment has been generated with ${input.indicators.length} indicators analyzed.`,
+          link: `/projects/${projectId}/assessments`,
+        })),
+      });
+    });
+    console.log(`[AssessmentGenerator] Assessment ${assessmentId} complete (${summary})`);
+  } catch (err) {
+    // The report or notifications could not be written: keep the answer on the assessment alone.
+    console.error(`[AssessmentGenerator] Assessment ${assessmentId}: saving the report failed (${err instanceof Error ? err.name : 'unknown error'}); saving the assessment alone`);
+    try {
+      await prisma.assessment.update({
+        where: { id: assessmentId },
+        data: { status: 'delivered', deliveredAt, reportUrl: null, scopeDescription },
+      });
+      console.log(`[AssessmentGenerator] Assessment ${assessmentId} delivered without a report (${summary})`);
+    } catch (saveErr) {
+      console.error(`[AssessmentGenerator] Assessment ${assessmentId}: saving the assessment failed (${saveErr instanceof Error ? saveErr.name : 'unknown error'})`);
+      await markFailed(assessmentId, ASSESSMENT_SAVE_FAILED);
+    }
+  }
+}
+
+/** Sets the failed state (status "analysis" and a fixed message); a failure here is logged by class only. */
+async function markFailed(assessmentId: string, message: string): Promise<void> {
+  try {
+    await prisma.assessment.update({ where: { id: assessmentId }, data: { status: 'analysis', scopeDescription: message } });
+  } catch (err) {
+    console.error(`[AssessmentGenerator] Assessment ${assessmentId}: the failure could not be recorded (${err instanceof Error ? err.name : 'unknown error'})`);
+  }
+}
+
+interface PreparedAssessment {
+  organizationId: string;
+  input: AssessmentPromptInput;
+  statusCounts: StatusCounts;
+}
+
+/** Moves the assessment through scoping and analysis and gathers the prompt input (aggregates and redacted text only). */
+async function prepareAssessment(assessmentId: string, projectId: string, assessmentType: string): Promise<PreparedAssessment> {
   await prisma.assessment.update({
     where: { id: assessmentId },
     data: { status: 'scoping' },
@@ -54,8 +197,9 @@ export async function generateAutoAssessment(
   });
   if (!project) throw new Error('Project not found');
 
+  // The current framework: the newest version whose generation did not fail.
   const framework = await prisma.framework.findFirst({
-    where: { projectId },
+    where: { projectId, generationError: null },
     orderBy: { version: 'desc' },
     include: {
       indicators: {
@@ -73,8 +217,9 @@ export async function generateAutoAssessment(
     take: 20,
   });
 
+  // Transcripts uploaded through the qualitative upload reach the model only as qualitative excerpts.
   const documents = await prisma.document.findMany({
-    where: { projectId, parsingStatus: 'completed' },
+    where: { projectId, parsingStatus: 'completed', qualitativeSource: false },
     orderBy: { uploadedAt: 'desc' },
     take: 20,
     select: { fileName: true, fileType: true, parsedText: true, aiAnalysis: true },
@@ -86,137 +231,70 @@ export async function generateAutoAssessment(
     data: { status: 'analysis' },
   });
 
-  // 2. Build the context (aggregates and redacted text only)
+  // 2. Build the context (aggregates and redacted text only; values, areas and locations are free text)
   const indicators = framework?.indicators || [];
-  const indicatorSummary: AssessmentIndicatorInput[] = indicators.map(ind => ({
-    text: ind.indicatorText,
-    level: ind.level,
-    status: ind.status,
-    unit: ind.unit,
-    baseline: ind.baselineValue,
-    target: ind.targetValue,
-    current: ind.currentValue,
-    progressPercent: progressTowardTarget(ind.baselineValue, ind.targetValue, ind.currentValue),
-    trend: valueTrend(ind.dataPoints.map(dp => dp.value), ind.direction),
-    recentDataPoints: ind.dataPoints.slice(0, 5).map(dp => ({
-      value: dp.value,
-      date: isoDate(dp.collectionDate),
-      method: dp.collectionMethod,
-      area: dp.geographicArea,
-    })),
-  }));
+  const indicatorSummary: AssessmentIndicatorInput[] = indicators.map(ind => {
+    const progress = indicatorProgress(ind);
+    return {
+      text: ind.indicatorText,
+      level: ind.level,
+      status: ind.status,
+      unit: ind.unit,
+      baseline: ind.baselineValue,
+      target: ind.targetValue,
+      current: ind.currentValue,
+      progressPercent: progress?.percent ?? null,
+      ...(progress?.noBaseline ? { progressNote: PROGRESS_NO_BASELINE_NOTE } : {}),
+      trend: valueTrend(ind.dataPoints.map(dp => ({ value: dp.value, date: dp.collectionDate, area: dp.geographicArea })), ind.direction, ind.targetValue),
+      recentDataPoints: ind.dataPoints.slice(0, 5).map(dp => ({
+        value: redactPersonalData(dp.value).text,
+        date: isoDate(dp.collectionDate),
+        method: dp.collectionMethod,
+        area: redacted(dp.geographicArea),
+      })),
+    };
+  });
 
   const qualSummary: AssessmentQualitativeInput[] = qualitativeEntries.map(e => ({
     type: e.entryType,
     title: redactPersonalData(e.title).text,
     themes: stringList(e.themes).map(theme => redactPersonalData(theme).text),
     sentiment: e.sentiment,
-    // Redact first, then cut, so a number is never cut in half and left behind.
-    excerpt: redactPersonalData(e.content ?? '').text.slice(0, QUALITATIVE_EXCERPT_CHARS),
+    // Redact first, then cut (at a word boundary), so no number is cut in half: neither a phone
+    // number left behind nor a figure the model would quote wrongly.
+    excerpt: cutAtWord(redactPersonalData(e.content ?? '').text, QUALITATIVE_EXCERPT_CHARS),
     participants: e.participants,
-    location: e.location,
+    location: redacted(e.location),
   }));
-
-  const docSummary = documents.map(documentSummaryFor);
 
   const statusCounts = countStatuses(indicators);
   const achievementRate = indicators.length > 0
     ? Math.round(((statusCounts.on_track + statusCounts.completed) / indicators.length) * 100)
     : null;
 
-  const prompt = assessmentPrompt({
-    assessmentType,
-    project: {
-      name: project.name,
-      sector: project.sector,
-      donor: project.donor,
-      donorType: project.donorType,
-      startDate: isoDate(project.startDate),
-      endDate: isoDate(project.endDate),
-      targetBeneficiaries: project.targetBeneficiaries,
-      geographicScope: project.geographicScope,
-      budgetUsd: project.budgetUsd === null ? null : project.budgetUsd.toString(),
-    },
-    indicators: indicatorSummary,
+  return {
+    organizationId: project.organizationId,
     statusCounts,
-    achievementRate,
-    qualitative: qualSummary,
-    documents: docSummary,
-  });
-
-  // 3. Generate the assessment with AI
-  try {
-    const result = await generateStructured({
-      feature: 'assessment.report',
-      model: 'main',
-      effort: 'medium',
-      system: ASSESSMENT_SYSTEM,
-      messages: [{ role: 'user', content: prompt }],
-      schema: ASSESSMENT_SCHEMA,
-      promptVersion: ASSESSMENT_PROMPT_VERSION,
-      maxTokens: 16000,
-      timeoutMs: 300_000,
-      context: { organizationId: project.organizationId, projectId: project.id },
-    });
-    const report = normalizeAssessment(result.data);
-
-    // Generate HTML report (every value escaped)
-    const html = generateAssessmentHtml({
-      project: { name: project.name, sector: project.sector, donor: project.donor },
+    input: {
       assessmentType,
-      report,
+      project: {
+        name: project.name,
+        sector: project.sector,
+        donor: project.donor,
+        donorType: project.donorType,
+        startDate: isoDate(project.startDate),
+        endDate: isoDate(project.endDate),
+        targetBeneficiaries: project.targetBeneficiaries,
+        geographicScope: redacted(project.geographicScope),
+        budgetUsd: project.budgetUsd === null ? null : project.budgetUsd.toString(),
+      },
+      indicators: indicatorSummary,
       statusCounts,
-      totalIndicators: indicators.length,
-      model: result.model,
-      promptVersion: result.promptVersion,
-    });
-
-    await prisma.assessment.update({
-      where: { id: assessmentId },
-      data: {
-        status: 'delivered',
-        deliveredAt: new Date(),
-        reportUrl: null, // HTML stored in the Report below; the JSON in scopeDescription
-        scopeDescription: JSON.stringify({ ...report, model: result.model, promptVersion: result.promptVersion }),
-      },
-    });
-
-    // Also create a Report record with the HTML
-    await prisma.report.create({
-      data: {
-        projectId,
-        type: assessmentType === 'baseline' ? 'assessment_report' : assessmentType === 'midterm' ? 'quarterly_summary' : 'assessment_report',
-        title: `AI ${capitalise(assessmentType)} Assessment — ${project.name}`,
-        aiNarrative: html,
-        status: 'draft',
-      },
-    });
-
-    // Notify the organisation's admins
-    const admins = await prisma.user.findMany({
-      where: { organizationId: project.organizationId, role: { in: ['org_admin', 'platform_admin'] } },
-      select: { id: true },
-    });
-    for (const admin of admins) {
-      await prisma.notification.create({
-        data: {
-          userId: admin.id,
-          type: 'assessment_ready',
-          title: `Assessment Complete: ${project.name}`,
-          message: `AI ${assessmentType} assessment has been generated with ${indicators.length} indicators analyzed.`,
-          link: `/projects/${projectId}/assessments`,
-        },
-      });
-    }
-
-    console.log(`[AssessmentGenerator] Assessment ${assessmentId} complete (${indicators.length} indicators, ${qualSummary.length} qualitative entries, ${docSummary.length} documents; ${result.model}, ${result.usage.inputTokens} input / ${result.usage.outputTokens} output tokens)`);
-  } catch (err) {
-    console.error(`[AssessmentGenerator] Assessment ${assessmentId} failed: ${err instanceof Error ? err.name : 'unknown error'}`);
-    await prisma.assessment.update({
-      where: { id: assessmentId },
-      data: { status: 'analysis', scopeDescription: assessmentFailureMessage(err) },
-    });
-  }
+      achievementRate,
+      qualitative: qualSummary,
+      documents: documents.map(documentSummaryFor),
+    },
+  };
 }
 
 /** The message stored on a failed assessment: the kind of failure only, never model output or error text. */
@@ -226,6 +304,17 @@ export function assessmentFailureMessage(err: unknown): string {
   if (err instanceof AiInvalidOutputError) return 'AI generation failed: the AI answer did not match the expected format. Try again.';
   if (err instanceof AiRequestError) return 'AI generation failed: the AI service could not be reached. Try again later.';
   return 'AI generation failed: an unexpected error occurred. Try again.';
+}
+
+/**
+ * At most `max` characters of the text, ending at a word boundary so that no number or word is cut
+ * in half ("1,250" never becomes "1,2"); a text without a space in that range is cut at `max`.
+ */
+export function cutAtWord(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  if (/\s/.test(text[max])) return cut.trimEnd();
+  return cut.replace(/\S+$/, '').trimEnd() || cut;
 }
 
 function isoDate(date: Date): string {
@@ -269,11 +358,13 @@ function readAnalysis(value: unknown): { summary: string; keyFindings: string[] 
 export function documentSummaryFor(doc: { fileName: string; fileType: string; parsedText: string | null; aiAnalysis: unknown }): AssessmentDocumentInput {
   const parsedText = doc.parsedText ?? '';
   let analysis = readAnalysis(doc.aiAnalysis);
-  const markerAt = parsedText.indexOf(LEGACY_ANALYSIS_MARKER);
+  // The LAST marker, like the Phase 3 migration and stripAiAnalysis: a marker quoted in the
+  // document's own text stays part of the text.
+  const markerAt = parsedText.lastIndexOf(LEGACY_ANALYSIS_MARKER);
   if (!analysis && markerAt >= 0) {
     // Stored legacy data (not a fresh model answer); malformed JSON falls through to the text.
     try {
-      const legacy = parsedText.slice(parsedText.lastIndexOf(LEGACY_ANALYSIS_MARKER) + LEGACY_ANALYSIS_MARKER.length).trim();
+      const legacy = parsedText.slice(markerAt + LEGACY_ANALYSIS_MARKER.length).trim();
       analysis = readAnalysis(JSON.parse(legacy));
     } catch {
       analysis = null;
@@ -285,7 +376,7 @@ export function documentSummaryFor(doc: { fileName: string; fileType: string; pa
   return {
     name: redactPersonalData(doc.fileName).text,
     type: doc.fileType,
-    summary: analysis?.summary.trim() ? clean(analysis.summary) : clean(documentText).slice(0, DOCUMENT_FALLBACK_CHARS),
+    summary: analysis?.summary.trim() ? clean(analysis.summary) : cutAtWord(clean(documentText), DOCUMENT_FALLBACK_CHARS),
     keyFindings: (analysis?.keyFindings ?? []).map(clean).filter(Boolean).slice(0, MAX_DOCUMENT_FINDINGS),
   };
 }
@@ -325,6 +416,37 @@ export function normalizeAssessment(answer: AssessmentAnswer): AssessmentAnswer 
   };
 }
 
+export type AssessmentSection = keyof AssessmentAnswer;
+
+/** The texts of each section of an answer, as checked by checkAssessmentFigures. */
+function sectionTexts(report: AssessmentAnswer): Record<AssessmentSection, string[]> {
+  const { indicatorAnalysis: ia, qualitativeInsights: qi, riskAssessment: ra } = report;
+  return {
+    executiveSummary: [report.executiveSummary],
+    methodology: [report.methodology],
+    keyFindings: report.keyFindings.flatMap(f => [f.area, f.finding, f.evidence]),
+    indicatorAnalysis: [ia.overallAchievement, ...ia.strongPerformers, ...ia.challengeAreas, ...ia.dataGaps],
+    qualitativeInsights: [...qi.mainThemes, qi.beneficiaryVoices, qi.contextualFactors],
+    recommendations: report.recommendations.flatMap(r => [r.recommendation, r.responsible]),
+    lessonsLearned: report.lessonsLearned,
+    riskAssessment: [...ra.currentRisks, ...ra.mitigationStrategies],
+    nextSteps: report.nextSteps,
+  };
+}
+
+/**
+ * The numbers of each section of the answer that are not among the figures sent to the model
+ * (indicatorFigures.unverifiedFigures); sections without any are left out.
+ */
+export function checkAssessmentFigures(report: AssessmentAnswer, allowedFigures: readonly string[]): Partial<Record<AssessmentSection, string[]>> {
+  const checks: Partial<Record<AssessmentSection, string[]>> = {};
+  for (const [section, texts] of Object.entries(sectionTexts(report)) as [AssessmentSection, string[]][]) {
+    const figures = unverifiedFigures(texts.join('\n'), allowedFigures);
+    if (figures.length) checks[section] = figures;
+  }
+  return checks;
+}
+
 const RATING_COLOURS: Readonly<Record<string, string>> = { strong: '#16a34a', moderate: '#d97706', weak: '#dc2626' };
 const PRIORITY_CLASSES = new Set(['high', 'medium', 'low']);
 const TIMELINE_LABELS: Readonly<Record<string, string>> = { immediate: 'Immediate', short_term: 'Short term', medium_term: 'Medium term' };
@@ -333,6 +455,8 @@ export interface AssessmentHtmlInput {
   project: { name: string; sector: string; donor: string };
   assessmentType: string;
   report: AssessmentAnswer;
+  /** Per section, the numbers not found in the data sent (checkAssessmentFigures); each gets a warning line. */
+  unverifiedFigures?: Partial<Record<AssessmentSection, string[]>>;
   statusCounts: StatusCounts;
   totalIndicators: number;
   model: string;
@@ -349,6 +473,8 @@ export function generateAssessmentHtml(input: AssessmentHtmlInput): string {
   const generated = (input.generatedAt ?? new Date()).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
   const titled = (title: string, body: string, tag = 'h3') => (body ? `<${tag}>${escapeHtml(title)}</${tag}>${body}` : '');
   const { indicatorAnalysis: ia, qualitativeInsights: qi, riskAssessment: ra } = report;
+  const checks = input.unverifiedFigures ?? {};
+  const warn = (section: AssessmentSection) => figureWarning(checks[section]);
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -369,6 +495,7 @@ h3{color:#374151;margin-top:20px}
 .rec{padding:10px;margin:8px 0;border-radius:8px;border:1px solid #e5e7eb}
 .rec.high{border-left:4px solid #ef4444} .rec.medium{border-left:4px solid #f59e0b} .rec.low{border-left:4px solid #3b82f6}
 .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;color:white}
+.figure-check{padding:6px 10px;border-left:4px solid #d97706;background:#fffbeb;color:#92400e;font-size:14px}
 .footer{margin-top:40px;text-align:center;color:#6b7280;font-size:12px;border-top:1px solid #e5e7eb;padding-top:20px}
 </style></head><body>
 <div class="header">
@@ -388,8 +515,9 @@ h3{color:#374151;margin-top:20px}
 
 <h2>Executive Summary</h2>
 ${htmlParagraphs(report.executiveSummary)}
+${warn('executiveSummary')}
 
-${titled('Methodology', htmlParagraphs(report.methodology), 'h2')}
+${titled('Methodology', htmlParagraphs(report.methodology) && `${htmlParagraphs(report.methodology)}${warn('methodology')}`, 'h2')}
 
 <h2>Key Findings</h2>
 ${report.keyFindings.map(f => `
@@ -398,17 +526,20 @@ ${report.keyFindings.map(f => `
 <p>${escapeHtml(f.finding)}</p>
 ${f.evidence ? `<p><em>Evidence: ${escapeHtml(f.evidence)}</em></p>` : ''}
 </div>`).join('')}
+${warn('keyFindings')}
 
 <h2>Indicator Analysis</h2>
 ${htmlParagraphs(ia.overallAchievement)}
 ${titled('Strong Performers', htmlList(ia.strongPerformers))}
 ${titled('Challenge Areas', htmlList(ia.challengeAreas))}
 ${titled('Data Gaps', htmlList(ia.dataGaps))}
+${warn('indicatorAnalysis')}
 
 <h2>Qualitative Insights</h2>
 ${titled('Main Themes', htmlList(qi.mainThemes))}
 ${titled('Beneficiary Voices', htmlParagraphs(qi.beneficiaryVoices))}
 ${titled('Contextual Factors', htmlParagraphs(qi.contextualFactors))}
+${warn('qualitativeInsights')}
 
 <h2>Recommendations</h2>
 ${report.recommendations.map(r => `
@@ -417,14 +548,16 @@ ${report.recommendations.map(r => `
 <p>${escapeHtml(r.recommendation)}</p>
 ${r.responsible ? `<p><em>Responsible: ${escapeHtml(r.responsible)}</em></p>` : ''}
 </div>`).join('')}
+${warn('recommendations')}
 
-${titled('Lessons Learned', htmlList(report.lessonsLearned), 'h2')}
+${titled('Lessons Learned', htmlList(report.lessonsLearned) && `${htmlList(report.lessonsLearned)}${warn('lessonsLearned')}`, 'h2')}
 
 ${ra.currentRisks.length || ra.mitigationStrategies.length ? `<h2>Risk Assessment</h2>
 ${htmlList(ra.currentRisks)}
-${titled('Mitigation Strategies', htmlList(ra.mitigationStrategies))}` : ''}
+${titled('Mitigation Strategies', htmlList(ra.mitigationStrategies))}
+${warn('riskAssessment')}` : ''}
 
-${titled('Next Steps', htmlList(report.nextSteps, true), 'h2')}
+${titled('Next Steps', htmlList(report.nextSteps, true) && `${htmlList(report.nextSteps, true)}${warn('nextSteps')}`, 'h2')}
 
 <div class="footer">
 <p>Generated by RAQIB M&amp;E Platform — Momentum Labs</p>

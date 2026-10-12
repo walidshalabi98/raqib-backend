@@ -58,9 +58,9 @@ export async function codeQualitativeEntry(entryId: string, projectId: string): 
   const analysis = result.data;
   const themes = normalizeThemes(analysis.themes);
 
-  // Link to the indicators of the latest framework.
+  // Link to the indicators of the current framework (the newest version whose generation did not fail).
   const framework = await prisma.framework.findFirst({
-    where: { projectId },
+    where: { projectId, generationError: null },
     orderBy: { version: 'desc' },
     include: { indicators: { select: { id: true, indicatorText: true, indicatorTextAr: true } } },
   });

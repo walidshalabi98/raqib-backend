@@ -4,13 +4,16 @@
  * 1. "framework.structure": the coded results chain and the figures quoted in the documents
  *    (skipped without documents; the results chain is then built from the project's metadata).
  * 2. "framework.indicators": one draft reference sheet per indicator.
- * Only aggregates and redacted document text reach the model; logs hold counts and ids only.
+ * Only aggregates and redacted text reach the model; logs hold counts and ids only. FGD and KII
+ * transcripts (Document.qualitativeSource) are never used: qualitative coding covers them.
+ * When a run fails, the version keeps a safe message in Framework.generationError and is never the
+ * project's current framework (the newest version without a generationError).
  */
 
 import { IndicatorLevel, Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { generateStructured } from './client';
-import { AiInvalidOutputError, AiOutputTruncatedError } from './errors';
+import { AiError, AiInvalidOutputError, AiOutputTruncatedError, safeErrorSummary } from './errors';
 import { redactPersonalData } from './redact';
 import {
   FRAMEWORK_INDICATORS_SCHEMA,
@@ -37,6 +40,7 @@ import {
   projectSectors,
   selectLibraryCandidates,
   structureForPrompt,
+  verifyDocumentFigures,
 } from './frameworkNormalize';
 
 /** Token limits and timeouts (thinking counts towards max tokens; the client retries a cut-off answer once with twice the limit). */
@@ -51,24 +55,73 @@ const LIBRARY_ENTRY_SELECT = {
   disaggregation: true, standardReference: true, isStandard: true, notes: true, meansOfVerification: true, calculation: true,
 } satisfies Prisma.IndicatorLibraryEntrySelect;
 
+/** A failure of the generator itself, with a message that is safe to store and show (no prompt, document or model text). */
+export class FrameworkGenerationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FrameworkGenerationError';
+  }
+}
+
+/**
+ * The message stored in Framework.generationError for a failed run: the AiError or
+ * FrameworkGenerationError message (built without prompt, document or answer text), otherwise only
+ * the error's class name, because database and library errors can echo stored values.
+ */
+export function generationFailureMessage(err: unknown): string {
+  const message = err instanceof AiError || err instanceof FrameworkGenerationError
+    ? err.message
+    : `Framework generation failed because of an internal error (${safeErrorSummary(err)}).`;
+  return message.length > 500 ? `${message.slice(0, 499)}…` : message;
+}
+
+/**
+ * Generates the results chain and indicators of an empty framework version. On failure it records
+ * generationError on the version (only while it is still empty, so a retried job never marks a
+ * finished framework as failed) and rethrows, so every caller (route, worker, ai:smoke) gets it.
+ */
 export async function generateFramework(frameworkId: string, projectId: string): Promise<void> {
+  try {
+    await runGeneration(frameworkId, projectId);
+  } catch (err) {
+    await prisma.framework.updateMany({
+      where: { id: frameworkId, projectId, resultNodes: { none: {} }, indicators: { none: {} } },
+      data: { generationError: generationFailureMessage(err) },
+    }).catch(recordErr => console.error(`[FrameworkGenerator] Could not record the failure of ${frameworkId}: ${safeErrorSummary(recordErr)}`));
+    throw err;
+  }
+}
+
+/** Free text written by staff: redacted like the documents before it reaches a prompt (CLAUDE.md rule 5). */
+function redacted(value: string): string;
+function redacted(value: string | null): string | null;
+function redacted(value: string | null): string | null {
+  return value ? redactPersonalData(value).text : value;
+}
+
+async function runGeneration(frameworkId: string, projectId: string): Promise<void> {
   const project = await prisma.project.findUnique({
     where: { id: projectId },
     include: {
-      documents: { where: { parsingStatus: 'completed' } },
+      // FGD and KII transcripts are coded by the qualitative entry only, never sent here.
+      documents: { where: { parsingStatus: 'completed', qualitativeSource: false } },
     },
   });
 
-  if (!project) throw new Error(`Project ${projectId} not found`);
+  if (!project) throw new FrameworkGenerationError('The project of this framework no longer exists.');
 
   const framework = await prisma.framework.findUnique({
     where: { id: frameworkId },
-    select: { projectId: true, _count: { select: { resultNodes: true, indicators: true } } },
+    select: { projectId: true, generationError: true, _count: { select: { resultNodes: true, indicators: true } } },
   });
-  if (!framework || framework.projectId !== projectId) throw new Error(`Framework ${frameworkId} not found for project ${projectId}`);
+  if (!framework || framework.projectId !== projectId) throw new FrameworkGenerationError('The framework version does not belong to this project.');
   // A retried job must not duplicate the results chain; a new version is generated instead.
   if (framework._count.resultNodes > 0 || framework._count.indicators > 0) {
     throw new Error(`Framework ${frameworkId} already has results or indicators; generate a new framework version instead`);
+  }
+  // A retried run is in progress again: the status route reports "processing", not the earlier failure.
+  if (framework.generationError) {
+    await prisma.framework.update({ where: { id: frameworkId }, data: { generationError: null } });
   }
 
   // Only the documents' own, redacted text is used, for the prompt and as evidence for baselines and targets.
@@ -85,17 +138,20 @@ export async function generateFramework(frameworkId: string, projectId: string):
   const context = { organizationId: project.organizationId, projectId };
 
   const sectors = projectSectors(project);
+  // Organisational free text, but staff sometimes add a contact number: every free-text field that
+  // reaches a prompt (here and through the metadata structure) is redacted like the documents.
+  const description = redacted(project.description);
+  const geographicScope = redacted(project.geographicScope);
   const projectInfo: FrameworkProjectInfo = {
-    name: project.name,
+    name: redacted(project.name),
     sector: project.sector,
     sectors,
     humanitarian: project.humanitarian,
-    donor: project.donor,
+    donor: redacted(project.donor),
     donorType: project.donorType,
-    // Organisational text, but staff sometimes add a contact number: redact it like the documents.
-    description: project.description ? redactPersonalData(project.description).text : undefined,
+    description: description || undefined,
     targetBeneficiaries: project.targetBeneficiaries || undefined,
-    geographicScope: project.geographicScope || undefined,
+    geographicScope: geographicScope || undefined,
     startDate: project.startDate.toISOString().slice(0, 10),
     endDate: project.endDate.toISOString().slice(0, 10),
   };
@@ -130,7 +186,9 @@ export async function generateFramework(frameworkId: string, projectId: string):
     // Step 1b: No documents — build the results chain from project metadata
     console.log(`[FrameworkGenerator] Step 1: No documents available, using project metadata`);
   }
-  if (!structure) structure = buildStructureFromMetadata(project);
+  if (!structure) structure = buildStructureFromMetadata({ ...project, description, geographicScope });
+  // The only document values the indicators may use: figures whose quote is found in a document.
+  const verifiedFigures = verifyDocumentFigures(structure.documentFigures, documents);
 
   // Step 2: Indicator library candidates (project sectors + cross-cutting; accountability entries for humanitarian projects)
   console.log(`[FrameworkGenerator] Step 2: Querying indicator library`);
@@ -175,7 +233,7 @@ export async function generateFramework(frameworkId: string, projectId: string):
   const aiModel = indicatorAnswer.model;
 
   if (extractIndicatorList(parsedIndicators).length === 0) {
-    throw new Error('AI returned empty or invalid indicator set');
+    throw new FrameworkGenerationError('AI returned empty or invalid indicator set');
   }
 
   // Linked library entries (standard reference, sex disaggregation, standard thresholds): the loaded rows,
@@ -220,11 +278,11 @@ export async function generateFramework(frameworkId: string, projectId: string):
       resultNodes: nodes,
       knownLibraryIds,
       libraryEntries,
-      documents,
+      verifiedFigures,
       aiModel,
       promptVersion: FRAMEWORK_PROMPT_VERSION,
     });
-    if (payloads.length === 0) throw new Error('AI returned empty or invalid indicator set');
+    if (payloads.length === 0) throw new FrameworkGenerationError('AI returned empty or invalid indicator set');
 
     console.log(`[FrameworkGenerator] Step 4: Creating ${nodes.length} results and ${payloads.length} indicators`);
     await tx.indicator.createMany({ data: payloads });
@@ -232,7 +290,7 @@ export async function generateFramework(frameworkId: string, projectId: string):
     // Update framework status
     await tx.framework.update({
       where: { id: frameworkId },
-      data: { status: 'expert_review', aiModelUsed: aiModel },
+      data: { status: 'expert_review', aiModelUsed: aiModel, generationError: null },
     });
 
     // Update project status

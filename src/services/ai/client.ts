@@ -16,18 +16,21 @@
  * - retries rate limits, overloads, server errors and network failures with exponential
  *   backoff (own loop; the SDK's retries are off), retries a cut-off answer once with a
  *   higher token limit, and turns refusals into AiRefusalError;
- * - writes exactly one AiCall row (ids, token counts, latency, cost; never prompt or answer
- *   text) and one console line with the same numbers.
+ * - counts and prices every attempt the API reports, including a declined attempt before a
+ *   server-side fallback (usage.iterations), each at its own model's rates;
+ * - writes exactly one AiCall row whatever the outcome, even when the system prompt or the
+ *   answer schema cannot be built (ids, token counts, latency, cost; never prompt or answer
+ *   text), and one console line with the same numbers.
  */
 import Anthropic from '@anthropic-ai/sdk';
 import type * as z from 'zod/v4';
-import type { AiCallStatus } from '@prisma/client';
-import { env } from '../../config/env';
+import { type AiCallStatus, Prisma } from '@prisma/client';
+import { AI_REQUEST_TIMEOUT_MAX_MS, env } from '../../config/env';
 import { prisma } from '../../config/prisma';
 import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from './errors';
 import { estimateCostUsd, roundUsd, supportsEffort, supportsServerFallback } from './models';
 import { outputJsonSchema } from './outputSchema';
-import { loadSharedSystemPrompt } from './prompts/system';
+import { loadSharedSystemPrompt, type SharedSystemPrompt } from './prompts/system';
 
 /** Which configured model to use: main = AI_MODEL_MAIN (default claude-sonnet-5-5), fast = AI_MODEL_FAST (default claude-haiku-5-5). */
 export type ModelTier = 'main' | 'fast';
@@ -71,7 +74,7 @@ export interface GenerateStructuredParams<S extends z.ZodType> {
   promptVersion: string;
   /** Reasoning effort; default "medium". */
   effort?: AiEffort;
-  /** Request timeout in ms; default AI_REQUEST_TIMEOUT_MS (60 000). Long generations (whole frameworks) pass more. */
+  /** Request timeout in ms; default AI_REQUEST_TIMEOUT_MS (60 000), at most one hour. Long generations (whole frameworks) pass more. */
   timeoutMs?: number;
   /** Organisation and project the call is for (ids only). */
   context?: AiCallContext;
@@ -87,12 +90,18 @@ export interface AiUsage {
 export interface StructuredResult<T> {
   /** The validated answer. */
   data: T;
-  /** Model that produced the answer (response.model; may differ from the requested one after a server-side fallback). */
+  /**
+   * Model that produced the answer: after a server-side fallback, `to.model` of the last
+   * fallback block; otherwise response.model.
+   */
   model: string;
   promptVersion: string;
-  /** Token usage summed over every attempt of this call. */
+  /** Token usage summed over every attempt of this call (declined attempts before a server-side fallback included). */
   usage: AiUsage;
-  /** Estimated cost in USD, or null when the model's price is unknown. */
+  /**
+   * Estimated cost in USD of every priced attempt, or null when no attempt's model has a known
+   * price. Attempts on a model without a price are left out (with a warning in the log).
+   */
   estimatedCostUsd: number | null;
   /** Id of the AiCall row, or null when logging failed (logging never fails the call). */
   aiCallId: string | null;
@@ -124,18 +133,32 @@ export interface AiSdkClient {
   beta: { messages: { create: CreateMessage } };
 }
 
+/** Token counts of a response, or of one entry of usage.iterations. */
+interface SdkUsageCounts {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+}
+
+/**
+ * One entry of usage.iterations (beta endpoint): usage per attempt, each with its own model.
+ * After a server-side fallback: a 'message' entry per declined attempt and a
+ * 'fallback_message' entry for the attempt that served the answer.
+ */
+interface SdkIterationUsage extends SdkUsageCounts {
+  type?: string;
+  model?: string | null;
+}
+
 /** The fields of a Messages API response this module reads. */
 interface SdkResponse {
   model?: string;
   stop_reason?: string | null;
   stop_details?: { category?: string | null } | null;
-  content?: Array<{ type: string; text?: string }>;
-  usage?: {
-    input_tokens?: number | null;
-    output_tokens?: number | null;
-    cache_read_input_tokens?: number | null;
-    cache_creation_input_tokens?: number | null;
-  } | null;
+  /** Text blocks hold the answer; a 'fallback' block marks where a fallback model took over (`to.model`). */
+  content?: Array<{ type: string; text?: string; to?: { model?: string | null } | null }>;
+  usage?: (SdkUsageCounts & { iterations?: SdkIterationUsage[] | null }) | null;
 }
 
 /** What is stored in the AiCall table (ids and numbers only). */
@@ -179,10 +202,28 @@ function defaultAnthropic(): AiSdkClient {
   return sdkClient;
 }
 
-/** Default AiCall logger: one row in the AiCall table. */
+/**
+ * Default AiCall logger: one row in the AiCall table. When the project or organisation was
+ * deleted while the call ran (foreign key error P2003), the row is written once more without
+ * it, so the cost of the call is still recorded: without the project only when the error names
+ * the project's foreign key alone (the organisation keeps the cost), otherwise without both.
+ */
 export async function writeAiCall(record: AiCallRecord): Promise<string | null> {
-  const row = await prisma.aiCall.create({ data: record, select: { id: true } });
-  return row.id;
+  try {
+    const row = await prisma.aiCall.create({ data: record, select: { id: true } });
+    return row.id;
+  } catch (err) {
+    const hasOwner = record.organizationId !== null || record.projectId !== null;
+    if (!hasOwner || !(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2003')) throw err;
+    const failedKey = `${String(err.meta?.constraint ?? '')} ${String(err.meta?.field_name ?? '')}`;
+    const projectOnly = record.projectId !== null && /projectId/.test(failedKey) && !/organizationId/.test(failedKey);
+    const data = projectOnly ? { ...record, projectId: null } : { ...record, organizationId: null, projectId: null };
+    console.warn(
+      `[ai] ${record.feature}: the ${projectOnly ? 'project' : 'organisation or project'} of this call no longer exists; AiCall row kept without ${projectOnly ? 'it' : 'them'}`,
+    );
+    const row = await prisma.aiCall.create({ data, select: { id: true } });
+    return row.id;
+  }
 }
 
 const defaultDeps: Deps = {
@@ -220,13 +261,24 @@ export function resetAiClientForTests(): void {
 
 /** Mutable bookkeeping for one generateStructured call; becomes the AiCall row. */
 interface CallState {
+  feature: string;
+  /** Model id sent in the request. */
+  model: string;
   attempts: number;
   timeoutRetries: number;
   usage: AiUsage;
-  /** Sum of per-response cost estimates; null once any response's model has no known price. */
-  cost: number | null;
+  /** Sum of the cost estimates of the priced parts (a response, or one attempt of it after a server-side fallback). */
+  cost: number;
+  pricedParts: number;
+  /** Parts left out of `cost` because their model has no known price. */
+  unpricedParts: number;
   servedModel: string | null;
   stopReason: string | null;
+}
+
+/** The call's estimated cost: null only when nothing could be priced (an unknown model served every response). */
+function callCost(state: CallState): number | null {
+  return state.unpricedParts > 0 && state.pricedParts === 0 ? null : roundUsd(state.cost);
 }
 
 /** Thrown inside the retry loop; carries what the AiCall row and the AiRequestError need. */
@@ -248,12 +300,16 @@ class RequestFailure extends Error {
 export async function generateStructured<S extends z.ZodType>(params: GenerateStructuredParams<S>): Promise<StructuredResult<z.infer<S>>> {
   const started = deps.now();
   const model = resolveModel(params.model);
-  const shared = loadSharedSystemPrompt();
+  let shared: SharedSystemPrompt | null = null;
   const state: CallState = {
+    feature: params.feature,
+    model,
     attempts: 0,
     timeoutRetries: 0,
     usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
     cost: 0,
+    pricedParts: 0,
+    unpricedParts: 0,
     servedModel: null,
     stopReason: null,
   };
@@ -264,14 +320,14 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
       model,
       servedModel: state.servedModel,
       promptVersion: params.promptVersion,
-      systemPromptVersion: shared.version,
+      systemPromptVersion: shared?.version ?? null,
       status,
       stopReason: state.stopReason,
       errorType,
       attempts: state.attempts,
       ...state.usage,
       latencyMs: Math.max(0, Math.round(deps.now() - started)),
-      estimatedCostUsd: state.cost === null ? null : roundUsd(state.cost),
+      estimatedCostUsd: callCost(state),
       organizationId: params.context?.organizationId ?? null,
       projectId: params.context?.projectId ?? null,
     };
@@ -284,14 +340,24 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
     }
   };
 
-  const outputSchema = outputJsonSchema(params.schema);
+  // Built before any request, inside a try: a broken knowledge file or a schema the converter
+  // cannot express still writes the AiCall row and throws a typed error (nothing is sent).
+  let prepared: { systemText: string; outputSchema: Record<string, unknown> };
+  try {
+    shared = loadSharedSystemPrompt();
+    prepared = { systemText: shared.text, outputSchema: outputJsonSchema(params.schema) };
+  } catch (err) {
+    await finish('error', errorName(err));
+    throw new AiRequestError(params.feature, null, false, 0);
+  }
+  const { systemText, outputSchema } = prepared;
   const effort = params.effort ?? 'medium';
   const useFallback = env.aiRefusalFallback === 'default' && supportsServerFallback(model);
   const buildBody = (maxTokens: number) => ({
     model,
     max_tokens: maxTokens,
     system: [
-      { type: 'text', text: shared.text, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: systemText, cache_control: { type: 'ephemeral' } },
       ...(params.system ? [{ type: 'text', text: params.system }] : []),
     ],
     messages: params.messages.map(m => ({ role: m.role, content: m.content })),
@@ -303,14 +369,14 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
   });
 
   let maxTokens = params.maxTokens;
-  let timeoutMs = params.timeoutMs ?? env.aiRequestTimeoutMs;
+  let timeoutMs = Math.min(params.timeoutMs ?? env.aiRequestTimeoutMs, AI_REQUEST_TIMEOUT_MAX_MS);
   let response: SdkResponse;
   try {
     response = await send(buildBody(maxTokens), timeoutMs, useFallback, state);
     const retryLimit = Math.min(2 * params.maxTokens, MAX_TOKENS_CEILING);
     if (response.stop_reason === 'max_tokens' && retryLimit > maxTokens) {
       maxTokens = retryLimit;
-      timeoutMs *= 2;
+      timeoutMs = Math.min(timeoutMs * 2, AI_REQUEST_TIMEOUT_MAX_MS);
       response = await send(buildBody(maxTokens), timeoutMs, useFallback, state);
     }
   } catch (err) {
@@ -325,8 +391,10 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
     await finish('refusal', error.name);
     throw error;
   }
-  if (response.stop_reason === 'max_tokens') {
-    const error = new AiOutputTruncatedError(params.feature, maxTokens);
+  // Cut off: after the max_tokens retry, or because the context window is full (no retry:
+  // more output tokens cannot help). Both are stored with status max_tokens and their stop reason.
+  if (response.stop_reason === 'max_tokens' || response.stop_reason === 'model_context_window_exceeded') {
+    const error = new AiOutputTruncatedError(params.feature, maxTokens, response.stop_reason);
     await finish('max_tokens', error.name);
     throw error;
   }
@@ -357,7 +425,7 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
     model: state.servedModel ?? model,
     promptVersion: params.promptVersion,
     usage: { ...state.usage },
-    estimatedCostUsd: state.cost === null ? null : roundUsd(state.cost),
+    estimatedCostUsd: callCost(state),
     aiCallId,
   };
 }
@@ -387,21 +455,71 @@ async function send(body: Record<string, unknown>, timeoutMs: number, beta: bool
   }
 }
 
+/** Adds one response's usage, cost, served model and stop reason to `state`. */
 function recordResponse(response: SdkResponse, state: CallState): void {
-  const usage: AiUsage = {
-    inputTokens: response.usage?.input_tokens ?? 0,
-    outputTokens: response.usage?.output_tokens ?? 0,
-    cacheReadTokens: response.usage?.cache_read_input_tokens ?? 0,
-    cacheWriteTokens: response.usage?.cache_creation_input_tokens ?? 0,
-  };
-  state.usage.inputTokens += usage.inputTokens;
-  state.usage.outputTokens += usage.outputTokens;
-  state.usage.cacheReadTokens += usage.cacheReadTokens;
-  state.usage.cacheWriteTokens += usage.cacheWriteTokens;
-  state.servedModel = response.model ?? state.servedModel;
+  // The content of a refused response is not read (see generateStructured).
+  const servedModel = (response.stop_reason === 'refusal' ? null : fallbackTarget(response)) ?? response.model ?? null;
+  state.servedModel = servedModel ?? state.servedModel;
   state.stopReason = response.stop_reason ?? null;
-  const cost = estimateCostUsd(response.model, usage);
-  state.cost = state.cost === null || cost === null ? null : state.cost + cost;
+  for (const part of billedParts(response, servedModel, state.model)) {
+    state.usage.inputTokens += part.usage.inputTokens;
+    state.usage.outputTokens += part.usage.outputTokens;
+    state.usage.cacheReadTokens += part.usage.cacheReadTokens;
+    state.usage.cacheWriteTokens += part.usage.cacheWriteTokens;
+    const cost = estimateCostUsd(part.model, part.usage);
+    if (cost === null) {
+      state.unpricedParts += 1;
+      console.warn(`[ai] ${state.feature}: no price for model ${part.model ?? '(none)'}; its tokens are left out of the cost estimate`);
+    } else {
+      state.pricedParts += 1;
+      state.cost += cost;
+    }
+  }
+}
+
+/**
+ * The model that took over after a server-side fallback: `to.model` (always the canonical id)
+ * of the last 'fallback' content block, or null when the response has none.
+ */
+function fallbackTarget(response: SdkResponse): string | null {
+  const content = Array.isArray(response.content) ? response.content : [];
+  for (let i = content.length - 1; i >= 0; i -= 1) {
+    const to = content[i]?.type === 'fallback' ? content[i].to?.model : null;
+    if (typeof to === 'string' && to !== '') return to;
+  }
+  return null;
+}
+
+/**
+ * What one response is billed for, as (model, tokens) parts. After a server-side fallback,
+ * usage.iterations is the per-attempt record (the top-level usage covers only the attempt
+ * that produced the returned message): every 'message' entry (a declined attempt; a missing
+ * model means the requested one) and the 'fallback_message' entry (the serving attempt), each
+ * priced at its own model's rates. The same holds for a refusal after which every fallback
+ * declined too (several 'message' entries; this client uses no server tools, so each one is
+ * an attempt). Otherwise the top-level usage at the served model's rates, so compaction or
+ * advisor entries (never requested here) are not counted twice.
+ */
+function billedParts(response: SdkResponse, servedModel: string | null, requestedModel: string): Array<{ model: string | null; usage: AiUsage }> {
+  const iterations = Array.isArray(response.usage?.iterations) ? response.usage.iterations : [];
+  const attempts = iterations.filter(entry => entry?.type === 'message' || entry?.type === 'fallback_message');
+  const fellBack = attempts.some(entry => entry.type === 'fallback_message') || (response.stop_reason === 'refusal' && attempts.length > 1);
+  if (fellBack) {
+    return attempts.map(entry => ({
+      model: entry.model || (entry.type === 'fallback_message' ? servedModel : requestedModel),
+      usage: tokenUsage(entry),
+    }));
+  }
+  return [{ model: servedModel, usage: tokenUsage(response.usage) }];
+}
+
+function tokenUsage(counts: SdkUsageCounts | null | undefined): AiUsage {
+  return {
+    inputTokens: counts?.input_tokens ?? 0,
+    outputTokens: counts?.output_tokens ?? 0,
+    cacheReadTokens: counts?.cache_read_input_tokens ?? 0,
+    cacheWriteTokens: counts?.cache_creation_input_tokens ?? 0,
+  };
 }
 
 /** Retry policy by SDK error class and HTTP status (never by message text). */

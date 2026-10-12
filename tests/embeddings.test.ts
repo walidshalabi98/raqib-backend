@@ -10,6 +10,7 @@ import {
   VOYAGE_EMBEDDINGS_URL,
   VOYAGE_MAX_BATCH,
   VoyageEmbeddingProvider,
+  createEmbeddingProvider,
   embeddingRetryDelayMs,
   getEmbeddingProvider,
   parseEmbeddingResponse,
@@ -17,6 +18,7 @@ import {
   type VoyageProviderOptions,
 } from '../src/services/ai/embeddings';
 import { AiError } from '../src/services/ai/errors';
+import * as embeddingProviders from '../src/services/ai/embeddingProviders';
 import * as vectorHelpers from '../src/services/library/vector';
 
 // Never the network: every test stubs global fetch. The texts below stand in for content
@@ -441,6 +443,42 @@ describe('getEmbeddingProvider', () => {
 
   it('reads the environment by default (no VOYAGE_API_KEY in tests)', () => {
     expect(getEmbeddingProvider()).toBeInstanceOf(NoopEmbeddingProvider);
+  });
+
+  it('is createEmbeddingProvider with the app env; the providers are the env-free module\'s', () => {
+    expect(createEmbeddingProvider({ voyageApiKey: API_KEY, voyageModel: ' voyage-4-lite ' })).toMatchObject({ name: 'voyage', model: 'voyage-4-lite' });
+    expect(createEmbeddingProvider({ voyageApiKey: API_KEY })).toMatchObject({ model: 'voyage-4' });
+    expect(createEmbeddingProvider({})).toBeInstanceOf(NoopEmbeddingProvider);
+    expect(createEmbeddingProvider).toBe(embeddingProviders.createEmbeddingProvider);
+    expect(VoyageEmbeddingProvider).toBe(embeddingProviders.VoyageEmbeddingProvider);
+    expect(NoopEmbeddingProvider).toBe(embeddingProviders.NoopEmbeddingProvider);
+    expect(EmbeddingError).toBe(embeddingProviders.EmbeddingError);
+  });
+});
+
+describe('embedding providers without the API configuration (npm run seed:library)', () => {
+  afterEach(() => {
+    vi.doUnmock('../src/config/env');
+    vi.resetModules();
+  });
+
+  it('load, with the library seed, without src/config/env.ts', async () => {
+    vi.resetModules();
+    // Loading the API configuration needs JWT secrets and ANTHROPIC_API_KEY; the library seed must not.
+    vi.doMock('../src/config/env', () => {
+      throw new Error('src/config/env.ts was loaded');
+    });
+
+    const providers = await import('../src/services/ai/embeddingProviders');
+    const seedCli = await import('../src/services/library/seedCli');
+    await import('../src/services/library/seed');
+    await import('../src/services/library/embed');
+    expect(providers.createEmbeddingProvider({})).toBeInstanceOf(providers.NoopEmbeddingProvider);
+    expect(seedCli.runLibrarySeed).toEqual(expect.any(Function));
+    // The check bites: the app's module does load the configuration.
+    const failure = await import('../src/services/ai/embeddings').then(() => null, (err: Error) => err);
+    expect(failure).toBeInstanceOf(Error);
+    expect(`${failure?.message} ${String((failure as { cause?: unknown } | null)?.cause ?? '')}`).toMatch(/mocking a module|src\/config\/env\.ts was loaded/);
   });
 });
 

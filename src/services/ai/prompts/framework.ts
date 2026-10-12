@@ -10,7 +10,7 @@
 import * as z from 'zod/v4';
 import type { CollectionMethod, Frequency, IndicatorDirection } from '@prisma/client';
 import type { LibraryCandidate } from '../frameworkNormalize';
-import { donorGuidance, donorLabel } from './donors';
+import { ECHO_INDICATOR_CAP, donorGuidance, donorLabel } from './donors';
 
 /** Version of the framework generator prompts, stored on every generated indicator (Indicator.promptVersion). */
 export const FRAMEWORK_PROMPT_VERSION = 'framework-v4';
@@ -20,10 +20,15 @@ export const STRUCTURE_DOCUMENT_MAX_CHARS = 8000;
 
 // ------------------------------------------------------------------ closed sets
 
-/** Units the indicator step may use (the seed library uses only these). */
+/**
+ * Units the indicator step may use: the shared unit list (raqib-frontend UNIT_SUGGESTIONS lists the
+ * same values; change both together). It covers every unit of the seed library and
+ * me-foundations.md §2 rule 3 (number, percentage, score, ratio, index, currency, yes/no). Only
+ * 'number' is a count unit, whose breakdowns must add up to the value (services/dataPoints/breakdown.ts).
+ */
 export const INDICATOR_UNITS = [
-  'number', 'percent', 'score', 'litres_per_person_per_day', 'hectares', 'dunums', 'megawatts', 'tonnes_co2eq',
-  'currency_ils', 'kg_per_dunum', 'yes_no',
+  'number', 'percent', 'score', 'ratio', 'index', 'litres_per_person_per_day', 'hectares', 'dunums', 'megawatts', 'tonnes_co2eq',
+  'currency_ils', 'currency_usd', 'currency_eur', 'currency_jod', 'kg_per_dunum', 'days', 'hours', 'minutes', 'km', 'yes_no',
 ] as const;
 
 /** Indicator levels: activities are tracked as tasks and milestones, never as indicators. */
@@ -75,7 +80,7 @@ export const PROJECT_STRUCTURE_SCHEMA = z.object({
     kind: z.enum(['baseline', 'target']),
     value: z.string().describe('The value exactly as written in the document.'),
     description: z.string(),
-    quote: z.string(),
+    quote: z.string().describe('The sentence of the document that contains the value, copied word for word.'),
   })),
 });
 
@@ -96,18 +101,24 @@ export const FRAMEWORK_INDICATORS_SCHEMA = z.object({
       numerator: z.string(),
       denominator: z.string(),
       formula: z.string(),
+      rounding: z.string().describe('How the result is rounded, e.g. "1 decimal place".'),
     }).describe('"" for the parts that do not apply (counts usually need none).'),
     direction: z.enum(FRAMEWORK_DIRECTIONS),
     disaggregation: z.array(z.string()),
     dataCollectionMethod: z.enum(FRAMEWORK_METHODS),
     frequency: z.enum(FRAMEWORK_FREQUENCIES),
     meansOfVerification: z.string(),
-    baselineValue: z.string().describe('Only a value written in the project documents, copied exactly; otherwise "".'),
+    baselineValue: z.string().describe('Only a documentFigures value of kind "baseline", copied exactly; otherwise "".'),
     baselineBasis: z.enum(BASELINE_BASES),
+    baselineDate: z.string().describe('YYYY-MM-DD: when the document baseline was measured, otherwise the planned baseline date; "" when unknown.'),
     baselineMethod: z.string(),
-    targetValue: z.string().describe('Only a document value or a standard threshold of the linked library entry; otherwise "".'),
+    targetValue: z.string().describe('Only a documentFigures value of kind "target" or a standard threshold of the linked library entry; otherwise "".'),
     targetBasis: z.enum(TARGET_BASES),
     targetJustification: z.string(),
+    intermediateTargets: z.array(z.object({
+      date: z.string().describe('YYYY-MM-DD'),
+      value: z.string().describe('A documentFigures value of kind "target", copied exactly.'),
+    })).describe('Intermediate targets the documents set for a date before the end; [] when they set none.'),
     assumptions: z.string(),
     responsibility: z.string(),
     phases: z.array(z.string()),
@@ -137,6 +148,7 @@ export const FRAMEWORK_STRUCTURE_SYSTEM = `You extract the results chain of a de
 export const FRAMEWORK_INDICATORS_SYSTEM = `You write the indicators of a project's M&E framework for Raqib. Each indicator becomes a draft indicator reference sheet that the organisation's M&E officer reviews before approval. Answer in the requested format only.
 
 - "" means unknown or not applicable: the officer sees it as "to be confirmed". Leave a field "" rather than guess, and never fill a field with an invented number.
+- indicatorTextAr is always required: translate every indicator into Modern Standard Arabic, never "".
 - Keep language neutral and professional; avoid political characterisations.
 - Never output names of people, phone numbers, ID numbers, email addresses or street addresses.`;
 
@@ -204,7 +216,7 @@ RULES:
 - Use the documents' own results where they exist; do not add results the documents do not support. Keep each statement to one sentence.
 - Outcomes describe changes among people or institutions; outputs describe products and services the project delivers; activities are actions of the team.
 - Arabic text (textAr) must be Modern Standard Arabic suitable for donor and ministry readers; "" only when you cannot translate a statement.
-- documentFigures: list only baseline and target values that are written in the documents, copied exactly (same digits and symbols). For each: resultCode, the code of the result it belongs to ("" when unclear); kind, baseline or target; value, exactly as written (e.g. 22% or 800); description, what the value measures; quote, the sentence from the document that contains the value. Never estimate or calculate a value. Use [] when the documents contain none.
+- documentFigures: list only baseline and target values that are written in the documents, copied exactly (same digits and symbols). For each: resultCode, the code of the result it belongs to ("" when unclear); kind, baseline or target; value, exactly as written (e.g. 22% or 800); description, what the value measures; quote, the sentence from the document that contains the value, copied word for word (a figure whose quote is not found in the document is dropped). A date, a budget amount, a unit cost or a sample size is not a baseline or target. Never estimate or calculate a value. Use [] when the documents contain none.
 - Do not include names, phone numbers, ID numbers or addresses of individuals.`;
 }
 
@@ -223,6 +235,14 @@ function candidateLine(c: LibraryCandidate): string {
   ].join(' | ');
 }
 
+/** The rule for a framework without document figures: no documents at all, or none whose values could be verified. */
+function noDocumentFiguresRule(projectStructure: Record<string, unknown>, hasDocuments: boolean): string {
+  if (!hasDocuments) return '- No project documents were provided: every baselineBasis must be "none", no targetBasis may be "document" and intermediateTargets must be [].\n';
+  const figures = projectStructure.documentFigures;
+  if (Array.isArray(figures) && figures.length > 0) return '';
+  return '- documentFigures is empty (the documents state no baseline or target value that could be verified): every baselineBasis must be "none", no targetBasis may be "document" and intermediateTargets must be [].\n';
+}
+
 /** The indicator step's user message: project info, the coded structure, library candidates and the rules. */
 export function generateFrameworkPrompt(
   projectStructure: Record<string, unknown>,
@@ -235,7 +255,7 @@ export function generateFrameworkPrompt(
 PROJECT INFO:
 ${projectInfoLines(projectInfo)}
 
-PROJECT STRUCTURE (results chain with codes; documentFigures are baseline and target values quoted from the project documents):
+PROJECT STRUCTURE (results chain with codes; documentFigures are the baseline and target values found in the project documents, the only document values you may use):
 ${JSON.stringify(projectStructure, null, 2)}
 
 INDICATOR LIBRARY CANDIDATES (prefer these; adapt the wording to the project and keep the candidate id as libraryId):
@@ -247,12 +267,13 @@ ${donorGuidance(projectInfo.donorType)}
 REQUIREMENTS:
 - Every indicator measures one result of the structure: set resultCode to that result's code ("G", "O1", "O1.1"…). Level must match the result: impact for the goal, outcome for outcomes, output for outputs.
 - Do not write activity indicators: activities are tracked as tasks and milestones, not as indicators.
-- Counts: 1-2 indicators for the goal, 2-4 per outcome, 2-3 per output${projectInfo.donorType === 'echo' ? ' (never more than 3 per result for DG ECHO)' : ''}.
+- Counts: 1-2 indicators for the goal, 2-4 per outcome, 2-3 per output${projectInfo.donorType === 'echo' ? `; DG ECHO: ${ECHO_INDICATOR_CAP}` : ''}.
 - Standard first: prefer a library candidate or another recognised standard (donor framework, cluster standard) over a custom indicator; set libraryId only to the id of a candidate listed above (otherwise "") and standardReferenceCode to the framework code (e.g. "EU GERF 2.38", "IASC MHPSS O5.4") when aligned, otherwise "".
 - indicatorText: neutral wording that names what is measured — never the target or the desired direction ("% of households with an acceptable Food Consumption Score", not "Increase to 80% the households…"); one dimension only (no "and/or" joining two measurements). Not duplicated within the framework.
-- indicatorTextAr: the same indicator in Modern Standard Arabic.
+- indicatorTextAr: the same indicator in Modern Standard Arabic. Always required: never leave it "".
 - definition: what exactly counts, with key terms defined. It never contains the target or the data source.
-- unit: one of ${INDICATOR_UNITS.join(', ')}. Percentages must have calculation.numerator and calculation.denominator; calculation.formula says how they combine (e.g. "numerator ÷ denominator × 100"). Use "" for calculation parts that do not apply.
+- unit: one of ${INDICATOR_UNITS.join(', ')}. Use "number" only for counts (people, kits, sessions); a ratio such as people per latrine or pupils per teacher is "ratio", a composite or parity index is "index", amounts use the currency of the documents, durations use days, hours or minutes.
+- calculation: percentages must have calculation.numerator and calculation.denominator; calculation.formula says how they combine (e.g. "numerator ÷ denominator × 100") and calculation.rounding how the result is rounded (e.g. "1 decimal place"). Use "" for calculation parts that do not apply.
 - direction: increase, decrease or maintain — the desired change, stated here and not in the indicator text.
 - disaggregation: snake_case keys. Sex is the minimum for every indicator that counts or measures people (use sex_of_household_head for household indicators); age and disability (Washington Group questions) are expected${projectInfo.humanitarian || ['eu', 'echo'].includes(projectInfo.donorType) ? ' and required for this project' : ' in humanitarian and EU-funded work'}; add location and displacement_status where relevant.
 - dataCollectionMethod: outputs are usually counted from records (document_review); outcomes from surveys (hh_survey) with qualitative explanation; impact from secondary data (secondary_data, e.g. PCBS).
@@ -261,10 +282,12 @@ REQUIREMENTS:
 - Account for movement restrictions and access constraints (Gaza, Area C): suggest remote methods where field access is uncertain and state this in assumptions.
 ${projectInfo.humanitarian ? '- Humanitarian project: include at least one accountability to affected people indicator (prefer AC-01 to AC-05) and disaggregate people-level indicators by sex, age and disability.\n' : ''}
 BASELINES AND TARGETS — never invent numbers:
-- baselineValue: only a value written in the project documents (see documentFigures), copied exactly, with baselineBasis "document". Otherwise baselineValue "" and baselineBasis "none". baselineMethod says how and when the baseline is or will be measured ("pending baseline survey, planned for <month year>").
-- targetValue: only (a) a value written in the project documents, copied exactly (targetBasis "document"), or (b) a standard threshold written in the linked library candidate (its standard or definition), such as the Sphere minimum of 15 litres per person per day (targetBasis "standard_threshold", with that candidate's id as libraryId; a threshold that is not written in the linked library entry is removed). Otherwise targetValue "" and targetBasis "method_only" (describe in targetJustification how the target will be set from the baseline, e.g. "baseline + 10 percentage points, consistent with similar programmes; confirm after the baseline survey") or "none".
+- baselineValue: only a value listed in documentFigures with kind "baseline", copied exactly, with baselineBasis "document". Otherwise baselineValue "" and baselineBasis "none". baselineMethod says how and when the baseline is or will be measured ("pending baseline survey, planned for <month year>").
+- baselineDate: for a document baseline, the date it was measured as the documents state it (the first day of the month when they give only a month); otherwise the planned date of the baseline measurement, derived from the project dates; "" when unknown.
+- targetValue: only (a) a value listed in documentFigures with kind "target", copied exactly (targetBasis "document"), or (b) a standard threshold written in the linked library candidate (its standard or definition), such as the Sphere minimum of 15 litres per person per day (targetBasis "standard_threshold", with that candidate's id as libraryId; a threshold that is not written in the linked library entry is removed). Otherwise targetValue "" and targetBasis "method_only" (describe in targetJustification how the target will be set from the baseline, e.g. "baseline + 10 percentage points, consistent with similar programmes; confirm after the baseline survey") or "none".
 - targetJustification: where the target comes from, or the proposed method (relative to the baseline) when there is no document value. Never state a target value that is not in the documents or the linked library entry; a change relative to the baseline ("baseline + 10 percentage points") is a method, not a target value.
-${options.hasDocuments ? '' : '- No project documents were provided: every baselineBasis must be "none" and no targetBasis may be "document".\n'}
+- intermediateTargets: only values listed in documentFigures with kind "target" that the documents set for a date before the end of the project (e.g. "6,000 people by the end of March 2026"), each with that date as YYYY-MM-DD; otherwise []. Never split, interpolate or phase a final target yourself.
+${noDocumentFiguresRule(projectStructure, options.hasDocuments)}
 OTHER FIELDS:
 - assumptions: the assumptions and data limitations of this indicator (access, response rates, record quality).
 - responsibility: the suggested responsible role, e.g. "M&E Officer", "Field Team", "Project Manager".

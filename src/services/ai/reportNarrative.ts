@@ -1,20 +1,25 @@
 import { prisma } from '../../config/prisma';
 import { generateStructured } from './client';
-import { escapeHtml, htmlList, htmlParagraphs } from './html';
-import { progressTowardTarget } from './indicatorFigures';
+import { escapeHtml, figureWarning, htmlList, htmlParagraphs } from './html';
+import { indicatorProgress, unverifiedFigures } from './indicatorFigures';
 import {
   NARRATIVE_PROMPT_VERSION,
   NARRATIVE_SCHEMA,
   NARRATIVE_SYSTEM,
   NarrativeAnswer,
   NarrativeIndicatorInput,
+  NarrativeProjectInput,
+  narrativeIndicatorBlock,
+  narrativeProjectBlock,
   writeNarrativePrompt,
 } from './prompts/narrative';
 import { redactPersonalData } from './redact';
 
 /**
- * Writes the AI narrative of a report (main tier) from the project's indicator figures and stores
- * the report HTML in Report.aiNarrative. AI errors propagate (typed errors from ./errors).
+ * Writes the AI narrative of a report (main tier) from the indicator figures of the project's
+ * current framework and stores the report HTML in Report.aiNarrative. Numbers in the narrative
+ * that are not among the figures sent are listed in a warning line of their section
+ * (unverifiedFigures). AI errors propagate (typed errors from ./errors).
  */
 export async function generateReportNarrative(reportId: string, projectId: string): Promise<void> {
   const report = await prisma.report.findFirst({ where: { id: reportId, projectId } });
@@ -23,7 +28,9 @@ export async function generateReportNarrative(reportId: string, projectId: strin
   const project = await prisma.project.findUnique({
     where: { id: projectId },
     include: {
+      // The current framework: the newest version whose generation did not fail.
       frameworks: {
+        where: { generationError: null },
         orderBy: { version: 'desc' },
         take: 1,
         include: {
@@ -45,35 +52,38 @@ export async function generateReportNarrative(reportId: string, projectId: strin
   const framework = project.frameworks[0];
   if (!framework) throw new Error('No framework found for project');
 
-  // Aggregates only: values, dates, areas and disaggregated counts (never data point notes).
-  const indicatorData: NarrativeIndicatorInput[] = framework.indicators.map(ind => ({
-    indicatorText: ind.indicatorText,
-    level: ind.level,
-    status: ind.status,
-    unit: ind.unit,
-    baselineValue: ind.baselineValue,
-    targetValue: ind.targetValue,
-    currentValue: ind.currentValue,
-    progressPercent: progressTowardTarget(ind.baselineValue, ind.targetValue, ind.currentValue),
-    dataPoints: ind.dataPoints.map(dp => ({
-      value: dp.value,
-      date: isoDate(dp.collectionDate),
-      area: dp.geographicArea,
-      breakdown: dp.breakdown ?? undefined,
-    })),
-  }));
+  // Aggregates only: values, dates, areas and disaggregated counts (never data point notes). Values
+  // and areas are free text, so they are redacted like descriptions; breakdown labels are redacted
+  // by formatBreakdown.
+  const indicatorData: NarrativeIndicatorInput[] = framework.indicators.map(ind => {
+    const progress = indicatorProgress(ind);
+    return {
+      indicatorText: ind.indicatorText,
+      level: ind.level,
+      status: ind.status,
+      unit: ind.unit,
+      baselineValue: ind.baselineValue,
+      targetValue: ind.targetValue,
+      currentValue: ind.currentValue,
+      progressPercent: progress?.percent ?? null,
+      progressNoBaseline: progress?.noBaseline ?? false,
+      dataPoints: ind.dataPoints.map(dp => ({
+        value: redactPersonalData(dp.value).text,
+        date: isoDate(dp.collectionDate),
+        area: dp.geographicArea ? redactPersonalData(dp.geographicArea).text : null,
+        breakdown: dp.breakdown ?? undefined,
+      })),
+    };
+  });
 
-  const prompt = writeNarrativePrompt(
-    {
-      name: project.name,
-      sector: project.sector,
-      donor: project.donor,
-      periodStart: report.periodStart ? isoDate(report.periodStart) : undefined,
-      periodEnd: report.periodEnd ? isoDate(report.periodEnd) : undefined,
-    },
-    indicatorData,
-    report.donorFormat,
-  );
+  const projectInfo: NarrativeProjectInput = {
+    name: project.name,
+    sector: project.sector,
+    donor: project.donor,
+    periodStart: report.periodStart ? isoDate(report.periodStart) : undefined,
+    periodEnd: report.periodEnd ? isoDate(report.periodEnd) : undefined,
+  };
+  const prompt = writeNarrativePrompt(projectInfo, indicatorData, report.donorFormat);
 
   const result = await generateStructured({
     feature: 'report.narrative',
@@ -88,11 +98,18 @@ export async function generateReportNarrative(reportId: string, projectId: strin
     context: { organizationId: project.organizationId, projectId: project.id },
   });
 
+  // Every figure the model was given: project facts, indicator texts and figures, progress, data
+  // points with their dates, areas and breakdowns, and the number of indicators.
+  const allowedFigures = narrativeAllowedFigures(projectInfo, indicatorData, report.donorFormat);
+  const narrative = cleanNarrative(result.data);
+  const figureChecks = checkNarrativeFigures(narrative, allowedFigures);
+
   // HTML report content (no PDF/Puppeteer needed); every value is escaped.
   const html = generateReportHtml({
     projectName: project.name,
     reportTitle: report.title,
-    narrative: cleanNarrative(result.data),
+    narrative,
+    unverifiedFigures: figureChecks,
     indicators: indicatorData,
     model: result.model,
     promptVersion: result.promptVersion,
@@ -107,7 +124,32 @@ export async function generateReportNarrative(reportId: string, projectId: strin
     },
   });
 
-  console.log(`[ReportNarrative] Report ${reportId} generated (${indicatorData.length} indicators; ${result.model}, ${result.usage.inputTokens} input / ${result.usage.outputTokens} output tokens)`);
+  const unverified = Object.values(figureChecks).reduce((sum, figures) => sum + figures.length, 0);
+  console.log(`[ReportNarrative] Report ${reportId} generated (${indicatorData.length} indicators; ${unverified} unverified figures; ${result.model}, ${result.usage.inputTokens} input / ${result.usage.outputTokens} output tokens)`);
+}
+
+/** The figures sent in the narrative prompt (the project facts and every indicator block), for unverifiedFigures. */
+export function narrativeAllowedFigures(projectInfo: NarrativeProjectInput, indicators: readonly NarrativeIndicatorInput[], donorFormat?: string | null): string[] {
+  return [narrativeProjectBlock(projectInfo, donorFormat), String(indicators.length), ...indicators.map(narrativeIndicatorBlock)];
+}
+
+export type NarrativeSection = keyof NarrativeAnswer;
+
+/** The numbers of each narrative section that are not among the allowed figures; sections without any are left out. */
+export function checkNarrativeFigures(narrative: NarrativeAnswer, allowedFigures: readonly string[]): Partial<Record<NarrativeSection, string[]>> {
+  const sections: Record<NarrativeSection, string> = {
+    executiveSummary: narrative.executiveSummary,
+    progress: narrative.progress,
+    challenges: narrative.challenges,
+    patterns: narrative.patterns,
+    recommendations: narrative.recommendations.join('\n'),
+  };
+  const checks: Partial<Record<NarrativeSection, string[]>> = {};
+  for (const [section, text] of Object.entries(sections) as [NarrativeSection, string][]) {
+    const figures = unverifiedFigures(text, allowedFigures);
+    if (figures.length) checks[section] = figures;
+  }
+  return checks;
 }
 
 function isoDate(date: Date): string {
@@ -138,19 +180,22 @@ export interface ReportHtmlInput {
   projectName: string;
   reportTitle: string;
   narrative: NarrativeAnswer;
+  /** Per section, the numbers not found in the data sent (checkNarrativeFigures); each gets a warning line. */
+  unverifiedFigures?: Partial<Record<NarrativeSection, string[]>>;
   indicators: ReadonlyArray<Pick<NarrativeIndicatorInput, 'indicatorText' | 'level' | 'status' | 'baselineValue' | 'targetValue' | 'currentValue'>>;
   model: string;
   promptVersion: string;
   generatedAt?: Date;
 }
 
-function section(title: string, body: string): string {
-  return body ? `<h2>${escapeHtml(title)}</h2>\n<div class="narrative">${body}</div>` : '';
+function section(title: string, body: string, figures?: readonly string[]): string {
+  return body ? `<h2>${escapeHtml(title)}</h2>\n<div class="narrative">${body}${figureWarning(figures)}</div>` : '';
 }
 
 /** The report HTML. Every interpolated value (model output and database text) is HTML-escaped. */
 export function generateReportHtml(input: ReportHtmlInput): string {
   const { narrative } = input;
+  const checks = input.unverifiedFigures ?? {};
   const generated = (input.generatedAt ?? new Date()).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
   const value = (v: string | null | undefined) => escapeHtml(v && v.trim() ? v : 'N/A');
 
@@ -165,6 +210,7 @@ export function generateReportHtml(input: ReportHtmlInput): string {
     h2 { color: #2563eb; margin-top: 30px; }
     .header { text-align: center; margin-bottom: 40px; }
     .ai-label { display: inline-block; padding: 4px 10px; border-radius: 4px; background: #fef3c7; color: #92400e; font-size: 12px; }
+    .figure-check { padding: 6px 10px; border-left: 4px solid #d97706; background: #fffbeb; color: #92400e; font-size: 14px; }
     .narrative { margin: 20px 0; text-align: justify; }
     table { width: 100%; border-collapse: collapse; margin: 20px 0; }
     th { background: #1e3a5f; color: white; padding: 10px; text-align: left; }
@@ -182,11 +228,11 @@ export function generateReportHtml(input: ReportHtmlInput): string {
     <p class="ai-label">AI suggested — review before approval</p>
   </div>
 
-  ${section('Executive Summary', htmlParagraphs(narrative.executiveSummary))}
-  ${section('Progress Against Targets', htmlParagraphs(narrative.progress))}
-  ${section('Challenges', htmlParagraphs(narrative.challenges))}
-  ${section('Patterns', htmlParagraphs(narrative.patterns))}
-  ${section('Recommendations', htmlList(narrative.recommendations, true))}
+  ${section('Executive Summary', htmlParagraphs(narrative.executiveSummary), checks.executiveSummary)}
+  ${section('Progress Against Targets', htmlParagraphs(narrative.progress), checks.progress)}
+  ${section('Challenges', htmlParagraphs(narrative.challenges), checks.challenges)}
+  ${section('Patterns', htmlParagraphs(narrative.patterns), checks.patterns)}
+  ${section('Recommendations', htmlList(narrative.recommendations, true), checks.recommendations)}
 
   <h2>Indicator Summary</h2>
   <table>

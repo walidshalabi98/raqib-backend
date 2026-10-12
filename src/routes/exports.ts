@@ -11,7 +11,9 @@ router.get('/projects/:id/export/indicators', authenticate, asyncHandler(async (
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
+      // The current framework: the newest version whose AI generation did not fail.
       frameworks: {
+        where: { generationError: null },
         orderBy: { version: 'desc' },
         take: 1,
         include: {

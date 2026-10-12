@@ -35,3 +35,14 @@ export function htmlList(items: readonly string[] | null | undefined, ordered = 
   const tag = ordered ? 'ol' : 'ul';
   return `<${tag}>${entries.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</${tag}>`;
 }
+
+/**
+ * A visible warning under model text that holds numbers not found in the data sent to the model
+ * (indicatorFigures.unverifiedFigures), so a reviewer checks them before approval; "" when there are
+ * none. The figures are escaped.
+ */
+export function figureWarning(figures: readonly string[] | null | undefined): string {
+  const list = (figures ?? []).map(f => (f ?? '').trim()).filter(Boolean);
+  if (list.length === 0) return '';
+  return `<p class="figure-check">Check these figures: ${escapeHtml(list.join(', '))} — not found in the data provided</p>`;
+}

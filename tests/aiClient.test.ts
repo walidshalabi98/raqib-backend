@@ -1,7 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { Prisma } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
 import * as z from 'zod/v4';
-import { env } from '../src/config/env';
+import { AI_REQUEST_TIMEOUT_MAX_MS, env } from '../src/config/env';
 import { prisma } from '../src/config/prisma';
 import {
   type AiCallLogger,
@@ -16,12 +17,26 @@ import {
   resetAiClientForTests,
   resolveModel,
   retryDelayMs,
+  writeAiCall,
 } from '../src/services/ai/client';
 import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError, safeErrorSummary } from '../src/services/ai/errors';
 import { outputJsonSchema } from '../src/services/ai/outputSchema';
 import { loadSharedSystemPrompt } from '../src/services/ai/prompts/system';
 import { structuredOutputSchemaProblems } from './aiSchemaHelpers';
 import { hasTestDatabase, resetDatabase } from './helpers';
+
+// The real shared system prompt, except that a test can make loading it fail (a missing knowledge file).
+const systemPromptLoad = vi.hoisted(() => ({ fail: false }));
+vi.mock('../src/services/ai/prompts/system', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/services/ai/prompts/system')>();
+  return {
+    ...actual,
+    loadSharedSystemPrompt: (...args: Parameters<typeof actual.loadSharedSystemPrompt>) => {
+      if (systemPromptLoad.fail) throw new Error('Cannot read the M&E foundations file for the AI system prompt (/missing.md): ENOENT');
+      return actual.loadSharedSystemPrompt(...args);
+    },
+  };
+});
 
 // Prompt and answer markers: none of them may reach the AiCall row, logs or error messages.
 const PROMPT_MARKER = 'PROMPT-MARKER-7f3a';
@@ -114,6 +129,7 @@ beforeEach(() => {
 afterEach(() => {
   resetAiClientForTests();
   Object.assign(env, savedEnv);
+  systemPromptLoad.fail = false;
   vi.restoreAllMocks();
 });
 
@@ -258,6 +274,13 @@ describe('generateStructured: request', () => {
     await generateStructured(params());
     expect(create.mock.calls[0][1]).toEqual({ timeout: 15000, maxRetries: 0 });
   });
+
+  it('never sends a timeout above one hour (Node would turn it into 1 ms)', async () => {
+    expect(AI_REQUEST_TIMEOUT_MAX_MS).toBe(3_600_000);
+    queue(create, response());
+    await generateStructured(params({ timeoutMs: 10_000_000_000 }));
+    expect(create.mock.calls[0][1]).toEqual({ timeout: AI_REQUEST_TIMEOUT_MAX_MS, maxRetries: 0 });
+  });
 });
 
 describe('generateStructured: answers', () => {
@@ -331,6 +354,20 @@ describe('generateStructured: answers', () => {
     expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 });
     expect(result.estimatedCostUsd).toBeNull();
     expect(onlyRecord().estimatedCostUsd).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith('[ai] test.feature: no price for model claude-unknown-9; its tokens are left out of the cost estimate');
+  });
+
+  it('keeps the cost of priced responses when another response comes from a model without a price', async () => {
+    queue(create,
+      response({ stop_reason: 'max_tokens', model: 'claude-haiku-5-5', usage: { input_tokens: 1000, output_tokens: 4000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }),
+      response({ model: 'claude-unknown-9', usage: { input_tokens: 1000, output_tokens: 3000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }));
+    const result = await generateStructured(params());
+    expect(result.usage).toEqual({ inputTokens: 2000, outputTokens: 7000, cacheReadTokens: 0, cacheWriteTokens: 0 });
+    // Only the claude-haiku-5-5 response: (1000×0.10 + 4000×0.50) / 1M
+    expect(result.estimatedCostUsd).toBe(0.0021);
+    expect(onlyRecord()).toMatchObject({ estimatedCostUsd: 0.0021, servedModel: 'claude-unknown-9' });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain('claude-unknown-9');
   });
 
   it('rejects malformed JSON with AiInvalidOutputError and no answer text', async () => {
@@ -375,6 +412,194 @@ describe('generateStructured: answers', () => {
   });
 });
 
+describe('generateStructured: server-side fallback', () => {
+  /** The documented fallback shape: a fallback block where the fallback model takes over, and usage.iterations per attempt. */
+  function fallbackResponse(opts: {
+    topModel: string;
+    from: string;
+    to: string;
+    declined: Record<string, unknown>;
+    served: Record<string, unknown>;
+    category?: string | null;
+  }): FakeResponse {
+    const iteration = (type: string, counts: Record<string, unknown>) => ({
+      type,
+      cache_creation: null,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      ...counts,
+    });
+    const declined = iteration('message', opts.declined);
+    const served = iteration('fallback_message', opts.served);
+    return response({
+      model: opts.topModel,
+      content: [
+        { type: 'fallback', from: { model: opts.from }, to: { model: opts.to }, trigger: { type: 'refusal', category: opts.category ?? 'cyber' } },
+        { type: 'text', text: JSON.stringify(validAnswer) },
+      ],
+      // Top-level usage covers only the attempt that produced the returned message.
+      usage: {
+        input_tokens: served.input_tokens,
+        output_tokens: served.output_tokens,
+        cache_read_input_tokens: served.cache_read_input_tokens,
+        cache_creation_input_tokens: served.cache_creation_input_tokens,
+        iterations: [declined, served],
+      },
+    });
+  }
+
+  it('counts the declined attempt from usage.iterations and prices each attempt at its own model', async () => {
+    queue(betaCreate, fallbackResponse({
+      topModel: 'claude-sonnet-5',
+      from: 'claude-sonnet-5-5',
+      to: 'claude-sonnet-5',
+      declined: { model: 'claude-sonnet-5-5', input_tokens: 10000, output_tokens: 1500, cache_creation_input_tokens: 4000 },
+      served: { model: 'claude-sonnet-5', input_tokens: 10000, output_tokens: 2000 },
+    }));
+    const result = await generateStructured(params({ model: 'main' }));
+
+    expect(result.model).toBe('claude-sonnet-5');
+    expect(result.usage).toEqual({ inputTokens: 20000, outputTokens: 3500, cacheReadTokens: 0, cacheWriteTokens: 4000 });
+    // claude-sonnet-5-5 (10000×2 + 1500×10 + 4000×2.5) + claude-sonnet-5 (10000×2 + 2000×10), per 1M
+    expect(result.estimatedCostUsd).toBe(0.085);
+    expect(onlyRecord()).toMatchObject({
+      model: 'claude-sonnet-5-5',
+      servedModel: 'claude-sonnet-5',
+      status: 'success',
+      attempts: 1,
+      inputTokens: 20000,
+      outputTokens: 3500,
+      cacheWriteTokens: 4000,
+      estimatedCostUsd: 0.085,
+    });
+  });
+
+  it('reads the served model from the fallback block when response.model echoes the requested model (Opus 5.5 to Opus 4.8)', async () => {
+    env.aiModelMain = 'claude-opus-5-5';
+    queue(betaCreate, fallbackResponse({
+      topModel: 'claude-opus-5-5',
+      from: 'claude-opus-5-5',
+      to: 'claude-opus-4-8',
+      declined: { model: 'claude-opus-5-5', input_tokens: 8000, output_tokens: 300 },
+      served: { model: 'claude-opus-4-8', input_tokens: 8000, output_tokens: 1000 },
+    }));
+    const result = await generateStructured(params({ model: 'main' }));
+
+    expect(betaCreate.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5-5', fallbacks: 'default' });
+    expect(result.model).toBe('claude-opus-4-8');
+    expect(result.usage).toEqual({ inputTokens: 16000, outputTokens: 1300, cacheReadTokens: 0, cacheWriteTokens: 0 });
+    // claude-opus-5-5 (8000×4 + 300×20) + claude-opus-4-8 (8000×5 + 1000×25), per 1M
+    expect(result.estimatedCostUsd).toBe(0.103);
+    expect(onlyRecord()).toMatchObject({ model: 'claude-opus-5-5', servedModel: 'claude-opus-4-8', estimatedCostUsd: 0.103 });
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('uses the last fallback block when more than one model declined', async () => {
+    const r = fallbackResponse({
+      topModel: 'claude-opus-4-8',
+      from: 'claude-opus-5',
+      to: 'claude-opus-4-8',
+      declined: { model: 'claude-opus-5-5', input_tokens: 100, output_tokens: 10 },
+      served: { model: 'claude-opus-4-8', input_tokens: 100, output_tokens: 50 },
+    });
+    const content = r.content as unknown[];
+    content.unshift({ type: 'fallback', from: { model: 'claude-opus-5-5' }, to: { model: 'claude-opus-5' }, trigger: { type: 'refusal', category: 'cyber' } });
+    const usage = r.usage as { iterations: unknown[] };
+    usage.iterations.splice(1, 0, { type: 'message', model: 'claude-opus-5', input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cache_creation: null });
+    env.aiModelMain = 'claude-opus-5-5';
+    queue(betaCreate, r);
+    const result = await generateStructured(params({ model: 'main' }));
+    expect(result.model).toBe('claude-opus-4-8');
+    expect(result.usage).toMatchObject({ inputTokens: 300, outputTokens: 80 });
+    // (100×4 + 10×20) + (100×5 + 20×25) + (100×5 + 50×25), per 1M
+    expect(result.estimatedCostUsd).toBe(0.00335);
+  });
+
+  it('prices a declined attempt without a model at the requested model, and leaves out an unpriced fallback model', async () => {
+    queue(betaCreate, fallbackResponse({
+      topModel: 'claude-future-1',
+      from: 'claude-sonnet-5-5',
+      to: 'claude-future-1',
+      declined: { model: null, input_tokens: 1000, output_tokens: 100 },
+      served: { model: 'claude-future-1', input_tokens: 1000, output_tokens: 500 },
+    }));
+    const result = await generateStructured(params({ model: 'main' }));
+    expect(result.model).toBe('claude-future-1');
+    expect(result.usage).toMatchObject({ inputTokens: 2000, outputTokens: 600 });
+    // Only the declined claude-sonnet-5-5 attempt: (1000×2 + 100×10) / 1M
+    expect(result.estimatedCostUsd).toBe(0.003);
+    expect(warnSpy).toHaveBeenCalledWith('[ai] test.feature: no price for model claude-future-1; its tokens are left out of the cost estimate');
+  });
+
+  it('counts every declined attempt when the fallback model declines too (refusal)', async () => {
+    const r = response({
+      model: 'claude-opus-4-8',
+      stop_reason: 'refusal',
+      stop_details: { type: 'refusal', category: 'cyber', explanation: 'declined' },
+      usage: {
+        input_tokens: 5000,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        iterations: [
+          { type: 'message', model: 'claude-opus-5-5', input_tokens: 5000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cache_creation: null },
+          { type: 'message', model: 'claude-opus-4-8', input_tokens: 5000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cache_creation: null },
+        ],
+      },
+    });
+    Object.defineProperty(r, 'content', { get: () => { throw new Error('the content of a refused response must not be read'); } });
+    env.aiModelMain = 'claude-opus-5-5';
+    queue(betaCreate, r);
+    const error = await generateStructured(params({ model: 'main' })).catch(e => e);
+    expect(error).toBeInstanceOf(AiRefusalError);
+    // claude-opus-5-5 (5000×4 + 200×20) + claude-opus-4-8 (5000×5), per 1M
+    expect(onlyRecord()).toMatchObject({
+      status: 'refusal',
+      servedModel: 'claude-opus-4-8',
+      inputTokens: 10000,
+      outputTokens: 200,
+      estimatedCostUsd: 0.049,
+    });
+  });
+
+  it('uses the top-level usage when usage.iterations has no fallback entry (nothing counted twice)', async () => {
+    queue(betaCreate, response({
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 500,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        iterations: [
+          { type: 'compaction', input_tokens: 50000, output_tokens: 2000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cache_creation: null },
+          { type: 'message', model: 'claude-sonnet-5-5', input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cache_creation: null },
+        ],
+      },
+    }));
+    const result = await generateStructured(params({ model: 'main' }));
+    expect(result.model).toBe('claude-sonnet-5-5');
+    expect(result.usage).toEqual({ inputTokens: 1000, outputTokens: 500, cacheReadTokens: 0, cacheWriteTokens: 0 });
+    // (1000×2 + 500×10) / 1M
+    expect(result.estimatedCostUsd).toBe(0.007);
+  });
+
+  it('reads the served model from a fallback block even without usage.iterations', async () => {
+    queue(betaCreate, response({
+      model: 'claude-sonnet-5-5',
+      content: [
+        { type: 'fallback', from: { model: 'claude-sonnet-5-5' }, to: { model: 'claude-opus-5' }, trigger: { type: 'refusal', category: null } },
+        { type: 'text', text: JSON.stringify(validAnswer) },
+      ],
+    }));
+    const result = await generateStructured(params({ model: 'main' }));
+    expect(result.model).toBe('claude-opus-5');
+    // Top-level usage at the served model's rates: (1000×5 + 500×25) / 1M
+    expect(result.estimatedCostUsd).toBe(0.0175);
+    expect(onlyRecord().servedModel).toBe('claude-opus-5');
+  });
+});
+
 describe('generateStructured: max_tokens', () => {
   it('retries once with twice the limit and a doubled timeout, then succeeds', async () => {
     queue(create, response({ stop_reason: 'max_tokens', content: [{ type: 'text', text: '{"title": "cut' }] }), response());
@@ -409,6 +634,39 @@ describe('generateStructured: max_tokens', () => {
     const error = await generateStructured(params({ maxTokens: MAX_TOKENS_CEILING })).catch(e => e);
     expect(error).toBeInstanceOf(AiOutputTruncatedError);
     expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('caps the doubled timeout at one hour', async () => {
+    queue(create, response({ stop_reason: 'max_tokens' }), response());
+    await generateStructured(params({ timeoutMs: 3_000_000 }));
+    expect(create.mock.calls[0][1]).toEqual({ timeout: 3_000_000, maxRetries: 0 });
+    expect(create.mock.calls[1][1]).toEqual({ timeout: AI_REQUEST_TIMEOUT_MAX_MS, maxRetries: 0 });
+  });
+
+  it('treats a full context window as truncation, without a retry', async () => {
+    queue(create, response({ stop_reason: 'model_context_window_exceeded', content: [{ type: 'text', text: `{"title": "${ANSWER_MARKER}` }] }), response());
+    const error = await generateStructured(params({ maxTokens: 4000 })).catch(e => e);
+    expect(error).toBeInstanceOf(AiOutputTruncatedError);
+    expect(error).toMatchObject({ maxTokens: 4000, stopReason: 'model_context_window_exceeded', feature: 'test.feature' });
+    expect(error.message).toBe("The AI answer was cut off because the model's context window is full (test.feature).");
+    expectNoPromptOrAnswerText(error.message);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(onlyRecord()).toMatchObject({
+      status: 'max_tokens',
+      stopReason: 'model_context_window_exceeded',
+      errorType: 'AiOutputTruncatedError',
+      attempts: 1,
+      inputTokens: 1000,
+    });
+  });
+
+  it('treats a full context window on the max_tokens retry as truncation', async () => {
+    queue(create, response({ stop_reason: 'max_tokens' }), response({ stop_reason: 'model_context_window_exceeded' }));
+    const error = await generateStructured(params({ maxTokens: 4000 })).catch(e => e);
+    expect(error).toBeInstanceOf(AiOutputTruncatedError);
+    expect(error).toMatchObject({ maxTokens: 8000, stopReason: 'model_context_window_exceeded' });
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(onlyRecord()).toMatchObject({ status: 'max_tokens', stopReason: 'model_context_window_exceeded', attempts: 2 });
   });
 });
 
@@ -560,6 +818,7 @@ describe('describeIssues', () => {
       expect(describeIssues(result.error.issues)).toEqual(['items[0].name: expected string', 'items[1].name: expected string']);
     }
     const strict = z.strictObject({ a: z.string().min(2) }).safeParse({ a: 'x', [ANSWER_MARKER]: 1 });
+    expect(strict.success).toBe(false);
     if (!strict.success) {
       const issues = describeIssues(strict.error.issues);
       expect(issues).toEqual(expect.arrayContaining(['a: too small (minimum 2)', 'root: 1 unexpected key(s)']));
@@ -607,6 +866,99 @@ describe('generateStructured: logging', () => {
     logCall.mockRejectedValueOnce(new Error('database down'));
     queue(create, apiError(400));
     await expect(generateStructured(params())).rejects.toBeInstanceOf(AiRequestError);
+  });
+
+  it('writes one row and throws AiRequestError when the answer schema cannot be converted (nothing is sent)', async () => {
+    const error = await generateStructured({ ...params(), schema: z.object({ anything: z.any() }) } as any).catch(e => e);
+    expect(error).toBeInstanceOf(AiRequestError);
+    expect(error).toMatchObject({ feature: 'test.feature', status: null, retryable: false, attempts: 0 });
+    expect(create).not.toHaveBeenCalled();
+    expect(betaCreate).not.toHaveBeenCalled();
+    expect(onlyRecord()).toMatchObject({
+      status: 'error',
+      errorType: 'Error',
+      attempts: 0,
+      servedModel: null,
+      stopReason: null,
+      inputTokens: 0,
+      estimatedCostUsd: 0,
+      systemPromptVersion: loadSharedSystemPrompt().version,
+    });
+    expect(infoSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('writes one row and throws AiRequestError when the shared system prompt cannot be loaded', async () => {
+    systemPromptLoad.fail = true;
+    const error = await generateStructured(params()).catch(e => e);
+    expect(error).toBeInstanceOf(AiRequestError);
+    expect(error).toMatchObject({ status: null, retryable: false, attempts: 0 });
+    expect(error.message).toBe('The AI request failed (test.feature).');
+    expect(create).not.toHaveBeenCalled();
+    expect(onlyRecord()).toMatchObject({ status: 'error', errorType: 'Error', attempts: 0, systemPromptVersion: null });
+    expect(safeErrorSummary(error)).toBe('AiRequestError: The AI request failed (test.feature).');
+  });
+});
+
+describe('writeAiCall', () => {
+  const record: AiCallRecord = {
+    feature: 'test.feature',
+    model: 'claude-haiku-5-5',
+    servedModel: 'claude-haiku-5-5',
+    promptVersion: 'test-v1',
+    systemPromptVersion: 'system-v1-0123456789',
+    status: 'success',
+    stopReason: 'end_turn',
+    errorType: null,
+    attempts: 1,
+    inputTokens: 10,
+    outputTokens: 5,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    latencyMs: 100,
+    estimatedCostUsd: 0.000004,
+    organizationId: 'org-gone',
+    projectId: 'project-gone',
+  };
+  const fkError = (meta?: Record<string, unknown>) =>
+    new Prisma.PrismaClientKnownRequestError('Foreign key constraint violated', { code: 'P2003', clientVersion: 'test', meta });
+
+  it('writes the row again without the organisation and project after a foreign key error (P2003)', async () => {
+    const create = vi.spyOn(prisma.aiCall, 'create')
+      .mockRejectedValueOnce(fkError())
+      .mockResolvedValueOnce({ id: 'aicall-2' } as any);
+    await expect(writeAiCall(record)).resolves.toBe('aicall-2');
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[1][0]).toEqual({ data: { ...record, organizationId: null, projectId: null }, select: { id: true } });
+    expect(warnSpy).toHaveBeenCalledWith('[ai] test.feature: the organisation or project of this call no longer exists; AiCall row kept without them');
+  });
+
+  it('keeps the organisation when the error names only the project foreign key', async () => {
+    const create = vi.spyOn(prisma.aiCall, 'create')
+      .mockRejectedValueOnce(fkError({ constraint: 'AiCall_projectId_fkey', modelName: 'AiCall' }))
+      .mockResolvedValueOnce({ id: 'aicall-3' } as any);
+    await expect(writeAiCall(record)).resolves.toBe('aicall-3');
+    expect(create.mock.calls[1][0]).toEqual({ data: { ...record, projectId: null }, select: { id: true } });
+    expect(warnSpy).toHaveBeenCalledWith('[ai] test.feature: the project of this call no longer exists; AiCall row kept without it');
+
+    create.mockRejectedValueOnce(fkError({ constraint: 'AiCall_organizationId_fkey' })).mockResolvedValueOnce({ id: 'aicall-4' } as any);
+    await expect(writeAiCall(record)).resolves.toBe('aicall-4');
+    expect(create.mock.calls[3][0]).toEqual({ data: { ...record, organizationId: null, projectId: null }, select: { id: true } });
+  });
+
+  it('retries only once', async () => {
+    const create = vi.spyOn(prisma.aiCall, 'create').mockRejectedValueOnce(fkError()).mockRejectedValueOnce(new Error('database down'));
+    await expect(writeAiCall(record)).rejects.toThrow('database down');
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('rethrows other errors, and a foreign key error on a row without organisation or project', async () => {
+    const create = vi.spyOn(prisma.aiCall, 'create').mockRejectedValueOnce(new Error('database down'));
+    await expect(writeAiCall(record)).rejects.toThrow('database down');
+    expect(create).toHaveBeenCalledTimes(1);
+
+    create.mockRejectedValueOnce(fkError());
+    await expect(writeAiCall({ ...record, organizationId: null, projectId: null })).rejects.toMatchObject({ code: 'P2003' });
+    expect(create).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -671,11 +1023,29 @@ describe.skipIf(!hasTestDatabase)('generateStructured: AiCall table', () => {
     expect(rows[0]).toMatchObject({ status: 'error', errorType: 'BadRequestError', attempts: 1, servedModel: null, inputTokens: 0 });
   });
 
-  it('does not fail the call when the row cannot be written (unknown organisation)', async () => {
-    queue(create, response());
-    const result = await generateStructured(params({ context: { organizationId: '00000000-0000-0000-0000-000000000000' } }));
+  it('keeps the cost row without the organisation or project when they no longer exist', async () => {
+    queue(create, response({ model: 'claude-haiku-5-5' }));
+    const result = await generateStructured(params({
+      feature: 'test.deleted-owner',
+      context: { organizationId: '00000000-0000-0000-0000-000000000000', projectId: '00000000-0000-0000-0000-000000000001' },
+    }));
     expect(result.data).toEqual(validAnswer);
-    expect(result.aiCallId).toBeNull();
-    expect(warnSpy).toHaveBeenCalled();
+    expect(result.aiCallId).toEqual(expect.any(String));
+    const row = await prisma.aiCall.findUniqueOrThrow({ where: { id: result.aiCallId! } });
+    expect(row).toMatchObject({ feature: 'test.deleted-owner', status: 'success', organizationId: null, projectId: null, inputTokens: 1000 });
+    expect(row.estimatedCostUsd?.toString()).toBe('0.00035');
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expectNoPromptOrAnswerText(warnSpy.mock.calls[0]);
+  });
+
+  it('keeps the organisation on the cost row when only the project no longer exists', async () => {
+    const org = await prisma.organization.create({
+      data: { name: 'AI Org 2', type: 'local_ngo', country: 'Palestine', city: 'Nablus', contactEmail: 'ai2@example.org' },
+    });
+    queue(create, response());
+    const result = await generateStructured(params({ feature: 'test.deleted-project', context: { organizationId: org.id, projectId: '00000000-0000-0000-0000-000000000002' } }));
+    expect(result.aiCallId).toEqual(expect.any(String));
+    const row = await prisma.aiCall.findUniqueOrThrow({ where: { id: result.aiCallId! } });
+    expect(row).toMatchObject({ feature: 'test.deleted-project', organizationId: org.id, projectId: null });
   });
 });

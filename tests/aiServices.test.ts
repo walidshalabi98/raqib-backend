@@ -16,10 +16,12 @@ vi.mock('../src/services/ai/client', () => ({
 import { AiError, AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from '../src/services/ai/errors';
 import { hasDirectionalWording, normalizeAlternatives } from '../src/services/ai/indicatorAlternative';
 import { linkIndicators, linkKeywords, normalizeThemes } from '../src/services/ai/qualitativeCoder';
-import { generateReportHtml } from '../src/services/ai/reportNarrative';
-import { AtRiskIndicator, fallbackRiskAlert, mergeRiskAnswer } from '../src/services/ai/riskAnalyzer';
+import { checkNarrativeFigures, generateReportHtml, narrativeAllowedFigures } from '../src/services/ai/reportNarrative';
+import { AtRiskIndicator, fallbackRiskAlert, mergeRiskAnswer, riskAllowedFigures } from '../src/services/ai/riskAnalyzer';
 import {
   assessmentFailureMessage,
+  checkAssessmentFigures,
+  cutAtWord,
   documentSummaryFor,
   generateAssessmentHtml,
   normalizeAssessment,
@@ -41,7 +43,10 @@ import {
   truncateEntry,
 } from '../src/services/ai/prompts/qualitative';
 import {
+  BREAKDOWN_OMITTED,
   DATA_NOT_AVAILABLE,
+  formatBreakdown,
+  MAX_BREAKDOWN_CHARS,
   NARRATIVE_PROMPT_VERSION,
   NARRATIVE_SCHEMA,
   NARRATIVE_SYSTEM,
@@ -87,9 +92,9 @@ describe('AI answer schemas', () => {
   it('has a versioned prompt for every service', () => {
     expect(ALTERNATIVES_PROMPT_VERSION).toBe('alternatives-v2');
     expect(QUALITATIVE_PROMPT_VERSION).toBe('qualitative-coding-v2');
-    expect(NARRATIVE_PROMPT_VERSION).toBe('report-narrative-v2');
+    expect(NARRATIVE_PROMPT_VERSION).toBe('report-narrative-v3');
     expect(RISK_PROMPT_VERSION).toBe('risk-analysis-v2');
-    expect(ASSESSMENT_PROMPT_VERSION).toBe('assessment-report-v2');
+    expect(ASSESSMENT_PROMPT_VERSION).toBe('assessment-report-v3');
   });
 });
 
@@ -180,7 +185,17 @@ describe('prompts', () => {
     expect(prompt).toContain(`Baseline: ${DATA_NOT_AVAILABLE} | Target: 1,200 | Current: 600 | Progress toward target: ${DATA_NOT_AVAILABLE}`);
     expect(prompt).toContain('REPORTING PERIOD: 2026-01-01 to 2026-03-31');
     expect(prompt).toContain('DONOR FORMAT: follow the reporting conventions of UNICEF');
-    expect(prompt).toContain('area Hebron; breakdown {"sex":{"female":310,"male":290}}');
+    expect(prompt).toContain('600 (2026-03-01; area Hebron; breakdown sex: female 310, male 290)');
+    expect(prompt).toContain('INDICATOR DATA (1 indicator):');
+  });
+
+  it('narrative: an output count without a baseline shows its share of the target with the note', () => {
+    const prompt = writeNarrativePrompt({ name: 'P', sector: 'wash', donor: 'ECHO' }, [{
+      indicatorText: 'Number of people receiving trucked water', level: 'output', status: 'on_track', unit: 'number',
+      baselineValue: null, targetValue: '12,000', currentValue: '8,000', progressPercent: 67, progressNoBaseline: true, dataPoints: [],
+    }]);
+    expect(prompt).toContain('Progress toward target: 67% (of target; no baseline recorded)');
+    expect(NARRATIVE_SYSTEM).toContain('of target; no baseline recorded');
   });
 
   it('risk: the indicators are sent as JSON with their ids', () => {
@@ -190,6 +205,20 @@ describe('prompts', () => {
     }]);
     expect(prompt).toContain('"id": "ind-1"');
     expect(prompt).toContain('"computedTrend": "declining"');
+  });
+
+  it('assessment: the no-baseline note travels with the progress figure', () => {
+    const prompt = assessmentPrompt({
+      assessmentType: 'midterm',
+      project: { name: 'P', sector: 'wash', donor: 'ECHO', donorType: 'echo', startDate: '2026-01-01', endDate: '2027-12-31', targetBeneficiaries: 12000, geographicScope: 'Gaza', budgetUsd: null },
+      indicators: [{
+        text: 'People receiving trucked water', level: 'output', status: 'on_track', unit: 'number', baseline: null, target: '12,000', current: '8,000',
+        progressPercent: 67, progressNote: 'of target; no baseline recorded', trend: 'insufficient_data', recentDataPoints: [],
+      }],
+      statusCounts: { on_track: 1 }, achievementRate: 100, qualitative: [], documents: [],
+    });
+    expect(prompt).toContain('"progressPercent": 67,\n    "progressNote": "of target; no baseline recorded"');
+    expect(ASSESSMENT_SYSTEM).toContain('"progressNote": "of target; no baseline recorded"');
   });
 
   it('assessment: unknown project facts say "data not available", not zero', () => {
@@ -202,6 +231,86 @@ describe('prompts', () => {
     expect(prompt).toContain('- Target beneficiaries: data not available');
     expect(prompt).toContain('achievement rate data not available');
     expect(prompt).not.toContain('$0');
+  });
+});
+
+describe('narrative: breakdown formatting', () => {
+  const GAZA_LOCALITIES = [
+    'Gaza City', 'Jabalia', 'Beit Lahia', 'Beit Hanoun', 'Deir al-Balah', 'Nuseirat', 'Bureij', 'Maghazi', 'Khan Younis', 'Rafah',
+  ];
+  const location = Object.fromEntries(GAZA_LOCALITIES.map((name, i) => [`${name} collective shelter, displacement site ${i + 1}`, 1500 + i * 111]));
+
+  it('formats each dimension as "name: category count, …"', () => {
+    expect(formatBreakdown({ sex: { female: 9120, male: 8790 } })).toBe('sex: female 9120, male 8790');
+    expect(formatBreakdown({ disability: { yes: 12, no: 206 }, sex: { female: 120, male: 98 } })).toBe('sex: female 120, male 98; disability: yes 12, no 206');
+  });
+
+  it('never cuts a number: a long location dimension is left out whole and the omission is said', () => {
+    // The review case: 10 localities and the sex dimension, stored in this order.
+    const breakdown = { location, sex: { female: 9120, male: 8790 } };
+    expect(JSON.stringify(breakdown).length).toBeGreaterThan(MAX_BREAKDOWN_CHARS);
+    const text = formatBreakdown(breakdown, 200);
+    expect(text).toBe(`sex: female 9120, male 8790 ${BREAKDOWN_OMITTED}`);
+
+    // With room for it, the location dimension is sent whole, after sex.
+    const all = formatBreakdown(breakdown, 1000);
+    expect(all.startsWith('sex: female 9120, male 8790; location: Gaza City collective shelter, displacement site 1 1500, ')).toBe(true);
+    expect(all.endsWith('Rafah collective shelter, displacement site 10 2499')).toBe(true);
+    expect(all).not.toContain(BREAKDOWN_OMITTED);
+  });
+
+  it('keeps every dimension that fits, in priority order, and every number whole at the default budget', () => {
+    const breakdown = { location, age: { '0-17': 9000, '18-59': 8000, '60+': 910 }, sex: { female: 9120, male: 8790 } };
+    const text = formatBreakdown(breakdown);
+    expect(text.length).toBeLessThanOrEqual(MAX_BREAKDOWN_CHARS + BREAKDOWN_OMITTED.length + 1);
+    expect(text).toBe(`sex: female 9120, male 8790; age: 0-17 9000, 18-59 8000, 60+ 910 ${BREAKDOWN_OMITTED}`);
+    // Every number in the text is one of the stored counts or part of a label.
+    const counts = new Set(['9120', '8790', '9000', '8000', '910', '0', '17', '18', '59', '60']);
+    for (const n of text.match(/\d+/g) ?? []) expect(counts.has(n)).toBe(true);
+  });
+
+  it('redacts category labels and skips categories that are not numbers', () => {
+    expect(formatBreakdown({ location: { 'Camp office 0599123456': 40, Hebron: '1,200', Unknown: 'n/a' } }))
+      .toBe('location: Camp office [phone removed] 40, Hebron 1200');
+  });
+
+  it('returns "" for no breakdown or a malformed one', () => {
+    for (const value of [null, undefined, {}, [], 'x', 5, { sex: 'female' }, { sex: { female: 'many' } }]) {
+      expect(formatBreakdown(value)).toBe('');
+    }
+  });
+});
+
+describe('narrative: figure check', () => {
+  const project = { name: 'P', sector: 'wash', donor: 'ECHO', periodStart: '2026-07-01', periodEnd: '2026-09-30' };
+  const indicators = [{
+    indicatorText: 'People receiving at least 15 litres per day', level: 'output', status: 'at_risk', unit: 'number',
+    baselineValue: null, targetValue: '12,000', currentValue: '8,000', progressPercent: 67, progressNoBaseline: true,
+    dataPoints: [{ value: '8000', date: '2026-09-15', area: 'Rafah', breakdown: { sex: { female: 4100, male: 3900 } } }],
+  }];
+  const allowed = narrativeAllowedFigures(project, indicators, 'echo');
+
+  it('accepts figures that were sent and lists the others per section', () => {
+    const narrative: NarrativeAnswer = {
+      executiveSummary: '8,000 of 12,000 people (67% of target; no baseline recorded) received 15 litres in Q3 2026.',
+      progress: 'Women 4,100 and men 3,900 by 15 September; 2 indicators reviewed.',
+      challenges: 'Coverage fell by 33%.',
+      patterns: DATA_NOT_AVAILABLE,
+      recommendations: ['Reach 4,000 more people', 'Repair the network'],
+    };
+    expect(checkNarrativeFigures(narrative, allowed)).toEqual({ challenges: ['33%'], recommendations: ['4,000'] });
+  });
+
+  it('report HTML: a visible, escaped warning in each section with unverified figures', () => {
+    const html = generateReportHtml({
+      projectName: 'P', reportTitle: 'T', model: 'm', promptVersion: 'v', indicators: [],
+      narrative: { executiveSummary: 'Fine.', progress: 'Coverage fell by 33%.', challenges: '', patterns: '', recommendations: ['Reach 4,000 more'] },
+      unverifiedFigures: { progress: ['33%'], recommendations: ['4,000<script>'] },
+    });
+    expect(html).toContain('<p>Coverage fell by 33%.</p><p class="figure-check">Check these figures: 33% — not found in the data provided</p></div>');
+    expect(html).toContain('Check these figures: 4,000&lt;script&gt; — not found in the data provided');
+    expect(html.match(/<script/g)).toBeNull();
+    expect(html.split('class="figure-check"').length - 1).toBe(2);
   });
 });
 
@@ -368,6 +477,58 @@ describe('risk analysis: merging the answer', () => {
     expect(merged.riskLevel).toBe('high');
   });
 
+  it('takes the trend from the data whenever there are two comparable points, the model\'s only otherwise', () => {
+    // A "decrease" indicator rising from 22% to 30% is getting worse, whatever the model says.
+    const worse = indicator('a', 'off_track', {
+      direction: 'decrease', baselineValue: '22%', targetValue: '10%', currentValue: '30%',
+      dataPoints: [{ value: '30%', collectionDate: new Date('2026-09-01') }, { value: '22%', collectionDate: new Date('2026-06-01') }],
+    });
+    const noData = indicator('b', 'at_risk', { dataPoints: [] });
+    const otherAreas = indicator('c', 'at_risk', {
+      dataPoints: [
+        { value: '30', collectionDate: new Date('2026-09-01'), geographicArea: 'Gaza' },
+        { value: '40', collectionDate: new Date('2026-06-01'), geographicArea: 'Hebron' },
+      ],
+    });
+    const answer = (id: string) => ({ indicatorId: id, riskLevel: 'low' as const, trend: 'improving' as const, analysis: 'Analysis.', suggestedActions: ['Act'], estimatedImpact: 'Impact.' });
+    const merged = mergeRiskAnswer([worse, noData, otherAreas], { risks: [answer('a'), answer('b'), answer('c')] });
+    expect(merged.map(r => r.trend)).toEqual(['declining', 'improving', 'improving']);
+    expect(merged[0].riskLevel).toBe('low');
+  });
+
+  it('replaces texts with numbers that were not sent, drops such actions and redacts the rest', () => {
+    const a = indicator('a', 'off_track', {
+      direction: 'decrease', baselineValue: '22%', targetValue: '10%', currentValue: '30%',
+      dataPoints: [{ value: '30%', collectionDate: new Date('2026-09-01') }, { value: '22%', collectionDate: new Date('2026-06-01') }],
+    });
+    const fallback = fallbackRiskAlert(a);
+    const [merged] = mergeRiskAnswer([a], {
+      risks: [{
+        indicatorId: 'a', riskLevel: 'high', trend: 'improving',
+        analysis: 'Rose from 22% to 30%, showing strong improvement of 36%.',
+        suggestedActions: ['Reach 500 more households', 'Call the focal point on 0599123456', 'Check the 30% figure'],
+        estimatedImpact: 'Up to 1,200 households affected.',
+      }],
+    });
+    expect(merged.aiAnalysis).toBe(fallback.aiAnalysis);
+    expect(merged.estimatedImpact).toBe(fallback.estimatedImpact);
+    expect(merged.suggestedActions).toEqual(['Call the focal point on [phone removed]', 'Check the 30% figure']);
+
+    const [kept] = mergeRiskAnswer([a], {
+      risks: [{ indicatorId: 'a', riskLevel: 'high', trend: 'improving', analysis: 'Rose from 22% to 30% by 1 September 2026.', suggestedActions: ['Reach 500 more households'], estimatedImpact: 'Outcome 1 at risk.' }],
+    });
+    expect(kept.aiAnalysis).toBe('Rose from 22% to 30% by 1 September 2026.');
+    expect(kept.suggestedActions).toEqual(fallback.suggestedActions);
+    expect(kept.estimatedImpact).toBe('Outcome 1 at risk.');
+  });
+
+  it('allows the figures of every indicator sent, never their ids', () => {
+    const a = indicator('3f2a9c41-0000-4000-8000-000000000123', 'off_track', { indicatorText: 'Households reached' });
+    const figures = riskAllowedFigures([a]);
+    expect(figures).toEqual(expect.arrayContaining(['10', '1,200', '45%', '40', '50', '2026-05-01']));
+    expect(figures.join(' ')).not.toContain('3f2a9c41');
+  });
+
   it('deterministic assessment: high when off track, medium when at risk, trend from the data', () => {
     expect(fallbackRiskAlert(indicator('a', 'off_track'))).toMatchObject({ riskLevel: 'high', trend: 'declining' });
     expect(fallbackRiskAlert(indicator('b', 'at_risk', { direction: 'decrease' }))).toMatchObject({ riskLevel: 'medium', trend: 'improving' });
@@ -407,9 +568,25 @@ describe('assessment: document summaries', () => {
     expect(summary.keyFindings).toEqual([]);
   });
 
+  it('splits a legacy row at the LAST marker, so a marker quoted in the document text stays text', () => {
+    const parsedText = 'Guidelines quoting ---AI_ANALYSIS--- in the text.\n\n---AI_ANALYSIS---\n{"summary":"Legacy summary","keyFindings":[]}';
+    expect(documentSummaryFor({ ...base, parsedText, aiAnalysis: null }).summary).toBe('Legacy summary');
+    const broken = 'Guidelines quoting ---AI_ANALYSIS--- in the text.\n---AI_ANALYSIS---\n{not json';
+    expect(documentSummaryFor({ ...base, parsedText: broken, aiAnalysis: null }).summary).toBe('Guidelines quoting ---AI_ANALYSIS--- in the text.');
+  });
+
   it('uses the redacted text when there is no analysis at all, and redacts the file name', () => {
     const summary = documentSummaryFor({ fileName: 'list 0599123456.pdf', fileType: 'other', parsedText: 'Mail sara@example.ps', aiAnalysis: { summary: '', keyFindings: [] } });
     expect(summary).toEqual({ name: 'list [phone removed].pdf', type: 'other', summary: 'Mail [email removed]', keyFindings: [] });
+  });
+
+  it('never cuts a number of the fallback text in half', () => {
+    const text = `${'word '.repeat(58)}reached 1,250 households.`;
+    expect(text.indexOf('1,250')).toBeLessThan(300);
+    expect(text.indexOf('1,250') + 5).toBeGreaterThan(300);
+    const summary = documentSummaryFor({ ...base, parsedText: text, aiAnalysis: null });
+    expect(summary.summary.endsWith('reached')).toBe(true);
+    expect(summary.summary).not.toContain('1,2');
   });
 
   it('handles a document without text', () => {
@@ -467,6 +644,53 @@ describe('assessment: normalisation and failure message', () => {
       expect(message).not.toContain('secret');
       expect(message).not.toContain('keyFindings');
     }
+  });
+});
+
+describe('assessment: cutAtWord', () => {
+  it('ends at a word boundary and never splits a number', () => {
+    expect(cutAtWord('short text', 50)).toBe('short text');
+    expect(cutAtWord('reached 1,250 households', 12)).toBe('reached');
+    expect(cutAtWord('reached 1,250 households', 13)).toBe('reached 1,250');
+    expect(cutAtWord('reached 1,250 households', 14)).toBe('reached 1,250');
+    expect(cutAtWord('ابلغ ١٬٢٥٠ أسرة', 8)).toBe('ابلغ');
+    expect(cutAtWord('x'.repeat(20), 10)).toBe('x'.repeat(10));
+  });
+});
+
+describe('assessment: figure check', () => {
+  const allowed = [JSON.stringify({ indicators: [{ current: '40%', target: '60%', progressPercent: 50 }], statusCounts: { on_track: 1 }, achievementRate: 50, qualitative: [{ participants: 12 }] })];
+
+  it('lists the numbers of each section that were not sent', () => {
+    const report: AssessmentAnswer = {
+      ...ASSESSMENT,
+      executiveSummary: 'Achievement is 50%; income reached 40% of households against 60%.',
+      keyFindings: [{ area: 'Income', finding: 'Income rose by 15 points.', evidence: 'Current 40%.', rating: 'moderate' }],
+      qualitativeInsights: { ...ASSESSMENT.qualitativeInsights, beneficiaryVoices: '12 participants; 75% were satisfied.' },
+      nextSteps: ['Survey 400 households'],
+    };
+    expect(checkAssessmentFigures(report, allowed)).toEqual({
+      keyFindings: ['15'],
+      qualitativeInsights: ['75%'],
+      nextSteps: ['400'],
+    });
+  });
+
+  it('assessment HTML: a visible, escaped warning in each section with unverified figures', () => {
+    const html = generateAssessmentHtml({
+      project: { name: 'P', sector: 'livelihoods', donor: 'EU' },
+      assessmentType: 'midterm',
+      report: ASSESSMENT,
+      unverifiedFigures: { executiveSummary: ['36%'], keyFindings: ['1,500'], nextSteps: ['<b>9</b>'] },
+      statusCounts: { on_track: 1, at_risk: 0, off_track: 1, not_started: 0, completed: 0 },
+      totalIndicators: 2,
+      model: 'm',
+      promptVersion: 'v',
+    });
+    expect(html).toContain('<p>Two indicators are off track.</p>\n<p class="figure-check">Check these figures: 36% — not found in the data provided</p>');
+    expect(html).toContain('Check these figures: 1,500 — not found in the data provided');
+    expect(html).toContain('<h2>Next Steps</h2><ol><li>Collect endline data</li></ol><p class="figure-check">Check these figures: &lt;b&gt;9&lt;/b&gt;');
+    expect(html.split('class="figure-check"').length - 1).toBe(3);
   });
 });
 

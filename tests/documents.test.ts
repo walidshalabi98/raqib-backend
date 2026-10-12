@@ -29,10 +29,66 @@ describe.skipIf(!hasTestDatabase)('document storage and access', () => {
     const res = await request(app)
       .post(`/api/projects/${a.project.id}/documents`)
       .set('Authorization', a.officerAuth)
+      .field('fileType', 'logframe')
       .attach('file', PDF_BYTES, { filename: 'logframe.pdf', contentType: 'application/pdf' });
     expect(res.status).toBe(201);
-    expect(res.body.fileUrl).toMatch(new RegExp(`^projects/${a.project.id}/[0-9a-f-]+\\.pdf$`));
-    expect(res.body.fileSizeBytes).toBe(PDF_BYTES.length);
+    const stored = await prisma.document.findUniqueOrThrow({ where: { id: res.body.id } });
+    expect(stored.fileUrl).toMatch(new RegExp(`^projects/${a.project.id}/[0-9a-f-]+\\.pdf$`));
+    expect(stored.fileType).toBe('logframe');
+    // The response holds display fields only: never the storage key or the extracted text.
+    expect(res.body).toEqual({
+      id: stored.id,
+      projectId: a.project.id,
+      fileName: 'logframe.pdf',
+      fileType: 'logframe',
+      fileSizeBytes: PDF_BYTES.length,
+      parsingStatus: 'pending',
+      uploadedAt: stored.uploadedAt.toISOString(),
+      aiAnalysis: null,
+      qualitativeSource: false,
+      uploader: { fullName: a.officer.fullName },
+      textLength: 0,
+    });
+  });
+
+  it('lists documents without parsedText or the storage key, with textLength', async () => {
+    await prisma.document.update({ where: { id: a.document.id }, data: { parsedText: 'Redacted text: [phone removed]' } });
+    const res = await request(app).get(`/api/projects/${a.project.id}/documents`).set('Authorization', a.officerAuth);
+    expect(res.status).toBe(200);
+    for (const doc of res.body) {
+      expect(doc).not.toHaveProperty('parsedText');
+      expect(doc).not.toHaveProperty('fileUrl');
+      expect(doc).not.toHaveProperty('uploadedBy');
+      expect(typeof doc.textLength).toBe('number');
+    }
+    expect(res.body.find((d: { id: string }) => d.id === a.document.id).textLength).toBe('Redacted text: [phone removed]'.length);
+    expect(JSON.stringify(res.body)).not.toContain(a.document.fileUrl);
+  });
+
+  it('returns only the id and parsing status from the status route', async () => {
+    const res = await request(app).get(`/api/documents/${a.document.id}/status`).set('Authorization', a.officerAuth);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ id: a.document.id, parsingStatus: a.document.parsingStatus });
+  });
+
+  it('refuses Word 97–2003 (.doc) files with advice, and unknown document types', async () => {
+    const doc = await request(app)
+      .post(`/api/projects/${a.project.id}/documents`)
+      .set('Authorization', a.officerAuth)
+      .attach('file', Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]), { filename: 'report.doc', contentType: 'application/msword' });
+    expect(doc.status).toBe(400);
+    expect(doc.body.message).toBe('Word 97–2003 (.doc) files cannot be read. Save it as .docx or a text-based PDF and upload it again.');
+
+    const type = await request(app)
+      .post(`/api/projects/${a.project.id}/documents`)
+      .set('Authorization', a.officerAuth)
+      .field('fileType', 'invoice')
+      .attach('file', PDF_BYTES, { filename: 'invoice.pdf', contentType: 'application/pdf' });
+    expect(type.status).toBe(400);
+    expect(type.body.message).toMatch(/^fileType must be one of: proposal, logframe/);
+
+    const count = await prisma.document.count({ where: { projectId: a.project.id, fileName: { in: ['report.doc', 'invoice.pdf'] } } });
+    expect(count).toBe(0);
   });
 
   it('returns a signed URL valid for 5 minutes to members of the owning organisation', async () => {
@@ -91,6 +147,7 @@ describe.skipIf(!hasTestDatabase)('document storage and access', () => {
       .set('Authorization', a.officerAuth)
       .attach('file', Buffer.from('MZ fake'), { filename: 'tool.exe', contentType: 'application/octet-stream' });
     expect(exe.status).toBe(400);
+    expect(exe.body.message).toBe('Unsupported file type. Upload a PDF, Word (.docx) or Excel (.xlsx) file.');
 
     const fakePdf = await request(app)
       .post(`/api/projects/${a.project.id}/documents`)

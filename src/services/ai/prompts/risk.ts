@@ -3,7 +3,7 @@
  * src/services/ai/riskAnalyzer.ts for at-risk and off-track indicators. The AI client sends the
  * shared M&E system prompt (role + knowledge/me-foundations.md §1–12) before RISK_SYSTEM.
  *
- * Input is aggregates only: indicator texts, values, dates and the deterministic trend.
+ * Input is aggregates only: indicator texts, values (redacted), dates and the deterministic trend.
  */
 import * as z from 'zod/v4';
 
@@ -46,7 +46,7 @@ export interface RiskIndicatorInput {
   baseline: string | null;
   target: string | null;
   current: string | null;
-  /** Deterministic trend of the two latest values (indicatorFigures.valueTrend). */
+  /** Deterministic trend: the latest value against the previous one of the same area (indicatorFigures.valueTrend); it overrides the model's trend unless insufficient_data. */
   computedTrend: string;
   dataPoints: Array<{ value: string; date: string }>;
 }
