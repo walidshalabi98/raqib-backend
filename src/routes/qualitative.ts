@@ -10,8 +10,30 @@ import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
 import { parseDocument } from '../services/ai/documentParser';
 import { safeErrorSummary } from '../services/ai/errors';
 import { redactPersonalData } from '../services/ai/redact';
+import { describeRedactions, redactQualitativeFields, redactionTotal } from '../services/qualitative/redactEntry';
+import { dateOf, EntryFieldError, entryTypeOf, participantsOf } from '../services/qualitative/entryFields';
 
 const router = Router();
+
+/** Optional text fields of an entry: absent (undefined or null) or text. Checked before anything is stored. */
+function assertOptionalText(body: Record<string, unknown>, fields: readonly string[]): void {
+  for (const field of fields) {
+    const value = body[field];
+    if (value !== undefined && value !== null && typeof value !== 'string') {
+      throw new AppError(400, `${field} must be text`);
+    }
+  }
+}
+
+/** Runs a field check from entryFields and turns its error into a 400. */
+function checked<T>(check: () => T): T {
+  try {
+    return check();
+  } catch (err) {
+    if (err instanceof EntryFieldError) throw new AppError(400, err.message);
+    throw err;
+  }
+}
 
 // GET /api/projects/:id/qualitative
 router.get('/projects/:id/qualitative', authenticate, asyncHandler(async (req: Request, res: Response) => {
@@ -36,29 +58,42 @@ router.post('/projects/:id/qualitative', authenticate, aiLimiter, asyncHandler(a
   if (!entryType || !title || !content) {
     throw new AppError(400, 'entryType, title, and content are required');
   }
+  if (typeof title !== 'string' || typeof content !== 'string') {
+    throw new AppError(400, 'title and content must be text');
+  }
+  assertOptionalText(req.body, ['location', 'facilitator']);
+  // Checked here: a value the database refuses would put the whole entry in its error message.
+  const type = checked(() => entryTypeOf(entryType, 'entryType'));
+  const participantCount = checked(() => participantsOf(participants));
+  const conductedOn = checked(() => dateOf(dateConducted, 'dateConducted'));
   await assertAssessmentInProject(req.params.id, assessmentId);
+
+  // Typed notes are stored without phone numbers, ID numbers or email addresses (CLAUDE.md rule 5).
+  const { values: text, counts } = redactQualitativeFields({ title, content, location, facilitator });
 
   const entry = await prisma.qualitativeEntry.create({
     data: {
       projectId: req.params.id,
-      entryType,
-      title,
-      content,
-      participants,
-      location,
-      dateConducted: dateConducted ? new Date(dateConducted) : undefined,
-      facilitator,
+      entryType: type,
+      title: text.title,
+      content: text.content,
+      participants: participantCount,
+      location: text.location,
+      dateConducted: conductedOn,
+      facilitator: text.facilitator,
       assessmentId,
       attachments,
     },
   });
+  // Ids and counts only: never the text.
+  if (redactionTotal(counts) > 0) console.log(`[Qualitative] Entry ${entry.id}: ${describeRedactions(counts)}`);
 
   // Auto-trigger AI thematic coding after creation
   codeQualitativeEntry(entry.id, req.params.id).catch(err => {
     console.error(`Auto-coding qualitative entry ${entry.id} failed: ${safeErrorSummary(err)}`);
   });
 
-  res.status(201).json(entry);
+  res.status(201).json({ ...entry, redactions: counts });
 }));
 
 // POST /api/projects/:id/qualitative/upload — Upload document (transcript/notes) and create qualitative entry
@@ -68,11 +103,17 @@ router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documen
   const file = req.file;
   if (!file) throw new AppError(400, 'No file uploaded');
   assertFileContent(file);
+  // A repeated form field arrives as a list: refuse it before the file is stored.
+  assertOptionalText(req.body, ['title', 'location', 'facilitator']);
+  // Checked before the file is stored: the entry is created after parsing, when the request has been answered.
+  const type = checked(() => entryTypeOf(req.body.entryType, 'entryType', 'fgd_transcript'));
+  const participantCount = checked(() => participantsOf(req.body.participants));
+  const conductedOn = checked(() => dateOf(req.body.dateConducted, 'dateConducted'));
 
   const key = buildDocumentKey(req.params.id, file.originalname);
   await getStorage().put(key, file.buffer, file.mimetype);
 
-  const { entryType, title, participants, location, dateConducted, facilitator } = req.body;
+  const { title, location, facilitator } = req.body;
 
   // 1. A document record for the transcript. qualitativeSource: it is coded with its qualitative entry
   // only, and never sent to document analysis, framework generation or assessment summaries.
@@ -98,17 +139,20 @@ router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documen
     // as just extracted and redacted: there is no appended AI analysis to cut off.
     const parsedDoc = await prisma.document.findUnique({ where: { id: document.id }, select: { parsedText: true } });
     const content = parsedDoc?.parsedText?.trim() ? parsedDoc.parsedText : `[Content from uploaded file: ${safeFileName}]`;
+    // The typed title, location and facilitator are redacted like typed notes; the content again, which
+    // changes nothing in text the parser already redacted.
+    const { values: text, counts } = redactQualitativeFields({ title: title || `Transcript: ${safeFileName}`, content, location, facilitator });
 
     const entry = await prisma.qualitativeEntry.create({
       data: {
         projectId: req.params.id,
-        entryType: entryType || 'fgd_transcript',
-        title: title || `Transcript: ${safeFileName}`,
-        content,
-        participants: participants ? parseInt(participants) : undefined,
-        location,
-        dateConducted: dateConducted ? new Date(dateConducted) : undefined,
-        facilitator,
+        entryType: type,
+        title: text.title,
+        content: text.content,
+        participants: participantCount,
+        location: text.location,
+        dateConducted: conductedOn,
+        facilitator: text.facilitator,
         attachments: [{ documentId: document.id, fileName: file.originalname }],
       },
     });
@@ -118,8 +162,9 @@ router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documen
       console.error(`Qualitative coding after upload failed for entry ${entry.id}: ${safeErrorSummary(err)}`);
     });
 
-    // Log ids only: file names can hold personal data.
-    console.log(`[Qualitative] Created entry ${entry.id} from uploaded document ${document.id}`);
+    // Log ids and counts only: file names can hold personal data.
+    const removed = redactionTotal(counts) > 0 ? ` (${describeRedactions(counts)})` : '';
+    console.log(`[Qualitative] Created entry ${entry.id} from uploaded document ${document.id}${removed}`);
   }).catch(err => {
     console.error(`Document parsing for qualitative failed for document ${document.id}: ${safeErrorSummary(err)}`);
   });

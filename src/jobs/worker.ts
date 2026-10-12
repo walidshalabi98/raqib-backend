@@ -1,4 +1,6 @@
 import { Worker, Job } from 'bullmq';
+import { env } from '../config/env';
+import { prisma } from '../config/prisma';
 import { redis } from '../config/redis';
 import { parseDocument } from '../services/ai/documentParser';
 import { generateFramework } from '../services/ai/frameworkGenerator';
@@ -7,8 +9,8 @@ import { generateReportNarrative } from '../services/ai/reportNarrative';
 import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
 import { loadSharedSystemPrompt } from '../services/ai/prompts/system';
 import { safeErrorSummary } from '../services/ai/errors';
-
-import '../config/env'; // ensure env is loaded
+import { MAINTENANCE_QUEUE, PRUNE_AI_CALLS_SCHEDULE, runMaintenanceJob, scheduleAiCallPruning } from '../services/maintenance/aiCallRetention';
+import { getMaintenanceQueue } from './queues';
 
 console.log('[Worker] Starting RAQIB job workers...');
 
@@ -86,6 +88,20 @@ qualitativeWorker.on('failed', (job, err) => {
   console.error(`[Worker] Qualitative coding failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
 
+// Maintenance Worker: the nightly AiCall retention job (AI_CALL_RETENTION_MONTHS, default 24)
+const maintenanceWorker = new Worker(MAINTENANCE_QUEUE, async (job: Job) => {
+  return runMaintenanceJob(job, { prisma, months: env.aiCallRetentionMonths });
+}, { connection: redis, concurrency: 1 });
+
+maintenanceWorker.on('failed', (job, err) => {
+  console.error(`[Worker] Maintenance job ${job?.name} failed: ${job?.id}: ${safeErrorSummary(err)}`);
+});
+
+// Registered at every start; the fixed scheduler id keeps it to one schedule.
+scheduleAiCallPruning(getMaintenanceQueue())
+  .then(() => console.log(`[Worker] AiCall retention: ${env.aiCallRetentionMonths} months, pruned on "${PRUNE_AI_CALLS_SCHEDULE.pattern}" (${PRUNE_AI_CALLS_SCHEDULE.tz})`))
+  .catch(err => console.error(`[Worker] Scheduling the AiCall retention job failed: ${safeErrorSummary(err)}`));
+
 // Graceful shutdown
 async function shutdown() {
   console.log('[Worker] Shutting down workers...');
@@ -95,6 +111,8 @@ async function shutdown() {
     indicatorWorker.close(),
     reportWorker.close(),
     qualitativeWorker.close(),
+    maintenanceWorker.close(),
+    getMaintenanceQueue().close(), // the shared Redis connection stays open
   ]);
   process.exit(0);
 }

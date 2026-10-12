@@ -7,6 +7,7 @@ import { assertDocumentAccess, assertProjectAccess } from '../middleware/access'
 import { assertFileContent, documentUpload } from '../middleware/upload';
 import { buildDocumentKey, getStorage, SIGNED_URL_TTL_SECONDS } from '../services/storage';
 import { parseDocument } from '../services/ai/documentParser';
+import { safeErrorSummary } from '../services/ai/errors';
 
 const router = Router();
 
@@ -106,7 +107,7 @@ router.delete('/documents/:id', authenticate, asyncHandler(async (req: Request, 
 
   await prisma.document.delete({ where: { id: doc.id } });
   await getStorage().remove(doc.fileUrl).catch(err => {
-    console.error(`[Documents] Could not delete stored file for ${doc.id}:`, err.message);
+    console.error(`[Documents] Could not delete stored file for ${doc.id}: ${safeErrorSummary(err)}`);
   });
   res.json({ message: 'Document deleted' });
 }));

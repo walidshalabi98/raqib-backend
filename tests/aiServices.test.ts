@@ -20,6 +20,7 @@ import { checkNarrativeFigures, generateReportHtml, narrativeAllowedFigures } fr
 import { AtRiskIndicator, fallbackRiskAlert, mergeRiskAnswer, riskAllowedFigures } from '../src/services/ai/riskAnalyzer';
 import {
   assessmentFailureMessage,
+  assessmentTypeLabel,
   checkAssessmentFigures,
   cutAtWord,
   documentSummaryFor,
@@ -786,5 +787,20 @@ describe('HTML builders escape every interpolated value', () => {
     expect(html).toContain('<h2>Next Steps</h2><ol><li>Collect endline data</li></ol>');
     expect(html).toContain('AI suggested — review before approval');
     expect(html).toContain('content="Raqib AI assessment (assessment-report-v2; claude-sonnet-5-5)"');
+  });
+});
+
+describe('assessmentTypeLabel', () => {
+  it.each([
+    ['baseline', 'Baseline'],
+    ['midterm', 'Midterm'],
+    ['endline', 'Endline'],
+    ['fgd_round', 'FGD round'],
+    ['kii_round', 'KII round'],
+    ['observation_round', 'Observation round'],
+    ['survey_round', 'Survey round'],
+    ['post_distribution_monitoring', 'Post distribution monitoring'],
+  ])('%s reads as "%s"', (type, label) => {
+    expect(assessmentTypeLabel(type)).toBe(label);
   });
 });

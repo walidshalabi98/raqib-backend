@@ -102,6 +102,73 @@ describe.skipIf(!hasTestDatabase)('qualitative transcript upload', () => {
     expect(listed).not.toHaveProperty('parsedText');
   });
 
+  it('redacts the typed title, location and facilitator before the entry is stored, and logs ids and counts only', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const res = await request(app)
+      .post(`/api/projects/${a.project.id}/qualitative/upload`)
+      .set('Authorization', a.officerAuth)
+      .field('entryType', 'kii_notes')
+      .field('title', 'KII Yatta مع المنسقة ٠٥٦٩٨٧٦٥٤٣')
+      .field('location', 'Yatta, ID 401234567')
+      .field('facilitator', 'someone@example.org')
+      .attach('file', TRANSCRIPT, { filename: 'kii-yatta.pdf', contentType: 'application/pdf' });
+    expect(res.status).toBe(202);
+
+    const entry = await waitFor(() => entryFor(res.body.documentId));
+    expect(entry).toMatchObject({
+      entryType: 'kii_notes',
+      title: `KII Yatta مع المنسقة ${P}`,
+      location: `Yatta, ID ${I}`,
+      facilitator: REDACTION_PLACEHOLDERS.email,
+    });
+    // The content is the parser's redacted text, unchanged by redacting it again.
+    const document = await prisma.document.findUniqueOrThrow({ where: { id: res.body.documentId } });
+    expect(entry.content).toBe(document.parsedText);
+
+    await waitFor(async () => vi.mocked(console.log).mock.calls.some(c => String(c[0]).includes(`Created entry ${entry.id}`)) || null);
+    const lines = vi.mocked(console.log).mock.calls.map(c => c.map(String).join(' '));
+    expect(lines).toContain(
+      `[Qualitative] Created entry ${entry.id} from uploaded document ${document.id} (removed 1 phone numbers, 1 ID numbers, 1 email addresses)`,
+    );
+    for (const value of ['٠٥٦٩٨٧٦٥٤٣', '401234567', 'someone@example.org', 'Yatta', 'kii-yatta', 'المنسقة']) {
+      expect(lines.join('\n')).not.toContain(value);
+    }
+  });
+
+  it('refuses a repeated title, location or facilitator field before storing the file', async () => {
+    const before = await prisma.document.count({ where: { projectId: a.project.id } });
+    for (const field of ['title', 'location', 'facilitator']) {
+      const res = await request(app)
+        .post(`/api/projects/${a.project.id}/qualitative/upload`)
+        .set('Authorization', a.officerAuth)
+        .field(field, 'One')
+        .field(field, 'Two 0599123456')
+        .attach('file', TRANSCRIPT, { filename: 'fgd.pdf', contentType: 'application/pdf' });
+      expect(res.status).toBe(400);
+      expect(res.body.message).toBe(`${field} must be text`);
+    }
+    expect(await prisma.document.count({ where: { projectId: a.project.id } })).toBe(before);
+  });
+
+  it('refuses an unknown entry type, participants or date before storing the file', async () => {
+    const before = await prisma.document.count({ where: { projectId: a.project.id } });
+    const cases: [string, string, string][] = [
+      ['entryType', 'interview', 'entryType must be one of:'],
+      ['participants', 'twelve', 'participants must be a whole number from 0 to 100000'],
+      ['dateConducted', 'last week', 'dateConducted must be a date'],
+    ];
+    for (const [field, value, message] of cases) {
+      const res = await request(app)
+        .post(`/api/projects/${a.project.id}/qualitative/upload`)
+        .set('Authorization', a.officerAuth)
+        .field(field, value)
+        .attach('file', TRANSCRIPT, { filename: 'fgd.pdf', contentType: 'application/pdf' });
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain(message);
+    }
+    expect(await prisma.document.count({ where: { projectId: a.project.id } })).toBe(before);
+  });
+
   it('creates no entry when the file cannot be parsed', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     vi.spyOn(console, 'error').mockImplementation(() => undefined);

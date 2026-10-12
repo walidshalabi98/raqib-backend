@@ -160,6 +160,92 @@ describe.skipIf(!hasTestDatabase)('webhook authentication', () => {
     expect(good.status).toBe(200);
   });
 
+  it('stores KoboToolbox qualitative entries without phone numbers, ID numbers or email addresses, and logs ids and counts only', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const res = await request(app)
+        .post('/api/webhooks/kobotoolbox')
+        .set('X-Raqib-Webhook-Token', tokenA)
+        .send({
+          _project_id: a.project.id,
+          _type: 'qualitative',
+          _id: 312345678,
+          _submission_time: '2026-05-05T09:00:00Z',
+          _geolocation: [31.5326, 35.0998],
+          entry_type: 'kii_notes',
+          title: 'KII Dura 0599123456',
+          notes: 'The respondent (ID 401234567) asked for a reply to someone@example.org.',
+          notes_ar: 'قالت المستفيدة إن رقم هاتفها ٠٥٦٩٨٧٦٥٤٣ ورقم هويتها ٤٠١٢٣٤٥٦٧.',
+          households: '1200',
+        });
+      expect(res.status).toBe(200);
+
+      const entry = await prisma.qualitativeEntry.findFirstOrThrow({ where: { projectId: a.project.id, entryType: 'kii_notes' } });
+      expect(entry.title).toBe('KII Dura [phone removed]');
+      expect(entry.location).toBe('31.5326, 35.0998');
+      expect(entry.content).toContain('"notes":"The respondent (ID [ID number removed]) asked for a reply to [email removed]."');
+      expect(entry.content).toContain('"notes_ar":"قالت المستفيدة إن رقم هاتفها [phone removed] ورقم هويتها [ID number removed]."');
+      expect(entry.content).toContain('"title":"KII Dura [phone removed]"');
+      expect(entry.content).toContain('"households":"1200"');
+      expect(entry.content).toContain('"_submission_time":"2026-05-05T09:00:00Z"');
+      // The submission is redacted as text: a 9-digit submission id inside it goes too.
+      expect(entry.content).toContain('"_id":[ID number removed]');
+      for (const value of ['0599123456', '401234567', 'someone@example.org', '٠٥٦٩٨٧٦٥٤٣', '٤٠١٢٣٤٥٦٧', '312345678']) {
+        expect(JSON.stringify(entry)).not.toContain(value);
+      }
+
+      // Summed over the fields: the title's phone number is counted in the title and in the content.
+      expect(log.mock.calls).toEqual([[`[Webhook] KoboToolbox qualitative entry ${entry.id}: removed 3 phone numbers, 3 ID numbers, 1 email addresses`]]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('keeps the KoboToolbox submission id in the fallback title of a qualitative entry', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const res = await request(app)
+        .post('/api/webhooks/kobotoolbox')
+        .set('X-Raqib-Webhook-Token', tokenA)
+        .send({ _project_id: a.project.id, _type: 'qualitative', _id: 312345679, entry_type: 'msc_story', story: 'Water trucking resumed.' });
+      expect(res.status).toBe(200);
+      const entry = await prisma.qualitativeEntry.findFirstOrThrow({ where: { projectId: a.project.id, entryType: 'msc_story' } });
+      expect(entry.title).toBe('KoboToolbox Submission 312345679');
+      expect(entry.location).toBeNull();
+      expect(entry.content).toContain('"story":"Water trucking resumed."');
+      // Only the submission id was removed from the content; it is logged as a count with the entry id.
+      expect(log.mock.calls).toEqual([[`[Webhook] KoboToolbox qualitative entry ${entry.id}: removed 0 phone numbers, 1 ID numbers, 0 email addresses`]]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('refuses an unknown entry type or date before saving, without the submission in any log line', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const before = await prisma.qualitativeEntry.count({ where: { projectId: a.project.id } });
+      const cases: [Record<string, unknown>, string][] = [
+        [{ entry_type: 'kii' }, 'entry_type must be one of:'],
+        [{ _submission_time: 'yesterday' }, '_submission_time must be a date'],
+      ];
+      for (const [override, message] of cases) {
+        const res = await request(app)
+          .post('/api/webhooks/kobotoolbox')
+          .set('X-Raqib-Webhook-Token', tokenA)
+          .send({ _project_id: a.project.id, _type: 'qualitative', title: 'KII with Fatima Ahmad Saleh', notes: 'Fatima Ahmad Saleh said the distribution was late', ...override });
+        expect(res.status).toBe(400);
+        expect(res.body.message).toContain(message);
+      }
+      expect(await prisma.qualitativeEntry.count({ where: { projectId: a.project.id } })).toBe(before);
+      const logged = [...error.mock.calls, ...log.mock.calls].map(args => args.map(String).join(' ')).join('\n');
+      expect(logged).not.toContain('Fatima');
+    } finally {
+      error.mockRestore();
+      log.mockRestore();
+    }
+  });
+
   it('rejects a revoked token', async () => {
     const created = await request(app).post(`/api/organizations/${a.org.id}/webhook-tokens`).set('Authorization', a.adminAuth);
     const revoke = await request(app)
