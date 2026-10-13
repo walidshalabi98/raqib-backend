@@ -150,7 +150,7 @@ describe('role matrix', () => {
     const decided = Object.keys(ROLE_MATRIX).sort();
     expect(registered.filter(k => !(k in ROLE_MATRIX))).toEqual([]);
     expect(decided.filter(k => !byKey.has(k))).toEqual([]);
-    expect(registered).toHaveLength(81);
+    expect(registered).toHaveLength(83);
   });
 
   it.each(Object.entries(ROLE_MATRIX))('%s matches its entry exactly', (key, access) => {
