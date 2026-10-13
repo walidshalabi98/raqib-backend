@@ -11,6 +11,7 @@ import {
   replacePasswordHash,
   verifySignIn,
 } from '../services/auth/passwords';
+import { findUserByEmail } from '../services/auth/accounts';
 import {
   generateAccessToken,
   generateRefreshToken,
@@ -20,6 +21,7 @@ import {
   verifyResetToken,
 } from '../utils/tokens';
 import { sendPasswordResetEmail } from '../utils/email';
+import { normalizeEmail } from '../utils/emailAddress';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
@@ -64,12 +66,9 @@ function sessionTokens(user: Pick<User, 'id' | 'email' | 'organizationId' | 'rol
 router.post('/login', authLimiters.signIn, asyncHandler(async (req: Request, res: Response) => {
   const email = bodyString(req.body, 'email');
   const password = bodyString(req.body, 'password');
-  if (!email || !password) throw new AppError(400, 'Email and password are required');
+  if (!email || !normalizeEmail(email) || !password) throw new AppError(400, 'Email and password are required');
 
-  const found = await prisma.user.findUnique({
-    where: { email },
-    include: { organization: true },
-  });
+  const found = await findUserByEmail(email);
   const user = await verifySignIn(found, password);
   if (!user) throw new AppError(401, 'Invalid email or password');
 
@@ -116,10 +115,10 @@ router.post(
   authLimiters.passwordReset,
   authLimiters.forgotPasswordPerEmail,
   asyncHandler(async (req: Request, res: Response) => {
-    const email = bodyString(req.body, 'email')?.trim();
-    if (!email) throw new AppError(400, 'Email is required');
+    const email = bodyString(req.body, 'email');
+    if (!email || !normalizeEmail(email)) throw new AppError(400, 'Email is required');
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await findUserByEmail(email);
     if (user) {
       // Not awaited, so the answer takes as long for an unknown address. sendPasswordResetEmail never throws and,
       // without email, sends nothing and logs one line with the user id only.

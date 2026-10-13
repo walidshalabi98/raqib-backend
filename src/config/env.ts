@@ -27,6 +27,16 @@ const EMAIL_ADDRESS = /[^\s@<>",;]+@[^\s@<>",;.]+(?:\.[^\s@<>",;.]+)*\.[A-Za-z]{
 /** "address@domain" or "Display Name <address@domain>", on one line, without quotes or angle brackets in the name. */
 const EMAIL_SENDER = new RegExp(`^(?:${EMAIL_ADDRESS}|[^<>"\\r\\n]{1,100} <${EMAIL_ADDRESS}>)$`);
 
+/** A redis:// or rediss:// URL with a host, as ioredis will parse it (WHATWG URL). */
+function isRedisUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'redis:' || url.protocol === 'rediss:') && url.hostname !== '';
+  } catch {
+    return false;
+  }
+}
+
 /** An optional setting: unset or blank uses the default (so `NAME=` in .env behaves like a missing line). */
 function withDefault<T extends z.ZodTypeAny>(schema: T, fallback: z.input<T>) {
   return z.preprocess(v => (typeof v === 'string' ? (v.trim() === '' ? undefined : v.trim()) : v), schema.default(fallback));
@@ -70,7 +80,12 @@ const envSchema = z.object({
   // Local fallback directory for development when Supabase Storage is not configured.
   LOCAL_STORAGE_DIR: z.string().default('storage'),
 
-  REDIS_URL: z.string().default('redis://localhost:6379'),
+  // Holds the Redis password, so it is checked here, where a refusal names the setting but never repeats its value
+  // (ioredis would throw an error carrying the whole URL). Special characters in the password must be percent-encoded.
+  REDIS_URL: withDefault(
+    z.string().refine(isRedisUrl, 'must be a redis:// or rediss:// URL with a host (percent-encode special characters in the password)'),
+    'redis://localhost:6379',
+  ),
   // Without a Resend key no email is sent (docs/SECURITY_SETUP.md §9).
   RESEND_API_KEY: optionalString,
   EMAIL_FROM: withDefault(

@@ -603,6 +603,77 @@ describe.skipIf(!hasTestDatabase)('passwords and sign-in', () => {
       expect(same.status).toBe(400);
       expect(same.body.code).toBe('password_same_as_current');
     });
+
+    it('finds the account whatever capitals and surrounding spaces the email is typed with', async () => {
+      await setPassword(a.officer, 'Officer-case-pw-1');
+      expect(a.officer.email).toBe('me-a@example.org');
+      expect((await login(' ME-A@Example.ORG ', 'Officer-case-pw-1')).status).toBe(200);
+      expect((await login('Me-A@example.org', 'Officer-case-pw-2')).status).toBe(401);
+    });
+  });
+
+  describe('email addresses are stored and looked up trimmed and lower-cased', () => {
+    const invite = (body: object) => request(app).post('/api/users/invite').set('Authorization', a.adminAuth).send(body);
+
+    it('an invite stores the address lower-cased, and the same address in other capitals is refused as existing', async () => {
+      const res = await invite({ email: '  Mixed.Case@Example.ORG ', fullName: 'Mixed case', role: 'me_officer' });
+      expect(res.status).toBe(201);
+      keep(res.body.temporaryPassword);
+      expect(res.body.email).toBe('mixed.case@example.org');
+      expect((await prisma.user.findUniqueOrThrow({ where: { id: res.body.id } })).email).toBe('mixed.case@example.org');
+      expect((await login('MIXED.CASE@example.org', res.body.temporaryPassword)).status).toBe(200);
+
+      const again = await invite({ email: 'mixed.CASE@example.org', fullName: 'Mixed case', role: 'me_officer' });
+      expect(again.status).toBe(409);
+      expect(await prisma.user.count({ where: { email: { equals: 'mixed.case@example.org', mode: 'insensitive' } } })).toBe(1);
+    });
+
+    it('forgot password finds the account when the address is typed in capitals', async () => {
+      const from = lines.length;
+      const res = await request(app).post('/api/auth/forgot-password').send({ email: ` ${a.officer.email.toUpperCase()} ` });
+      expect(res.status).toBe(200);
+      await vi.waitFor(() => expect(lines.slice(from)).toContain(`[Email] password reset not sent: email is not configured (user ${a.officer.id})`));
+    });
+
+    it('an account stored with capitals before this rule still signs in, gets a reset, and cannot be invited twice', async () => {
+      const legacy = await prisma.user.create({
+        data: { organizationId: a.org.id, email: 'Legacy.Mixed@Example.org', passwordHash: 'x', fullName: 'Legacy', role: 'me_officer' },
+      });
+      await setPassword(legacy, 'Legacy-mixed-pw-1');
+      expect((await login('Legacy.Mixed@Example.org', 'Legacy-mixed-pw-1')).status).toBe(200);
+      expect((await login('legacy.mixed@example.org', 'Legacy-mixed-pw-1')).status).toBe(200);
+
+      const from = lines.length;
+      expect((await request(app).post('/api/auth/forgot-password').send({ email: 'LEGACY.MIXED@example.org' })).status).toBe(200);
+      await vi.waitFor(() => expect(lines.slice(from)).toContain(`[Email] password reset not sent: email is not configured (user ${legacy.id})`));
+
+      const again = await invite({ email: 'legacy.mixed@example.org', fullName: 'Legacy', role: 'me_officer' });
+      expect(again.status).toBe(409);
+      expect(await prisma.user.count({ where: { email: { equals: 'legacy.mixed@example.org', mode: 'insensitive' } } })).toBe(1);
+    });
+
+    it('two old accounts differing only in capitals: the exact address wins, else the lower-cased one', async () => {
+      const upper = await prisma.user.create({
+        data: { organizationId: a.org.id, email: 'Twin@example.org', passwordHash: 'x', fullName: 'Twin upper', role: 'me_officer' },
+      });
+      const lower = await prisma.user.create({
+        data: { organizationId: a.org.id, email: 'twin@example.org', passwordHash: 'x', fullName: 'Twin lower', role: 'me_officer' },
+      });
+      await setPassword(upper, 'Twin-upper-pw-1');
+      await setPassword(lower, 'Twin-lower-pw-1');
+
+      const signedIn = async (email: string, password: string) => (await login(email, password)).body.user?.id;
+      expect(await signedIn('Twin@example.org', 'Twin-upper-pw-1')).toBe(upper.id);
+      expect(await signedIn(' twin@example.org ', 'Twin-lower-pw-1')).toBe(lower.id);
+      expect(await signedIn('TWIN@EXAMPLE.ORG', 'Twin-lower-pw-1')).toBe(lower.id);
+      expect((await login('TWIN@EXAMPLE.ORG', 'Twin-upper-pw-1')).status).toBe(401);
+    });
+
+    it('an email of spaces only is refused like a missing one', async () => {
+      expect((await login('   ', 'Officer-case-pw-1')).status).toBe(400);
+      expect((await request(app).post('/api/auth/forgot-password').send({ email: '   ' })).status).toBe(400);
+      expect((await invite({ email: '   ', fullName: 'Nobody', role: 'me_officer' })).status).toBe(400);
+    });
   });
 
   describe('platform admins are managed by platform admins only (SR-5)', () => {

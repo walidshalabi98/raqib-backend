@@ -194,3 +194,34 @@ describe('AiCall retention setting', () => {
     expect(() => aiCallPruneSettings({ DATABASE_URL: ' ' })).toThrow(/DATABASE_URL is required/);
   });
 });
+
+describe('REDIS_URL', () => {
+  // Made-up password: the refusal must never repeat it, since ioredis would print the whole URL.
+  const PASSWORD = 'not-a-real-redis-password';
+
+  it('defaults for unset or blank values and trims a configured URL', () => {
+    expect(parseEnv(valid).redisUrl).toBe('redis://localhost:6379');
+    expect(parseEnv({ ...valid, REDIS_URL: '  ' }).redisUrl).toBe('redis://localhost:6379');
+    const url = `redis://default:${PASSWORD}@redis.railway.internal:6379`;
+    expect(parseEnv({ ...valid, REDIS_URL: ` ${url} ` }).redisUrl).toBe(url);
+    expect(parseEnv({ ...valid, REDIS_URL: 'rediss://default:a%2Fb%40c@cache.example.org:6380' }).redisUrl)
+      .toBe('rediss://default:a%2Fb%40c@cache.example.org:6380');
+  });
+
+  it.each([
+    ['a password with an unencoded /', `redis://default:${PASSWORD}/x@redis.railway.internal:6379`],
+    ['a password with an unencoded #', `redis://default:${PASSWORD}#x@redis.railway.internal:6379`],
+    ['an empty host', `redis://default:${PASSWORD}@:6379`],
+    ['another scheme', `http://default:${PASSWORD}@redis.railway.internal:6379`],
+    ['no scheme', `default:${PASSWORD}@redis.railway.internal:6379`],
+  ])('refuses %s, naming the setting without repeating its value', (_case, value) => {
+    let message = '';
+    try {
+      parseEnv({ ...valid, REDIS_URL: value });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/REDIS_URL: must be a redis:\/\/ or rediss:\/\/ URL with a host/);
+    expect(message).not.toContain(PASSWORD);
+  });
+});
