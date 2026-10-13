@@ -4,6 +4,7 @@ import { prisma } from '../config/prisma';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { issueTemporaryPassword } from '../services/auth/passwords';
+import { emailMatches } from '../services/auth/accounts';
 import { sendAdminResetEmail, sendInviteEmail } from '../utils/email';
 import { normalizeEmail } from '../utils/emailAddress';
 
@@ -65,7 +66,7 @@ router.post('/invite', authenticate, authorize('org_admin', 'platform_admin'), a
   if (!(Object.values(UserRole) as string[]).includes(role)) throw new AppError(400, 'Unknown role');
   assertAssignableRole(req, role);
 
-  const existing = await prisma.user.findUnique({ where: { email } });
+  const existing = await prisma.user.findFirst({ where: { email: emailMatches(email) }, select: { id: true } });
   if (existing) throw new AppError(409, 'A user with this email already exists');
 
   const org = await prisma.organization.findUniqueOrThrow({ where: { id: req.user!.organizationId } });
