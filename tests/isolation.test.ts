@@ -81,6 +81,8 @@ const ROUTES: RouteCase[] = [
   },
   { method: 'get', route: '/api/reports/:id', path: b => `/api/reports/${b.report.id}` },
   { method: 'get', route: '/api/reports/:id/status', path: b => `/api/reports/${b.report.id}/status` },
+  { method: 'patch', route: '/api/reports/:id/publish', path: b => `/api/reports/${b.report.id}/publish` },
+  { method: 'patch', route: '/api/reports/:id/unpublish', path: b => `/api/reports/${b.report.id}/unpublish` },
   // Dashboard and exports
   { method: 'get', route: '/api/dashboard/projects/:id/dashboard', path: b => `/api/dashboard/projects/${b.project.id}/dashboard` },
   { method: 'get', route: '/api/dashboard/projects/:id/risks', path: b => `/api/dashboard/projects/${b.project.id}/risks` },
@@ -194,6 +196,7 @@ describe.skipIf(!hasTestDatabase)('organisation isolation', () => {
     expect(await prisma.framework.count({ where: { projectId: b.project.id } })).toBe(1);
     expect(await prisma.qualitativeEntry.count({ where: { projectId: b.project.id } })).toBe(1);
     expect(await prisma.report.count({ where: { projectId: b.project.id } })).toBe(1);
+    expect((await prisma.report.findUniqueOrThrow({ where: { id: b.report.id } })).status).toBe('draft');
     expect(await prisma.assessment.count({ where: { projectId: b.project.id } })).toBe(1);
     expect(await prisma.beneficiary.count({ where: { projectId: b.project.id } })).toBe(1);
     expect(await prisma.document.count({ where: { projectId: b.project.id } })).toBe(1);

@@ -1,13 +1,15 @@
 import { Router, Request, Response } from 'express';
 import { DocumentType, Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
-import { authenticate } from '../middleware/auth';
+import { authenticate, authorize } from '../middleware/auth';
+import { hasStaffRole, STAFF_ROLES } from '../middleware/roles';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { assertDocumentAccess, assertProjectAccess } from '../middleware/access';
 import { assertFileContent, documentUpload } from '../middleware/upload';
 import { buildDocumentKey, getStorage, SIGNED_URL_TTL_SECONDS } from '../services/storage';
 import { parseDocument } from '../services/ai/documentParser';
 import { safeErrorSummary } from '../services/ai/errors';
+import { donorCanSeeDocument, donorDocumentWhere, toDonorDocument } from '../services/privacy/donorView';
 
 const router = Router();
 
@@ -45,19 +47,22 @@ export async function withTextLength<T extends { id: string }>(documents: T[]): 
 
 // GET /api/projects/:id/documents — display fields, textLength and aiAnalysis (Document.aiAnalysis, or null).
 // Transcripts uploaded through the qualitative upload (qualitativeSource: true) are listed but never analysed.
+// Donor viewers (any role without staff rights) see donor-facing document types only, without the AI analysis
+// or the uploader's name (SECURITY_SETUP §8.3).
 router.get('/projects/:id/documents', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
-  const documents = await prisma.document.findMany({
-    where: { projectId: req.params.id },
+  const documents = await withTextLength(await prisma.document.findMany({
+    where: { projectId: req.params.id, ...donorDocumentWhere(req.user) },
     select: DOCUMENT_FIELDS,
     orderBy: { uploadedAt: 'desc' },
-  });
-  res.json(await withTextLength(documents));
+  }));
+  // Donor viewers: no AI analysis (not reviewed) and no uploader names.
+  res.json(hasStaffRole(req.user) ? documents : documents.map(toDonorDocument));
 }));
 
-// POST /api/projects/:id/documents — Upload document to private storage
-router.post('/projects/:id/documents', authenticate, documentUpload.single('file'), asyncHandler(async (req: Request, res: Response) => {
+// POST /api/projects/:id/documents — Upload document to private storage (staff only; refused before the file is read)
+router.post('/projects/:id/documents', authenticate, authorize(...STAFF_ROLES), documentUpload.single('file'), asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
   if (!req.file) throw new AppError(400, 'File is required');
   assertFileContent(req.file);
@@ -89,9 +94,11 @@ router.post('/projects/:id/documents', authenticate, documentUpload.single('file
   res.status(201).json({ ...document, textLength: 0 });
 }));
 
-// GET /api/documents/:id/download — Short-lived signed URL, after an organisation check
+// GET /api/documents/:id/download — Short-lived signed URL, after an organisation check.
+// Documents hidden from donor viewers answer 404, like another organisation's id, so types cannot be probed.
 router.get('/documents/:id/download', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const doc = await assertDocumentAccess(req, req.params.id);
+  if (!hasStaffRole(req.user) && !donorCanSeeDocument(doc)) throw new AppError(404, 'Document not found');
 
   const url = await getStorage().signedUrl(doc.fileUrl, SIGNED_URL_TTL_SECONDS, doc.fileName);
   res.json({
@@ -101,8 +108,8 @@ router.get('/documents/:id/download', authenticate, asyncHandler(async (req: Req
   });
 }));
 
-// DELETE /api/documents/:id
-router.delete('/documents/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
+// DELETE /api/documents/:id (staff only)
+router.delete('/documents/:id', authenticate, authorize(...STAFF_ROLES), asyncHandler(async (req: Request, res: Response) => {
   const doc = await assertDocumentAccess(req, req.params.id);
 
   await prisma.document.delete({ where: { id: doc.id } });
@@ -115,6 +122,7 @@ router.delete('/documents/:id', authenticate, asyncHandler(async (req: Request, 
 // GET /api/documents/:id/status
 router.get('/documents/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const doc = await assertDocumentAccess(req, req.params.id);
+  if (!hasStaffRole(req.user) && !donorCanSeeDocument(doc)) throw new AppError(404, 'Document not found');
   res.json({ id: doc.id, parsingStatus: doc.parsingStatus });
 }));
 

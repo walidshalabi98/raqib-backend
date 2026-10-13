@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
-import { authenticate } from '../middleware/auth';
+import { authenticate, authorize } from '../middleware/auth';
+import { hasStaffRole, STAFF_ROLES } from '../middleware/roles';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { assertAssessmentInProject, assertProjectAccess, assertQualitativeAccess } from '../middleware/access';
 import { aiLimiter } from '../middleware/rateLimit';
@@ -12,6 +13,7 @@ import { safeErrorSummary } from '../services/ai/errors';
 import { redactPersonalData } from '../services/ai/redact';
 import { describeRedactions, redactQualitativeFields, redactionTotal } from '../services/qualitative/redactEntry';
 import { dateOf, EntryFieldError, entryTypeOf, participantsOf } from '../services/qualitative/entryFields';
+import { toDonorQualitativeEntry } from '../services/privacy/donorView';
 
 const router = Router();
 
@@ -35,7 +37,8 @@ function checked<T>(check: () => T): T {
   }
 }
 
-// GET /api/projects/:id/qualitative
+// GET /api/projects/:id/qualitative — staff get full entries; donor viewers get type, month and participants only
+// (no title, content, facilitator, location, attachments, exact date or AI coding: SECURITY_SETUP §8.3).
 router.get('/projects/:id/qualitative', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
@@ -43,11 +46,11 @@ router.get('/projects/:id/qualitative', authenticate, asyncHandler(async (req: R
     where: { projectId: req.params.id },
     orderBy: { createdAt: 'desc' },
   });
-  res.json(entries);
+  res.json(hasStaffRole(req.user) ? entries : entries.map(toDonorQualitativeEntry));
 }));
 
-// POST /api/projects/:id/qualitative — Add entry
-router.post('/projects/:id/qualitative', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+// POST /api/projects/:id/qualitative — Add entry (staff only: write and AI coding)
+router.post('/projects/:id/qualitative', authenticate, authorize(...STAFF_ROLES), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
   const {
@@ -97,7 +100,8 @@ router.post('/projects/:id/qualitative', authenticate, aiLimiter, asyncHandler(a
 }));
 
 // POST /api/projects/:id/qualitative/upload — Upload document (transcript/notes) and create qualitative entry
-router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documentUpload.single('file'), asyncHandler(async (req: Request, res: Response) => {
+// (staff only: refused before the limiter counts it and before the file is read)
+router.post('/projects/:id/qualitative/upload', authenticate, authorize(...STAFF_ROLES), aiLimiter, documentUpload.single('file'), asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
   const file = req.file;
@@ -176,15 +180,15 @@ router.post('/projects/:id/qualitative/upload', authenticate, aiLimiter, documen
   });
 }));
 
-// GET /api/qualitative/:id — Get full entry with themes
+// GET /api/qualitative/:id — Get full entry with themes (donor viewers: type, month and participants only)
 router.get('/qualitative/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const entry = await assertQualitativeAccess(req, req.params.id);
 
-  res.json(entry);
+  res.json(hasStaffRole(req.user) ? entry : toDonorQualitativeEntry(entry));
 }));
 
-// POST /api/qualitative/:id/code — Trigger AI thematic coding
-router.post('/qualitative/:id/code', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+// POST /api/qualitative/:id/code — Trigger AI thematic coding (staff only)
+router.post('/qualitative/:id/code', authenticate, authorize(...STAFF_ROLES), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
   const entry = await assertQualitativeAccess(req, req.params.id);
 
   // Thematic coding runs inline (no Redis/BullMQ needed)

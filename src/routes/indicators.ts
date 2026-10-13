@@ -4,6 +4,7 @@ import { assertIndicatorAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
+import { STAFF_ROLES } from '../middleware/roles';
 import { levelForResult } from '../services/indicators/hierarchy';
 import { assertIndicatorReferences } from '../services/indicators/references';
 import { INDICATOR_INCLUDE } from '../services/indicators/selects';
@@ -43,8 +44,8 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
   res.json(updated);
 }));
 
-// POST /api/indicators/:id/alternative — Request AI alternative
-router.post('/:id/alternative', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+// POST /api/indicators/:id/alternative — Request AI alternative (staff only: AI route)
+router.post('/:id/alternative', authenticate, authorize(...STAFF_ROLES), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
   await assertIndicatorAccess(req, req.params.id);
 
   // Generate alternative inline (no Redis/BullMQ needed)

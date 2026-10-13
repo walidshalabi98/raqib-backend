@@ -437,6 +437,29 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
       expect((await prisma.indicator.findUniqueOrThrow({ where: { id } })).currentValue).toBe('40');
     });
 
+    it('never makes a KoboToolbox answer (one household) the current value', async () => {
+      const id = await createIndicator(a, 'Average monthly household income', 'ILS');
+      // A later KoboToolbox submission, as the webhook stores it.
+      await prisma.dataPoint.create({
+        data: {
+          indicatorId: id, projectId: a.project.id, value: '2450', collectionDate: new Date('2026-10-05'), collectionMethod: 'hh_survey',
+          dataSource: 'KoboToolbox', createdBy: a.officer.id,
+        },
+      });
+      const bulk = await request(app)
+        .post(`/api/projects/${a.project.id}/data/bulk`)
+        .set('Authorization', a.officerAuth)
+        .send({ dataPoints: [{ ...VALID, indicatorId: id, value: '1340', collectionDate: '2026-09-30', collectionMethod: 'hh_survey' }] });
+      expect(bulk.status).toBe(201);
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id } })).currentValue).toBe('1340');
+
+      // A row typed with the KoboToolbox source is stored, but does not become the current value either.
+      const single = await request(app).post(`/api/indicators/${id}/data`).set('Authorization', a.officerAuth)
+        .send({ ...VALID, value: '980', collectionDate: '2026-10-06', collectionMethod: 'hh_survey', dataSource: 'kobotoolbox' });
+      expect(single.status).toBe(201);
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id } })).currentValue).toBe('1340');
+    });
+
     it('stores numeric values in canonical form', async () => {
       const res = await request(app)
         .post(`/api/projects/${a.project.id}/data/bulk`)

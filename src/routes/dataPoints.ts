@@ -3,11 +3,13 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { assertAssessmentInProject, assertIndicatorAccess, assertIndicatorsInProject, assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
+import { hasStaffRole } from '../middleware/roles';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { validationErrorBody } from '../services/dataPoints/fields';
 import {
   BulkRowFields, completeDataPoint, parseBulkRowFields, parseDataPointFields, rowLabel,
 } from '../services/dataPoints/validation';
+import { isRespondentLevel, NOT_RESPONDENT_LEVEL_WHERE, toDonorIndicatorData } from '../services/privacy/donorView';
 
 const router = Router();
 
@@ -20,9 +22,19 @@ router.get('/indicators/:id/data', authenticate, asyncHandler(async (req: Reques
     orderBy: { collectionDate: 'asc' },
     include: { creator: { select: { fullName: true } } },
   });
+  // Donor viewers (SECURITY_SETUP §8.3): no notes, attachments, author or unlisted areas; KoboToolbox rows (one
+  // respondent each) only as released monthly aggregates; the trend and count from what they are shown.
+  const staff = hasStaffRole(req.user);
+  const donor = staff ? null : toDonorIndicatorData(dataPoints, () => indicator.unit);
+  const series = donor
+    ? [
+      ...donor.dataPoints.map(dp => ({ at: dp.collectionDate.toISOString().slice(0, 7), value: dp.value })),
+      ...donor.surveyAggregates.filter(a => a.value !== null).map(a => ({ at: a.period, value: String(a.value) })),
+    ].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
+    : dataPoints.map(dp => ({ at: '', value: dp.value }));
 
   // Compute trend
-  const values = dataPoints
+  const values = series
     .map(dp => parseFloat(dp.value))
     .filter(v => !isNaN(v));
 
@@ -47,9 +59,9 @@ router.get('/indicators/:id/data', authenticate, asyncHandler(async (req: Reques
       unit: indicator.unit,
       disaggregation: indicator.disaggregation,
     },
-    dataPoints,
-    trend,
-    count: dataPoints.length,
+    ...(donor
+      ? { dataPoints: donor.dataPoints, surveyAggregates: donor.surveyAggregates, trend, count: donor.dataPoints.length }
+      : { dataPoints, trend, count: dataPoints.length }),
   });
 }));
 
@@ -87,11 +99,14 @@ router.post('/indicators/:id/data', authenticate, authorize('org_admin', 'platfo
     },
   });
 
-  // Update indicator's current value (numbers in the same canonical form as the data point)
-  await prisma.indicator.update({
-    where: { id: req.params.id },
-    data: { currentValue: dp.value },
-  });
+  // Update indicator's current value (numbers in the same canonical form as the data point), unless the row is
+  // a KoboToolbox answer: the current value is a result, never one household's answer (SECURITY_SETUP §8.3).
+  if (!isRespondentLevel(dataPoint)) {
+    await prisma.indicator.update({
+      where: { id: req.params.id },
+      data: { currentValue: dp.value },
+    });
+  }
 
   res.status(201).json(dataPoint);
 }));
@@ -167,10 +182,11 @@ router.post('/projects/:id/data/bulk', authenticate, authorize('org_admin', 'pla
 
   const created = await prisma.$transaction(async tx => {
     const result = await tx.dataPoint.createMany({ data });
-    // Each imported indicator's current value becomes its most recent data point (by collection date).
+    // Each imported indicator's current value becomes its most recent result (by collection date): never a
+    // KoboToolbox row, which is one household's answer (SECURITY_SETUP §8.3).
     for (const indicatorId of new Set(data.map(d => d.indicatorId))) {
       const latest = await tx.dataPoint.findFirst({
-        where: { indicatorId },
+        where: { indicatorId, ...NOT_RESPONDENT_LEVEL_WHERE },
         orderBy: [{ collectionDate: 'desc' }, { createdAt: 'desc' }],
         select: { value: true },
       });

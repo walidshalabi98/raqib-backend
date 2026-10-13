@@ -99,7 +99,12 @@ router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), as
   }
   if (id === req.user!.id) throw new AppError(400, 'Cannot deactivate yourself');
 
-  await prisma.user.delete({ where: { id } });
+  // The user's own notifications go with them (Notification.userId has no cascade): without this, a donor viewer
+  // told about a published report could never be removed, and would keep read access.
+  await prisma.$transaction([
+    prisma.notification.deleteMany({ where: { userId: id } }),
+    prisma.user.delete({ where: { id } }),
+  ]);
   res.json({ message: 'User deactivated' });
 }));
 

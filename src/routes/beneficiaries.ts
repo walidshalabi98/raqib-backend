@@ -1,13 +1,18 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertBeneficiaryAccess, assertIndicatorsInProject, assertProjectAccess } from '../middleware/access';
-import { authenticate } from '../middleware/auth';
+import { authenticate, authorize } from '../middleware/auth';
+import { hasStaffRole, STAFF_ROLES } from '../middleware/roles';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
+import { loadBeneficiaryAggregates, toDonorBeneficiarySummary } from '../services/beneficiaries/donorSummary';
 
 const router = Router();
 
+// Beneficiary records hold personal data: the list, detail and writes are for staff only. Donor viewers
+// get aggregated figures (small counts hidden, other counts rounded) from GET /projects/:id/beneficiaries/stats (SECURITY_SETUP §8.4).
+
 // GET /api/projects/:id/beneficiaries - List with filters
-router.get('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
+router.get('/projects/:id/beneficiaries', authenticate, authorize(...STAFF_ROLES), asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
   const { gender, ageGroup, status, governorate, search } = req.query;
@@ -48,7 +53,7 @@ router.get('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req:
 }));
 
 // POST /api/projects/:id/beneficiaries - Register new
-router.post('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
+router.post('/projects/:id/beneficiaries', authenticate, authorize(...STAFF_ROLES), asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
   const { fullName, fullNameAr, gender, age, ageGroup, location, governorate, phoneNumber, nationalId, householdSize, vulnerabilityTags } = req.body;
@@ -75,7 +80,7 @@ router.post('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req
 }));
 
 // GET /api/beneficiaries/:id - Get single with full service history
-router.get('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
+router.get('/beneficiaries/:id', authenticate, authorize(...STAFF_ROLES), asyncHandler(async (req: Request, res: Response) => {
   await assertBeneficiaryAccess(req, req.params.id);
   const beneficiary = await prisma.beneficiary.findUniqueOrThrow({
     where: { id: req.params.id },
@@ -91,7 +96,7 @@ router.get('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request,
 }));
 
 // PATCH /api/beneficiaries/:id - Update
-router.patch('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
+router.patch('/beneficiaries/:id', authenticate, authorize(...STAFF_ROLES), asyncHandler(async (req: Request, res: Response) => {
   await assertBeneficiaryAccess(req, req.params.id);
 
   const { fullName, fullNameAr, gender, age, ageGroup, location, governorate, phoneNumber, nationalId, householdSize, vulnerabilityTags, status } = req.body;
@@ -118,7 +123,7 @@ router.patch('/beneficiaries/:id', authenticate, asyncHandler(async (req: Reques
 }));
 
 // POST /api/beneficiaries/:id/services - Add service record
-router.post('/beneficiaries/:id/services', authenticate, asyncHandler(async (req: Request, res: Response) => {
+router.post('/beneficiaries/:id/services', authenticate, authorize(...STAFF_ROLES), asyncHandler(async (req: Request, res: Response) => {
   const beneficiary = await assertBeneficiaryAccess(req, req.params.id);
 
   const { serviceType, description, dateProvided, quantity, unit, indicatorId, notes } = req.body;
@@ -142,9 +147,14 @@ router.post('/beneficiaries/:id/services', authenticate, asyncHandler(async (req
   res.status(201).json(service);
 }));
 
-// GET /api/projects/:id/beneficiaries/stats - Aggregated stats for dashboard
+// GET /api/projects/:id/beneficiaries/stats - Aggregated stats for dashboard.
+// Staff: exact counts (audience 'staff'). Everyone else: the donor summary, small counts hidden and other counts rounded (audience 'donor').
 router.get('/projects/:id/beneficiaries/stats', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
+  if (!hasStaffRole(req.user)) {
+    res.json(toDonorBeneficiarySummary(await loadBeneficiaryAggregates(req.params.id)));
+    return;
+  }
 
   const [total, byGender, byAgeGroup, byGovernorate, byStatus, serviceCount] = await Promise.all([
     prisma.beneficiary.count({ where: { projectId: req.params.id } }),
@@ -155,7 +165,7 @@ router.get('/projects/:id/beneficiaries/stats', authenticate, asyncHandler(async
     prisma.beneficiaryService.count({ where: { projectId: req.params.id } }),
   ]);
 
-  res.json({ total, serviceCount, byGender, byAgeGroup, byGovernorate, byStatus });
+  res.json({ audience: 'staff', total, serviceCount, byGender, byAgeGroup, byGovernorate, byStatus });
 }));
 
 export default router;

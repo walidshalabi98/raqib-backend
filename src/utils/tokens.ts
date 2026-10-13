@@ -20,6 +20,7 @@ export function generateResetToken(userId: string): string {
 
 export function verifyResetToken(token: string): { id: string } {
   const payload = jwt.verify(token, env.jwtSecret) as { id: string; purpose: string };
-  if (payload.purpose !== 'reset') throw new Error('Invalid token purpose');
+  // A JsonWebTokenError, so the error handler answers 401 like any other invalid token.
+  if (payload.purpose !== 'reset') throw new jwt.JsonWebTokenError('Invalid token purpose');
   return { id: payload.id };
 }

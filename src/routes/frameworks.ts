@@ -9,19 +9,25 @@ import { resolveModel } from '../services/ai/client';
 import { generateFramework } from '../services/ai/frameworkGenerator';
 import { levelForResult, sortResultNodes } from '../services/indicators/hierarchy';
 import { assertIndicatorReferences } from '../services/indicators/references';
-import { INDICATOR_INCLUDE, INDICATOR_LIST_INCLUDE, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
+import { INDICATOR_INCLUDE, indicatorListInclude, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
 import { parseIndicatorCreate, toIndicatorCreateData } from '../services/indicators/validation';
 import { safeErrorSummary } from '../services/ai/errors';
+import { donorDataPointWhere } from '../services/privacy/donorView';
 
 const router = Router();
 
 const INDICATOR_ORDER = [{ sortOrder: 'asc' }, { createdAt: 'asc' }] satisfies Prisma.IndicatorOrderByWithRelationInput[];
 
-/** A framework with its result nodes (each with counts) and its indicators (each with its result and data point count). */
-const FRAMEWORK_DETAIL_INCLUDE = {
-  resultNodes: { include: RESULT_NODE_INCLUDE },
-  indicators: { orderBy: INDICATOR_ORDER, include: INDICATOR_LIST_INCLUDE },
-} satisfies Prisma.FrameworkInclude;
+/**
+ * A framework with its result nodes (each with counts) and its indicators (each with its result and the number
+ * of data points the user can see: donor viewers never count KoboToolbox rows, SECURITY_SETUP §8.3).
+ */
+function frameworkDetailInclude(user: Request['user']) {
+  return {
+    resultNodes: { include: RESULT_NODE_INCLUDE },
+    indicators: { orderBy: INDICATOR_ORDER, include: indicatorListInclude(donorDataPointWhere(user)) },
+  } satisfies Prisma.FrameworkInclude;
+}
 
 /**
  * The project's current framework: the newest version whose AI generation did not fail. A failed
@@ -50,7 +56,7 @@ router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Req
   const framework = await prisma.framework.findFirst({
     where: { projectId: req.params.id, ...CURRENT_FRAMEWORK },
     orderBy: { version: 'desc' },
-    include: FRAMEWORK_DETAIL_INCLUDE,
+    include: frameworkDetailInclude(req.user),
   });
 
   if (!framework) {
@@ -112,7 +118,7 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
   await assertFrameworkAccess(req, req.params.id);
   const framework = await prisma.framework.findUniqueOrThrow({
     where: { id: req.params.id },
-    include: FRAMEWORK_DETAIL_INCLUDE,
+    include: frameworkDetailInclude(req.user),
   });
 
   const hasIndicators = framework.indicators.length > 0;
@@ -151,7 +157,7 @@ router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'pl
         approvedAt: new Date(),
         approvedBy: req.user!.id,
       },
-      include: FRAMEWORK_DETAIL_INCLUDE,
+      include: frameworkDetailInclude(req.user),
     }),
     // Update project status
     prisma.project.update({
@@ -219,7 +225,7 @@ router.get('/frameworks/:id/indicators', authenticate, asyncHandler(async (req: 
   const indicators = await prisma.indicator.findMany({
     where: { frameworkId: req.params.id },
     orderBy: INDICATOR_ORDER,
-    include: INDICATOR_LIST_INCLUDE,
+    include: indicatorListInclude(donorDataPointWhere(req.user)),
   });
 
   res.json(indicators);
