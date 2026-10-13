@@ -10,7 +10,7 @@ import { formatIssues, parseDateInput, summariseErrors, validationErrorBody } fr
 import {
   completeDataPoint, normaliseValue, parseBulkRowFields, parseDataPointFields,
 } from '../src/services/dataPoints/validation';
-import { bearer, createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
+import { createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
 
 const VALID = { value: '218', collectionDate: '2026-04-01', collectionMethod: 'hh_survey' };
 
@@ -204,7 +204,6 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
 
   let unitlessPercentId: string;
   let unitlessArabicId: string;
-  let viewerAuth: string;
 
   beforeAll(async () => {
     await resetDatabase();
@@ -215,30 +214,26 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
     scoreId = await createIndicator(a, 'Average coping strategy score', 'score');
     unitlessPercentId = await createIndicator(a, 'Proportion of girls enrolled in secondary school', null);
     unitlessArabicId = await createIndicator(a, 'نسبة الأسر ذات درجة استهلاك غذائي مقبولة', null);
-    const viewer = await prisma.user.create({
-      data: { organizationId: a.org.id, email: 'viewer-data@example.org', passwordHash: 'x', fullName: 'Viewer', role: 'donor_viewer' },
-    });
-    viewerAuth = bearer(viewer);
   });
 
   it('lets donor viewers read data points but not record them (403)', async () => {
     const before = await prisma.dataPoint.count({ where: { projectId: a.project.id } });
-    const single = await request(app).post(`/api/indicators/${peopleId}/data`).set('Authorization', viewerAuth).send(VALID);
+    const single = await request(app).post(`/api/indicators/${peopleId}/data`).set('Authorization', a.donorAuth).send(VALID);
     expect(single.status).toBe(403);
     const bulk = await request(app)
       .post(`/api/projects/${a.project.id}/data/bulk`)
-      .set('Authorization', viewerAuth)
+      .set('Authorization', a.donorAuth)
       .send({ dataPoints: [{ ...VALID, indicatorId: peopleId }] });
     expect(bulk.status).toBe(403);
     expect(await prisma.dataPoint.count({ where: { projectId: a.project.id } })).toBe(before);
     expect((await prisma.indicator.findUniqueOrThrow({ where: { id: peopleId } })).currentValue).toBeNull();
 
     // Donor viewers see approved indicators only (Phase 4, kpi-assistant-spec §A1): 404 until it is approved.
-    const hidden = await request(app).get(`/api/indicators/${peopleId}/data`).set('Authorization', viewerAuth);
+    const hidden = await request(app).get(`/api/indicators/${peopleId}/data`).set('Authorization', a.donorAuth);
     expect(hidden.status).toBe(404);
     await prisma.indicator.update({ where: { id: peopleId }, data: { isApproved: true } });
     try {
-      const list = await request(app).get(`/api/indicators/${peopleId}/data`).set('Authorization', viewerAuth);
+      const list = await request(app).get(`/api/indicators/${peopleId}/data`).set('Authorization', a.donorAuth);
       expect(list.status).toBe(200);
     } finally {
       // The later tests in this file share the fixture; leave it as it was.
@@ -444,6 +439,29 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
         .set('Authorization', a.officerAuth)
         .send({ dataPoints: [{ ...VALID, indicatorId: id, value: '9', collectionDate: '2026-01-31' }] });
       expect((await prisma.indicator.findUniqueOrThrow({ where: { id } })).currentValue).toBe('40');
+    });
+
+    it('never makes a KoboToolbox answer (one household) the current value', async () => {
+      const id = await createIndicator(a, 'Average monthly household income', 'ILS');
+      // A later KoboToolbox submission, as the webhook stores it.
+      await prisma.dataPoint.create({
+        data: {
+          indicatorId: id, projectId: a.project.id, value: '2450', collectionDate: new Date('2026-10-05'), collectionMethod: 'hh_survey',
+          dataSource: 'KoboToolbox', createdBy: a.officer.id,
+        },
+      });
+      const bulk = await request(app)
+        .post(`/api/projects/${a.project.id}/data/bulk`)
+        .set('Authorization', a.officerAuth)
+        .send({ dataPoints: [{ ...VALID, indicatorId: id, value: '1340', collectionDate: '2026-09-30', collectionMethod: 'hh_survey' }] });
+      expect(bulk.status).toBe(201);
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id } })).currentValue).toBe('1340');
+
+      // A row typed with the KoboToolbox source is stored, but does not become the current value either.
+      const single = await request(app).post(`/api/indicators/${id}/data`).set('Authorization', a.officerAuth)
+        .send({ ...VALID, value: '980', collectionDate: '2026-10-06', collectionMethod: 'hh_survey', dataSource: 'kobotoolbox' });
+      expect(single.status).toBe(201);
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id } })).currentValue).toBe('1340');
     });
 
     it('stores numeric values in canonical form', async () => {

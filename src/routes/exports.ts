@@ -1,10 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertProjectAccess } from '../middleware/access';
-import { authenticate } from '../middleware/auth';
+import { authenticate, authorize } from '../middleware/auth';
+import { hasStaffRole, STAFF_ROLES } from '../middleware/roles';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
 import { indicatorVisibilityWhere } from '../services/indicators/visibility';
+import { donorArea, isRespondentLevel, toDonorSurveyAggregates } from '../services/privacy/donorView';
 
 const router = Router();
 
@@ -29,6 +31,9 @@ router.get('/projects/:id/export/indicators', authenticate, asyncHandler(async (
     },
   });
   if (!project) throw new AppError(404, 'Project not found');
+  // Donor viewers (SECURITY_SETUP §8.3): listed areas only (never coordinates or villages), and KoboToolbox rows
+  // (one respondent each) only as released monthly aggregates.
+  const staff = hasStaffRole(req.user);
 
   const framework = project.frameworks[0];
   const indicators = framework?.indicators.map(ind => ({
@@ -42,13 +47,14 @@ router.get('/projects/:id/export/indicators', authenticate, asyncHandler(async (
     current: ind.currentValue,
     unit: ind.unit,
     status: ind.status,
-    dataPoints: ind.dataPoints.map(dp => ({
+    dataPoints: ind.dataPoints.filter(dp => staff || !isRespondentLevel(dp)).map(dp => ({
       value: dp.value,
       date: dp.collectionDate.toISOString().split('T')[0],
       method: dp.collectionMethod,
       source: dp.dataSource,
-      area: dp.geographicArea,
+      area: staff ? dp.geographicArea : donorArea(dp.geographicArea),
     })),
+    ...(!staff && { surveyAggregates: toDonorSurveyAggregates(ind.dataPoints.filter(isRespondentLevel), () => ind.unit) }),
   })) || [];
 
   res.json({
@@ -59,8 +65,8 @@ router.get('/projects/:id/export/indicators', authenticate, asyncHandler(async (
   });
 }));
 
-// GET /api/projects/:id/export/beneficiaries
-router.get('/projects/:id/export/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
+// GET /api/projects/:id/export/beneficiaries — the register with personal data: staff only
+router.get('/projects/:id/export/beneficiaries', authenticate, authorize(...STAFF_ROLES), asyncHandler(async (req: Request, res: Response) => {
   const project = await assertProjectAccess(req, req.params.id);
 
   let beneficiaries: any[] = [];

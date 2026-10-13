@@ -10,29 +10,31 @@ import { generateFramework } from '../services/ai/frameworkGenerator';
 import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
 import { createIndicatorInFramework } from '../services/indicators/create';
 import { sortResultNodes } from '../services/indicators/hierarchy';
-import { INDICATOR_LIST_INCLUDE, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
+import { indicatorListInclude, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
 import { parseIndicatorCreate } from '../services/indicators/validation';
 import { canSeeIndicator, indicatorVisibilityWhere } from '../services/indicators/visibility';
 import { safeErrorSummary } from '../services/ai/errors';
+import { donorDataPointWhere } from '../services/privacy/donorView';
 
 const router = Router();
 
 const INDICATOR_ORDER = [{ sortOrder: 'asc' }, { createdAt: 'asc' }] satisfies Prisma.IndicatorOrderByWithRelationInput[];
 
-/** A framework with its result nodes (each with counts) and its indicators (each with its result and data point count). */
-const FRAMEWORK_DETAIL_INCLUDE = {
-  resultNodes: { include: RESULT_NODE_INCLUDE },
-  indicators: { orderBy: INDICATOR_ORDER, include: INDICATOR_LIST_INCLUDE },
-} satisfies Prisma.FrameworkInclude;
-
 /**
- * FRAMEWORK_DETAIL_INCLUDE with the indicators `user` may see: approved ones only for a donor viewer (spec §A1;
- * design 4.7). Result nodes and their `_count.indicators` are not filtered (docs/DATA_MODEL.md §12).
+ * A framework with its result nodes (each with counts) and the indicators `user` may see: approved ones only for a
+ * donor viewer (spec §A1; design 4.7), each with its result and the number of data points the user can see (donor
+ * viewers never count KoboToolbox rows, SECURITY_SETUP §8.3). Result nodes and their `_count.indicators` are not
+ * filtered (docs/DATA_MODEL.md §12). `indicatorWhere` defaults to the indicators `user` may see; GET
+ * /frameworks/:id/status passes `{}` so its status counts every indicator, and filters the list afterwards.
  */
-function frameworkDetailInclude(user: Request['user']) {
+function frameworkDetailInclude(user: Request['user'], indicatorWhere: Prisma.IndicatorWhereInput = indicatorVisibilityWhere(user)) {
   return {
-    ...FRAMEWORK_DETAIL_INCLUDE,
-    indicators: { ...FRAMEWORK_DETAIL_INCLUDE.indicators, where: indicatorVisibilityWhere(user) },
+    resultNodes: { include: RESULT_NODE_INCLUDE },
+    indicators: {
+      where: indicatorWhere,
+      orderBy: INDICATOR_ORDER,
+      include: indicatorListInclude(donorDataPointWhere(user)),
+    },
   } satisfies Prisma.FrameworkInclude;
 }
 
@@ -122,9 +124,10 @@ export function generationFailure(
 // indicators only (spec §A1; design 4.7).
 router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertFrameworkAccess(req, req.params.id);
+  // Every indicator, so the status is the same for every role; the donor filter is applied to the list below.
   const framework = await prisma.framework.findUniqueOrThrow({
     where: { id: req.params.id },
-    include: FRAMEWORK_DETAIL_INCLUDE,
+    include: frameworkDetailInclude(req.user, {}),
   });
 
   const hasIndicators = framework.indicators.length > 0;
@@ -164,7 +167,7 @@ router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'pl
         approvedAt: new Date(),
         approvedBy: req.user!.id,
       },
-      include: FRAMEWORK_DETAIL_INCLUDE,
+      include: frameworkDetailInclude(req.user),
     }),
     // Update project status
     prisma.project.update({
@@ -215,7 +218,7 @@ router.get('/frameworks/:id/indicators', authenticate, asyncHandler(async (req: 
   const indicators = await prisma.indicator.findMany({
     where: { frameworkId: req.params.id, ...indicatorVisibilityWhere(req.user) },
     orderBy: INDICATOR_ORDER,
-    include: INDICATOR_LIST_INCLUDE,
+    include: indicatorListInclude(donorDataPointWhere(req.user)),
   });
 
   res.json(indicators);

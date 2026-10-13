@@ -52,6 +52,14 @@ describe('visibility rule (src/services/indicators/visibility.ts)', () => {
     expect(canSeeIndicator(undefined, { isApproved: true })).toBe(true);
   });
 
+  it('denies by default: a missing, empty or unknown role sees approved indicators only (hasStaffRole, src/middleware/roles.ts)', () => {
+    for (const user of [{}, { role: undefined }, { role: '' }, { role: 'admin' }, { role: 'ORG_ADMIN' }, null]) {
+      expect(indicatorVisibilityWhere(user)).toEqual({ isApproved: true });
+      expect(dataPointVisibilityWhere(user)).toEqual({ indicator: { isApproved: true } });
+      expect(canSeeIndicator(user, { isApproved: false })).toBe(false);
+    }
+  });
+
   it('agrees with itself: the where filter keeps exactly the indicators canSeeIndicator allows', () => {
     const indicators = [{ isApproved: true }, { isApproved: false }];
     for (const user of [...ROLES.map(role => ({ role })), undefined]) {
@@ -157,7 +165,8 @@ describe.skipIf(!hasTestDatabase)('donor viewers see approved indicators only (r
       expect(donor.body.indicatorStatus).toEqual({ on_track: 0, at_risk: 1, off_track: 0, not_started: 0, completed: 0 });
       expect(donor.body.indicatorLevels).toEqual({ impact: 0, outcome: 1, output: 0, activity: 0 });
       expect(donor.body.trends.map((t: { indicatorId: string }) => t.indicatorId)).toEqual([approved.id]);
-      expect(donor.body.geographic).toEqual([{ area: 'Hebron', dataPointCount: 1 }]);
+      // Donors get listed places with their Arabic name (src/services/privacy/places.ts).
+      expect(donor.body.geographic.map((g: { area: string; dataPointCount: number }) => [g.area, g.dataPointCount])).toEqual([['Hebron', 1]]);
       // Recent activity: data points of unapproved indicators are left out.
       expect(ids(donor.body.recentActivity)).toEqual([approvedPoint.id]);
       expect(donor.body.recentActivity[0].indicator).toEqual({ indicatorText: approved.indicatorText });
@@ -183,23 +192,22 @@ describe.skipIf(!hasTestDatabase)('donor viewers see approved indicators only (r
       expect(officer.body.alerts.map((a: { indicatorId: string }) => a.indicatorId).sort()).toEqual(ids([fx.indicator, aiSuggested]));
     });
 
+    // The donor-data-access PR closes the AI risk analysis to donor viewers (403), which supersedes the Phase 4
+    // approved-only donor analysis (design SDA-06; docs/SECURITY_SETUP.md §8.2).
     describe('GET /api/dashboard/projects/:id/risks', () => {
       beforeEach(() => vi.mocked(analyzeProjectRisks).mockClear());
 
-      it('a donor viewer\'s risk analysis is built from approved indicators only (approvedOnly: true)', async () => {
+      it('refuses a donor viewer (403) before any analysis runs', async () => {
         const res = await get(`/api/dashboard/projects/${fx.project.id}/risks`, fx.donorAuth);
-        expect(res.status).toBe(200);
-        expect(analyzeProjectRisks).toHaveBeenCalledTimes(1);
-        expect(analyzeProjectRisks).toHaveBeenCalledWith(fx.project.id, { approvedOnly: true });
+        expect(res.status).toBe(403);
+        expect(res.body).toEqual({ message: 'Insufficient permissions' });
+        expect(analyzeProjectRisks).not.toHaveBeenCalled();
       });
 
-      it('officers and admins get the analysis of every indicator (approvedOnly: false)', async () => {
+      it('officers and admins get the analysis of every indicator of the current framework', async () => {
         await get(`/api/dashboard/projects/${fx.project.id}/risks`, fx.officerAuth).expect(200);
         await get(`/api/dashboard/projects/${fx.project.id}/risks`, fx.adminAuth).expect(200);
-        expect(vi.mocked(analyzeProjectRisks).mock.calls).toEqual([
-          [fx.project.id, { approvedOnly: false }],
-          [fx.project.id, { approvedOnly: false }],
-        ]);
+        expect(vi.mocked(analyzeProjectRisks).mock.calls).toEqual([[fx.project.id], [fx.project.id]]);
       });
     });
   });
@@ -224,16 +232,18 @@ describe.skipIf(!hasTestDatabase)('donor viewers see approved indicators only (r
     });
   });
 
+  // Beneficiary records are staff only since the donor-data-access PR (docs/SECURITY_SETUP.md §8.3): donor viewers
+  // get 403 on the list and the detail, so no service of an unapproved indicator can reach them there.
   describe('beneficiaries.ts', () => {
-    it('GET /api/beneficiaries/:id leaves out services of unapproved indicators for a donor viewer', async () => {
-      const donor = await get(`/api/beneficiaries/${fx.beneficiary.id}`, fx.donorAuth);
-      expect(donor.status).toBe(200);
-      expect(donor.body.services.map((s: { id: string }) => s.id)).toEqual([services.approved, services.none]);
-      expect(donor.body.services[0].indicator).toEqual({ id: approved.id, indicatorText: approved.indicatorText });
-      expect(donor.body.services[1].indicator).toBeNull();
+    it('GET /api/beneficiaries/:id and the list refuse a donor viewer (403)', async () => {
+      for (const path of [`/api/beneficiaries/${fx.beneficiary.id}`, `/api/projects/${fx.project.id}/beneficiaries`]) {
+        const donor = await get(path, fx.donorAuth);
+        expect(donor.status, path).toBe(403);
+        expect(JSON.stringify(donor.body)).not.toContain(fx.indicator.indicatorText);
+      }
     });
 
-    it('names each service\'s indicator by id and text only, for every role', async () => {
+    it('names each service\'s indicator by id and text only', async () => {
       const officer = await get(`/api/beneficiaries/${fx.beneficiary.id}`, fx.officerAuth);
       expect(officer.body.services.map((s: { id: string }) => s.id)).toEqual([services.approved, services.unapproved, services.none]);
       expect(officer.body.services[1].indicator).toEqual({ id: fx.indicator.id, indicatorText: fx.indicator.indicatorText });
@@ -242,12 +252,7 @@ describe.skipIf(!hasTestDatabase)('donor viewers see approved indicators only (r
       }
     });
 
-    it('GET /api/projects/:id/beneficiaries leaves out the same services in the list', async () => {
-      const donor = await get(`/api/projects/${fx.project.id}/beneficiaries`, fx.donorAuth);
-      expect(donor.status).toBe(200);
-      const listed = donor.body.beneficiaries.find((b: { id: string }) => b.id === fx.beneficiary.id);
-      expect(listed.services.map((s: { id: string }) => s.id)).toEqual([services.approved, services.none]);
-
+    it('GET /api/projects/:id/beneficiaries gives staff every service', async () => {
       const officer = await get(`/api/projects/${fx.project.id}/beneficiaries`, fx.officerAuth);
       const all = officer.body.beneficiaries.find((b: { id: string }) => b.id === fx.beneficiary.id);
       expect(all.services).toHaveLength(3);

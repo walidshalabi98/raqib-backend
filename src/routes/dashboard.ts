@@ -1,12 +1,17 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertProjectAccess } from '../middleware/access';
-import { authenticate } from '../middleware/auth';
+import { authenticate, authorize } from '../middleware/auth';
+import { hasStaffRole, STAFF_ROLES } from '../middleware/roles';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { analyzeProjectRisks } from '../services/ai/riskAnalyzer';
 import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
-import { canSeeIndicator, dataPointVisibilityWhere, indicatorVisibilityWhere } from '../services/indicators/visibility';
+import { dataPointVisibilityWhere, indicatorVisibilityWhere } from '../services/indicators/visibility';
+import {
+  donorDataPointWhere, donorReportWhere, isRespondentLevel, mergeDonorAreas, NOT_RESPONDENT_LEVEL_WHERE, RESPONDENT_LEVEL_WHERE,
+  toDonorDataPoint, toDonorSurveyAggregates,
+} from '../services/privacy/donorView';
 
 const router = Router();
 
@@ -26,7 +31,9 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
           indicators: {
             where: indicatorVisibilityWhere(req.user),
             include: {
+              // The 10 most recent rows the caller is shown one by one (donors: never KoboToolbox rows).
               dataPoints: {
+                where: donorDataPointWhere(req.user),
                 orderBy: { collectionDate: 'desc' },
                 take: 10,
               },
@@ -37,6 +44,10 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
     },
   });
   if (!project) throw new AppError(404, 'Project not found');
+  // Donor viewers (any role without staff rights, SECURITY_SETUP §8.3): data points without notes, attachments,
+  // author or unlisted areas; KoboToolbox rows (one respondent each) only as released monthly aggregates, never
+  // one by one, and never in a count.
+  const staff = hasStaffRole(req.user);
 
   const framework = project.frameworks[0];
   const indicators = framework?.indicators || [];
@@ -55,6 +66,15 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
   const levelCounts = { impact: 0, outcome: 0, output: 0, activity: 0 };
   indicators.forEach(ind => { levelCounts[ind.level]++; });
 
+  // Donors: respondent-level rows of these indicators, aggregated per released month (all of them, not only the last 10).
+  const surveyRows = staff ? [] : await prisma.dataPoint.findMany({
+    where: { indicatorId: { in: indicators.map(ind => ind.id) }, ...RESPONDENT_LEVEL_WHERE },
+    select: { indicatorId: true, value: true, collectionDate: true, createdAt: true },
+    orderBy: { collectionDate: 'asc' },
+  });
+  const unitOf = new Map(indicators.map(ind => [ind.id, ind.unit]));
+  const surveyAggregates = toDonorSurveyAggregates(surveyRows, id => unitOf.get(id));
+
   // Trend data per indicator
   const trends = indicators.map(ind => ({
     indicatorId: ind.id,
@@ -64,22 +84,27 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
     baselineValue: ind.baselineValue,
     targetValue: ind.targetValue,
     currentValue: ind.currentValue,
-    dataPoints: ind.dataPoints.map(dp => ({
+    dataPoints: ind.dataPoints.filter(dp => staff || !isRespondentLevel(dp)).map(dp => ({
       value: dp.value,
       date: dp.collectionDate,
     })),
+    ...(!staff && { surveyAggregates: surveyAggregates.filter(a => a.indicatorId === ind.id) }),
   }));
 
-  // Geographic data
+  // Geographic data (donors: rows they are shown one by one only, grouped by listed place)
   const geoData = await prisma.dataPoint.groupBy({
     by: ['geographicArea'],
-    where: { projectId: req.params.id, geographicArea: { not: null }, ...dataPointVisibilityWhere(req.user) },
+    where: {
+      projectId: req.params.id, geographicArea: { not: null },
+      AND: [donorDataPointWhere(req.user), dataPointVisibilityWhere(req.user)],
+    },
     _count: { id: true },
   });
+  const geographic = geoData.map(g => ({ area: g.geographicArea, dataPointCount: g._count.id }));
 
-  // Recent data points (donor viewers: of approved indicators only)
+  // Recent data points (donors: never respondent-level rows, and of approved indicators only)
   const recentData = await prisma.dataPoint.findMany({
-    where: { projectId: req.params.id, ...dataPointVisibilityWhere(req.user) },
+    where: { projectId: req.params.id, AND: [staff ? {} : NOT_RESPONDENT_LEVEL_WHERE, dataPointVisibilityWhere(req.user)] },
     orderBy: { createdAt: 'desc' },
     take: 10,
     include: {
@@ -114,11 +139,8 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
     indicatorStatus: statusCounts,
     indicatorLevels: levelCounts,
     trends,
-    geographic: geoData.map(g => ({
-      area: g.geographicArea,
-      dataPointCount: g._count.id,
-    })),
-    recentActivity: recentData,
+    geographic: staff ? geographic : mergeDonorAreas(geographic),
+    recentActivity: staff ? recentData : recentData.map(toDonorDataPoint),
     assessments: assessments.map(a => ({
       id: a.id,
       type: a.type,
@@ -129,7 +151,8 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
 }));
 
 // GET /api/dashboard/overview — Org-level overview. Donor viewers: indicator counts and off-track alerts from
-// approved indicators only (spec §A1); the record counts (`dataPointCount` etc.) are not filtered.
+// approved indicators only (spec §A1); the record counts (`dataPointCount` etc.) are not filtered by approval, but
+// count what donors can see (SECURITY_SETUP §8.3).
 router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
 
@@ -142,7 +165,14 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
           indicators: { where: indicatorVisibilityWhere(req.user), select: { id: true, indicatorText: true, status: true } },
         },
       },
-      _count: { select: { assessments: true, reports: true, dataPoints: true } },
+      // Counts of what the caller can see: donors count published reports only and no KoboToolbox rows.
+      _count: {
+        select: {
+          assessments: true,
+          reports: { where: donorReportWhere(req.user) },
+          dataPoints: { where: donorDataPointWhere(req.user) },
+        },
+      },
     },
   });
 
@@ -187,13 +217,13 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
   });
 }));
 
-// GET /api/dashboard/projects/:id/risks — AI Risk Analysis. A donor viewer's analysis is built from approved
-// indicators only, so the model never sees (and the answer never names) an unapproved one (spec §A1; design 4.7).
-router.get('/projects/:id/risks', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
+// GET /api/dashboard/projects/:id/risks — AI Risk Analysis (staff only: it runs a model on every request, and its
+// output is not reviewed; staff share their conclusions in reports). Donor viewers get 403, which supersedes the
+// Phase 4 approved-only donor analysis (design SDA-06); staff analyse every indicator of the current framework.
+router.get('/projects/:id/risks', authenticate, authorize(...STAFF_ROLES), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
-  const approvedOnly = !canSeeIndicator(req.user, { isApproved: false });
-  const risks = await analyzeProjectRisks(req.params.id, { approvedOnly });
+  const risks = await analyzeProjectRisks(req.params.id);
   res.json({ projectId: req.params.id, risks, analyzedAt: new Date().toISOString() });
 }));
 

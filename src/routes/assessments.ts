@@ -2,14 +2,17 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertAssessmentAccess, assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
+import { hasStaffRole } from '../middleware/roles';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { generateAutoAssessment } from '../services/ai/assessmentGenerator';
 import { safeErrorSummary } from '../services/ai/errors';
+import { toDonorAssessment } from '../services/privacy/donorView';
 
 const router = Router();
 
-// GET /api/projects/:id/assessments
+// GET /api/projects/:id/assessments — donor viewers get toDonorAssessment: never scopeDescription (the AI
+// assessment, written from transcript excerpts), the price or the report location (SECURITY_SETUP §8.3).
 router.get('/projects/:id/assessments', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
@@ -20,7 +23,7 @@ router.get('/projects/:id/assessments', authenticate, asyncHandler(async (req: R
     },
     orderBy: { requestedAt: 'desc' },
   });
-  res.json(assessments);
+  res.json(hasStaffRole(req.user) ? assessments : assessments.map(toDonorAssessment));
 }));
 
 // POST /api/projects/:id/assessments — Request new assessment
@@ -72,12 +75,13 @@ router.patch('/assessments/:id', authenticate, authorize('org_admin', 'platform_
   res.json(updated);
 }));
 
-// GET /api/assessments/:id/report — Get AI-generated assessment report
+// GET /api/assessments/:id/report — Get AI-generated assessment report. Donor viewers get `report: null`: the
+// report is unreviewed AI output written from transcript excerpts, and assessments have no approval step yet.
 router.get('/assessments/:id/report', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const assessment = await assertAssessmentAccess(req, req.params.id);
 
   let report = null;
-  if (assessment.scopeDescription) {
+  if (assessment.scopeDescription && hasStaffRole(req.user)) {
     try { report = JSON.parse(assessment.scopeDescription); } catch { report = null; }
   }
 

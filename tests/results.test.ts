@@ -9,7 +9,7 @@ import {
 import { sameResultCode } from '../src/services/indicators/references';
 import { describeIssues, parseResultCreate, parseResultUpdate, resultCreateSchema } from '../src/services/indicators/validation';
 import { AppError } from '../src/middleware/errorHandler';
-import { bearer, createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
+import { createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
 
 const LEVELS: IndicatorLevel[] = ['impact', 'outcome', 'output', 'activity'];
 
@@ -146,10 +146,7 @@ describe.skipIf(!hasTestDatabase)('results chain API', () => {
     await resetDatabase();
     a = await createOrgFixture('a');
     b = await createOrgFixture('b');
-    const viewer = await prisma.user.create({
-      data: { organizationId: a.org.id, email: 'viewer-a@example.org', passwordHash: 'x', fullName: 'Viewer A', role: 'donor_viewer' },
-    });
-    viewerAuth = bearer(viewer);
+    viewerAuth = a.donorAuth;
     // A second framework of the same project and organisation.
     otherFrameworkId = (await prisma.framework.create({ data: { projectId: a.project.id, version: 2 } })).id;
     await prisma.resultNode.create({ data: { frameworkId: otherFrameworkId, level: 'impact', code: 'Goal', text: 'Other goal' } });

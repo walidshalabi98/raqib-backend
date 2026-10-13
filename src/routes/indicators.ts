@@ -44,7 +44,7 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
   res.json(updated);
 }));
 
-// POST /api/indicators/:id/alternative — KPI Assistant alternatives for this indicator (alias of
+// POST /api/indicators/:id/alternative — KPI Assistant alternatives for this indicator (staff only: AI route; alias of
 // POST /api/projects/:id/kpi-suggestions with { scope: 'alternatives', indicatorId }; design 7.1). The request body
 // is ignored. An indicator of an older framework version answers 409 stale; one without a result 422 not_suggestable.
 router.post('/:id/alternative', authenticate, authorize(...KPI_ROLES), aiLimiter, kpiOrgLimiter, asyncHandler(async (req: Request, res: Response) => {

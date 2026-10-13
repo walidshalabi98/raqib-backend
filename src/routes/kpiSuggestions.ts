@@ -21,7 +21,7 @@ import { scoreExistingIndicator } from '../services/kpi/validate';
  * GET /api/frameworks/:id/indicator-quality, GET /api/kpi-assistant/status. The alternatives alias
  * POST /api/indicators/:id/alternative lives in routes/indicators.ts and shares handleKpiRequest.
  *
- * Every route: authenticate, then authorize(org_admin, platform_admin, me_officer) — donor viewers never see raw
+ * Every route: authenticate, then authorize(...KPI_ROLES) (= STAFF_ROLES) — donor viewers never see raw
  * suggestions (spec §A1) — then the organisation access helper of the id (404 for another organisation's ids,
  * CLAUDE.md rule 1). Errors are `{ message, code?, details? }`.
  */

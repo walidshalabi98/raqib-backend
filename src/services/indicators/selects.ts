@@ -13,11 +13,16 @@ export const INDICATOR_INCLUDE = {
   result: { select: RESULT_SUMMARY_SELECT },
 } satisfies Prisma.IndicatorInclude;
 
-/** Include for indicator lists (framework views): the result plus the number of data points. */
-export const INDICATOR_LIST_INCLUDE = {
-  ...INDICATOR_INCLUDE,
-  _count: { select: { dataPoints: true } },
-} satisfies Prisma.IndicatorInclude;
+/**
+ * Include for indicator lists (framework views): the result plus the number of data points the caller can see
+ * (`dataPointWhere`: donorDataPointWhere(req.user), so donor viewers never count KoboToolbox rows).
+ */
+export function indicatorListInclude(dataPointWhere: Prisma.DataPointWhereInput) {
+  return {
+    ...INDICATOR_INCLUDE,
+    _count: { select: { dataPoints: { where: dataPointWhere } } },
+  } satisfies Prisma.IndicatorInclude;
+}
 
 /** Include for result nodes: how many indicators and child results each has. */
 export const RESULT_NODE_INCLUDE = {

@@ -10,9 +10,11 @@ import { AppError } from './errorHandler';
  * organisation are reported as 404 (never 403) so ids cannot be probed.
  */
 
+/** The caller's organisation. No user, or a user without an organisation, is 401: never an unscoped query. */
 function orgId(req: Request): string {
-  if (!req.user) throw new AppError(401, 'Not authenticated');
-  return req.user.organizationId;
+  const organizationId = req.user?.organizationId;
+  if (typeof organizationId !== 'string' || !organizationId) throw new AppError(401, 'Not authenticated');
+  return organizationId;
 }
 
 export async function assertProjectAccess(req: Request, projectId: string) {

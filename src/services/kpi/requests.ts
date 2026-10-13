@@ -4,11 +4,12 @@
  * Every id is checked against the caller's organisation and the project's current framework (CLAUDE.md rule 1).
  */
 import type { Request, Response } from 'express';
-import type { KpiSuggestion, Prisma, PrismaClient, Project, UserRole } from '@prisma/client';
+import type { KpiSuggestion, Prisma, PrismaClient, Project } from '@prisma/client';
 import { z } from 'zod';
 import { env } from '../../config/env';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../middleware/errorHandler';
+import { STAFF_ROLES } from '../../middleware/roles';
 import { findCurrentFramework } from '../frameworks/current';
 import { sortResultNodes } from '../indicators/hierarchy';
 import { kpiAssistantStatus } from './availability';
@@ -17,8 +18,12 @@ import { KPI_SYNC_WAIT_MS, startKpiRun, toRunDto, toSuggestionDto, waitForRun } 
 import { allowanceFor, scopedResults } from './scope';
 import type { KpiRunDto, KpiScope, KpiSuggestionDto, ProjectContext } from './types';
 
-/** Roles that may use the KPI Assistant (donor_viewer never sees raw suggestions; spec §A1). */
-export const KPI_ROLES = ['org_admin', 'platform_admin', 'me_officer'] as const satisfies readonly UserRole[];
+/**
+ * Roles that may use the KPI Assistant: the staff roles (src/middleware/roles.ts; docs/SECURITY_SETUP.md §8), so a
+ * donor viewer never sees raw suggestions (spec §A1) and never spends AI budget. tests/roles.test.ts checks that
+ * every KPI route carries exactly these roles.
+ */
+export const KPI_ROLES = STAFF_ROLES;
 /** More scoped results than this → 422 too_many_results (D20). */
 export const KPI_MAX_RESULTS_PER_RUN = 40;
 
