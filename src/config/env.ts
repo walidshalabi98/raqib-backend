@@ -20,6 +20,13 @@ const wholeNumber = z.coerce
  */
 export const AI_REQUEST_TIMEOUT_MAX_MS = 3_600_000;
 
+/** The sender of every email (EMAIL_FROM), on a domain verified in Resend. */
+export const DEFAULT_EMAIL_FROM = 'Raqib by Momentum Labs <noreply@raqib.momentumlabs.ps>';
+
+const EMAIL_ADDRESS = /[^\s@<>",;]+@[^\s@<>",;.]+(?:\.[^\s@<>",;.]+)*\.[A-Za-z]{2,}/.source;
+/** "address@domain" or "Display Name <address@domain>", on one line, without quotes or angle brackets in the name. */
+const EMAIL_SENDER = new RegExp(`^(?:${EMAIL_ADDRESS}|[^<>"\\r\\n]{1,100} <${EMAIL_ADDRESS}>)$`);
+
 /** An optional setting: unset or blank uses the default (so `NAME=` in .env behaves like a missing line). */
 function withDefault<T extends z.ZodTypeAny>(schema: T, fallback: z.input<T>) {
   return z.preprocess(v => (typeof v === 'string' ? (v.trim() === '' ? undefined : v.trim()) : v), schema.default(fallback));
@@ -64,7 +71,12 @@ const envSchema = z.object({
   LOCAL_STORAGE_DIR: z.string().default('storage'),
 
   REDIS_URL: z.string().default('redis://localhost:6379'),
+  // Without a Resend key no email is sent (docs/SECURITY_SETUP.md §9).
   RESEND_API_KEY: optionalString,
+  EMAIL_FROM: withDefault(
+    z.string().max(320).regex(EMAIL_SENDER, 'must be an email address or "Name <address@domain>" on one line'),
+    DEFAULT_EMAIL_FROM,
+  ),
   APP_URL: z.string().default('http://localhost:5173'),
   API_URL: optionalString,
   CORS_ORIGINS: optionalString,
@@ -82,6 +94,13 @@ export function parseEnv(source: EnvInput) {
   }
 
   const e = result.data;
+  // Refresh tokens are kept apart from access and reset tokens by their own secret (and audience): one value
+  // for both would let a used reset link or an access token be traded for a session at /api/auth/refresh.
+  if (e.JWT_SECRET === e.JWT_REFRESH_SECRET) {
+    throw new Error(
+      'Invalid environment configuration:\n  - JWT_REFRESH_SECRET: must be different from JWT_SECRET (generate each one separately)',
+    );
+  }
   if (e.NODE_ENV === 'production' && !(e.SUPABASE_URL && e.SUPABASE_SERVICE_KEY)) {
     throw new Error(
       'Invalid environment configuration:\n  - SUPABASE_URL / SUPABASE_SERVICE_KEY: required in production (documents must be stored in private Supabase Storage)',
@@ -119,6 +138,7 @@ export function parseEnv(source: EnvInput) {
     localStorageDir: e.LOCAL_STORAGE_DIR,
     redisUrl: e.REDIS_URL,
     resendApiKey: e.RESEND_API_KEY || '',
+    emailFrom: e.EMAIL_FROM,
     appUrl: e.APP_URL,
     apiUrl: e.API_URL || `http://localhost:${e.PORT}`,
     corsOrigins,

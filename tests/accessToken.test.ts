@@ -37,6 +37,10 @@ describe('accessTokenUser', () => {
     ['no email', without('email')],
     ['no full name', without('fullName')],
     ['a reset token payload', { id: ZERO_UUID, purpose: 'reset' }],
+    ['an audience claim (the reset audience)', { ...CLAIMS, aud: 'raqib:password-reset' }],
+    ['an audience claim of any value', { ...CLAIMS, aud: 'raqib' }],
+    ['a reset token payload with its audience and fingerprint', { id: ZERO_UUID, purpose: 'reset', pwd: '0123456789abcdef', aud: 'raqib:password-reset' }],
+    ['a refresh token payload (refresh audience)', { ...CLAIMS, pwd: '0123456789abcdef', aud: 'raqib:refresh' }],
     ['a string', 'token'],
     ['null', null],
   ])('refuses a payload with %s', (_label, payload) => {
@@ -48,13 +52,16 @@ describe('authenticate', () => {
   const paths = ['/api/projects', `/api/projects/${ZERO_UUID}/export`];
 
   it.each(paths)('answers 401 to a reset token on GET %s', async path => {
-    const res = await request(app).get(path).set('Authorization', `Bearer ${generateResetToken(ZERO_UUID)}`);
+    const res = await request(app).get(path).set('Authorization', `Bearer ${generateResetToken({ id: ZERO_UUID, passwordHash: 'x' })}`);
     expect(res.status).toBe(401);
     expect(res.body).toEqual({ message: 'Invalid or expired token' });
   });
 
   it.each(paths)('answers 401 to a signed token without an organisation or a role on GET %s', async path => {
-    for (const auth of [signed(without('organizationId')), signed(without('role')), signed({ ...CLAIMS, purpose: 'reset' })]) {
+    for (const auth of [
+      signed(without('organizationId')), signed(without('role')), signed({ ...CLAIMS, purpose: 'reset' }),
+      signed({ ...CLAIMS, aud: 'raqib:password-reset' }),
+    ]) {
       const res = await request(app).get(path).set('Authorization', auth);
       expect(res.status).toBe(401);
     }
@@ -96,7 +103,7 @@ describe.skipIf(!hasTestDatabase)('authenticate with a database', () => {
   });
 
   it('refuses a reset token for a real user on both routes', async () => {
-    const auth = `Bearer ${generateResetToken(a.officer.id)}`;
+    const auth = `Bearer ${generateResetToken(a.officer)}`;
     for (const path of ['/api/projects', `/api/projects/${a.project.id}/export`, `/api/projects/${b.project.id}/export`]) {
       const res = await request(app).get(path).set('Authorization', auth);
       expect(res.status, path).toBe(401);
@@ -105,7 +112,7 @@ describe.skipIf(!hasTestDatabase)('authenticate with a database', () => {
 
   it('still lets a reset token reset the password (the reset route verifies it itself)', async () => {
     const res = await request(app).post('/api/auth/reset-password')
-      .send({ token: generateResetToken(a.officer.id), newPassword: 'Another-long-password-1' });
+      .send({ token: generateResetToken(a.officer), newPassword: 'Another-long-password-1' });
     expect(res.status).toBe(200);
     // An access token cannot be used as a reset token either.
     const refused = await request(app).post('/api/auth/reset-password')

@@ -59,6 +59,7 @@ const DONOR_ROUTES: Record<string, (f: Fixture) => string> = {
   'get /api/notifications/': () => '/api/notifications',
   'patch /api/notifications/:id/read': f => `/api/notifications/${f.notificationId}/read`,
   'patch /api/notifications/read-all': () => '/api/notifications/read-all',
+  'post /api/auth/change-password': () => '/api/auth/change-password',
   'get /api/templates/': () => '/api/templates',
   'get /api/projects/:id/beneficiaries/stats': f => `/api/projects/${f.project.id}/beneficiaries/stats`,
   'get /api/projects/:id/export/indicators': f => `/api/projects/${f.project.id}/export/indicators`,
@@ -96,7 +97,7 @@ describe.skipIf(!hasTestDatabase)('no donor request reaches an AI model', () => 
   });
 
   it.each(Object.keys(DONOR_ROUTES).map(key => [key]))('%s', async key => {
-    const method = key.split(' ')[0] as 'get' | 'patch';
+    const method = key.split(' ')[0] as 'get' | 'patch' | 'post';
     const before = modelRequests.length;
     const res = await request(app)[method](DONOR_ROUTES[key](f)).set('Authorization', f.donorAuth);
     expect(res.status, JSON.stringify(res.body)).toBeLessThan(500);

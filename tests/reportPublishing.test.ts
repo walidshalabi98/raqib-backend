@@ -238,7 +238,7 @@ describe.skipIf(!hasTestDatabase)('publishing reports', () => {
     const leaving = await prisma.user.create({
       data: { organizationId: a.org.id, email: 'donor-leaving-a@example.org', passwordHash: 'x', fullName: 'Donor leaving', role: 'donor_viewer' },
     });
-    const refreshToken = generateRefreshToken(leaving.id);
+    const refreshToken = generateRefreshToken(leaving);
     expect((await publish(finished.id, a.adminAuth)).status).toBe(200);
     expect(await prisma.notification.count({ where: { userId: leaving.id } })).toBe(1);
 
@@ -253,7 +253,7 @@ describe.skipIf(!hasTestDatabase)('publishing reports', () => {
     // The removed viewer cannot get a new access token (the one already issued expires within 15 minutes).
     const refreshed = await request(app).post('/api/auth/refresh').send({ refreshToken });
     expect(refreshed.status).toBe(401);
-    expect(refreshed.body).toEqual({ message: 'User not found' });
+    expect(refreshed.body).toEqual({ message: 'Your session has ended. Sign in again.', code: 'session_ended' });
   });
 
   it('tells each donor viewer once when two publish requests race', async () => {

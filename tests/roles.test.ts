@@ -13,7 +13,7 @@ import app from '../src/app';
 import { auditMiddleware } from '../src/middleware/audit';
 import { authenticate, authorize, RoleGuard } from '../src/middleware/auth';
 import { errorHandler } from '../src/middleware/errorHandler';
-import { aiLimiter, apiLimiter, authLimiter, webhookLimiter } from '../src/middleware/rateLimit';
+import { aiLimiter, apiLimiter, webhookLimiter } from '../src/middleware/rateLimit';
 import { ADMIN_ROLES, hasStaffRole, PLATFORM_ROLES, STAFF_ROLES } from '../src/middleware/roles';
 import { authenticateWebhook } from '../src/middleware/webhookAuth';
 import { generateAccessToken, generateResetToken } from '../src/utils/tokens';
@@ -46,7 +46,7 @@ function send(key: string, auth: string) {
 
 /** Middleware reviewed for src/app.ts, by identity where the module exports it. */
 const REVIEWED_BY_IDENTITY = new Map<unknown, string>([
-  [apiLimiter, 'apiLimiter'], [authLimiter, 'authLimiter'], [webhookLimiter, 'webhookLimiter'],
+  [apiLimiter, 'apiLimiter'], [webhookLimiter, 'webhookLimiter'],
   [auditMiddleware, 'auditMiddleware'], [authenticateWebhook, 'authenticateWebhook'], [errorHandler, 'errorHandler'],
 ]);
 /** Created inline in src/app.ts (Express's own, helmet, cors, the body parsers): reviewed by name, and only for every path. */
@@ -66,7 +66,8 @@ describe('every layer of the app is reviewed', () => {
     // a sub-app or a wrapped router would otherwise escape the role matrix and the checks below.
     expect(layerReview(stack)).toEqual([
       '/ query', '/ expressInit', '/ helmetMiddleware', '/ corsMiddleware', '/ jsonParser', '/ urlencodedParser',
-      '/api apiLimiter', '/api auditMiddleware', '/api/auth authLimiter', '/api/webhooks webhookLimiter',
+      // /api/auth has no shared limiter: each of its routes has its own (tests/rateLimit.test.ts).
+      '/api apiLimiter', '/api auditMiddleware', '/api/webhooks webhookLimiter',
       '/api/webhooks authenticateWebhook', '/ errorHandler',
     ]);
   });
@@ -150,7 +151,7 @@ describe('role matrix', () => {
     const decided = Object.keys(ROLE_MATRIX).sort();
     expect(registered.filter(k => !(k in ROLE_MATRIX))).toEqual([]);
     expect(decided.filter(k => !byKey.has(k))).toEqual([]);
-    expect(registered).toHaveLength(83);
+    expect(registered).toHaveLength(85);
   });
 
   it.each(Object.entries(ROLE_MATRIX))('%s matches its entry exactly', (key, access) => {
@@ -180,7 +181,7 @@ describe('role matrix', () => {
       .map(r => r.key)
       .sort();
     expect(open).toEqual(Object.keys(NON_GET_WITHOUT_AUTHORIZE).sort());
-    expect(Object.keys(NON_GET_WITHOUT_AUTHORIZE)).toHaveLength(8);
+    expect(Object.keys(NON_GET_WITHOUT_AUTHORIZE)).toHaveLength(9);
   });
 
   // The known AI routes, by their limiter and the reviewed list. tests/donorAi.test.ts does not rely on either: it calls
@@ -230,7 +231,7 @@ describe('refusals (no database is reached)', () => {
 
   // Access tokens must carry an organisation and a role; reset tokens are refused (tests/accessToken.test.ts).
   it.each(arrayRoutes.map(([key]) => [key]))('a reset token gets 401 on %s', async key => {
-    const res = await send(key, `Bearer ${generateResetToken(ZERO_UUID)}`);
+    const res = await send(key, `Bearer ${generateResetToken({ id: ZERO_UUID, passwordHash: 'x' })}`);
     expect(res.status).toBe(401);
   });
 

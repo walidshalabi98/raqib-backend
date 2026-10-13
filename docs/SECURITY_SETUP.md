@@ -9,7 +9,7 @@ The server now refuses to start when required settings are missing or weak, and 
 | Variable | Rule |
 |---|---|
 | `DATABASE_URL` | required |
-| `JWT_SECRET`, `JWT_REFRESH_SECRET` | required, at least 32 characters each (`openssl rand -hex 32`) |
+| `JWT_SECRET`, `JWT_REFRESH_SECRET` | required, at least 32 characters each, and different from each other: generate each one separately (`openssl rand -hex 32`). One value for both is refused, because a reset link or an access token could then be traded for a session (§9) |
 | `ANTHROPIC_API_KEY` | required |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | required in production (document storage) |
 | `CORS_ORIGINS` | extra browser origins, comma-separated; `APP_URL` is always allowed |
@@ -21,8 +21,10 @@ The server now refuses to start when required settings are missing or weak, and 
 | `AI_CALL_RETENTION_MONTHS` | optional, default `24`, from 1 to 120; months an `AiCall` log row is kept before the worker's nightly job deletes it |
 | `VOYAGE_API_KEY` | optional secret; embeddings for the indicator library. Without it nothing is sent to Voyage and search uses keywords |
 | `VOYAGE_MODEL` | optional, default `voyage-4` |
+| `RESEND_API_KEY` | optional secret; without it no email is sent (§9) |
+| `EMAIL_FROM` | optional sender, `address@domain` or `Name <address@domain>` on a domain verified in Resend; default `Raqib by Momentum Labs <noreply@raqib.momentumlabs.ps>`; refused when it is on more than one line |
 
-Blank values (`NAME=`) for the optional AI settings use the default. Changing `JWT_SECRET` signs everyone out once. See `.env.example` for the full list.
+Blank values (`NAME=`) for the optional AI settings use the default. Changing `JWT_SECRET` or `JWT_REFRESH_SECRET` signs everyone out once. See `.env.example` for the full list.
 
 ## 2. Document storage
 
@@ -55,12 +57,13 @@ Phase 2 and Phase 3 add more reviewed SQL (Phase 3: the `AiCall` table with row 
 ## 5. Other protections
 
 - Security headers (`helmet`), CORS limited to configured origins.
-- Rate limits: 300 requests/minute per IP overall; 30 per 15 minutes on `/api/auth/*`; 60 AI requests/hour per user; 120 webhook calls/minute per IP.
+- Rate limits: 300 requests/minute per IP overall; on `/api/auth`, each kind of request has its own count (§9): sign-in 30 failed attempts per 15 minutes per IP, refresh 300 per 15 minutes per IP, forgotten password and reset links 30 per 15 minutes per IP plus 5 an hour per email address, change password 10 per 15 minutes per user; 60 AI requests/hour per user; 120 webhook calls/minute per IP.
 - Every route that takes an id checks the caller's organisation through `src/middleware/access.ts`; other organisations' records answer 404. Ids passed in a request body (indicator, assessment) must belong to the same project.
-- Access tokens must carry an organisation and a role; reset tokens are refused. `authenticate` validates the verified token payload with zod (user id, email, organisation id, a known role, full name) and refuses any token with a `purpose` claim (401); the access helpers answer 401 when the signed-in user has no organisation. Follow-ups: single-use reset links, and a separate audience or secret for reset tokens (RFC 8725 §3.12).
-- Org admins can no longer grant the `platform_admin` role.
+- Access tokens must carry an organisation and a role; reset and refresh tokens are refused. `authenticate` accepts HS256 only, validates the verified token payload with zod (user id, email, organisation id, a known role, full name) and refuses any token with a `purpose` or an audience (`aud`) claim (401); the access helpers answer 401 when the signed-in user has no organisation. Reset tokens and refresh tokens have their own audiences and stop working when the password changes (§9).
+- Org admins can no longer grant the `platform_admin` role, nor change, remove or reset the password of a platform admin (403).
+- Passwords: one policy for changed, reset and temporary passwords; temporary passwords are shown once when email is off; emails carry single-use links, never passwords; a password change ends the account's other sessions; nothing secret is logged (§9).
 - Every write, delete and AI route checks the role; donor viewers are read-only and never receive beneficiaries' personal data (§8).
-- The seed refuses to run in production and needs `SEED_PASSWORD` outside development.
+- The seed refuses to run in production. Outside development it needs `SEED_PASSWORD`, which must meet the password policy and becomes the org admin's password only; the other demo accounts get passwords nobody knows until an admin resets them (§9).
 
 ## 6. AI providers and personal data (Phase 3)
 
@@ -114,10 +117,10 @@ Owner decision of 13 October 2026: donor viewers are read-only and never receive
 
 ### 8.2 Route matrix
 
-The authoritative list of all 83 routes is `ROLE_MATRIX` in `tests/roleMatrix.ts`. `tests/roles.test.ts` (no database) fails when a route has no entry, when an entry has no route, or when a route's guard differs from its entry. It also checks that:
+The authoritative list of all 85 routes is `ROLE_MATRIX` in `tests/roleMatrix.ts`. `tests/roles.test.ts` (no database) fails when a route has no entry, when an entry has no route, or when a route's guard differs from its entry. It also checks that:
 
 - every layer of the app that is not a route or a router is on a reviewed list (by identity, or by name for the global middleware created in `src/app.ts`). The walk enters every layer that has its own stack, whatever its name, so an endpoint written as `app.use(path, handler)`, a mounted sub-app, a router behind a wrapper function or a static mount fails the test instead of escaping the matrix;
-- every non-GET route refuses donor viewers, except a reviewed allowlist of 8 (sign-in, refresh, forgot and reset password, the two webhooks, and marking one's own notifications);
+- every non-GET route refuses donor viewers, except a reviewed allowlist of 9 (sign-in, refresh, forgot and reset password, changing one's own password, the two webhooks, and marking one's own notifications);
 - every AI route refuses donor viewers;
 - a donor viewer and an M&E officer on admin routes get 403, and a reset token or a token with an unknown role gets 401.
 
@@ -125,7 +128,7 @@ Two integration tests do not rely on the lists: `tests/donorAi.test.ts` calls ev
 
 | Resource | Donor viewers | Staff only | Admins only (org_admin, platform_admin) |
 |---|---|---|---|
-| Organisation, users | own organisation profile | | edit organisation, webhook tokens, users |
+| Organisation, users | own organisation profile; change own password (every role) | | edit organisation, webhook tokens, users; invite; reset another user's password (§9) |
 | Projects | list, project page (donor-visible documents only; counts of what donors see), export (donor export, §8.3) | edit | create, archive |
 | Documents | donor-visible documents without AI analysis or uploader name: list, download, status (others answer 404) | upload (AI analysis), delete | |
 | Frameworks, results, indicators | read | generate (AI), manual framework, add, edit, delete, alternatives (AI) | approve |
@@ -179,11 +182,11 @@ Donor responses are built from explicit field lists in `src/services/privacy/don
 
 ### 8.6 Known limitations
 
-1. Reset links are not single-use, and reset tokens share the access-token secret (they are refused as access tokens, §5). Follow-ups: single-use reset links; a separate audience or secret for reset tokens (RFC 8725 §3.12).
+1. Passwords (§9): a password change, a reset link or an admin reset ends every other session of the account at its next refresh, but an access token already issued is not checked against the database and stays valid until it expires (at most 15 minutes). A temporary password is not forced to be changed at the next sign-in (that needs a column): the admin who passes it on asks the person to change it in Settings. bcrypt reads only the first 72 bytes of a password, so two long passwords that share those bytes are the same password. The common-password list is short (about 120 entries) and bundled; checking a large breached-password corpus is not done.
 2. The audit log keeps the new values of allow-listed M&E fields (§8.5), not the previous ones; the previous value is the one in the row before. Audit entries for personal-data exports and downloads are F3.
 3. KoboToolbox GPS is stored exactly; coarsening at ingestion needs an owner decision (F4).
 4. Donor viewers see every project of their organisation, with budgets; per-donor project access needs a migration (F5).
-5. Users are hard-deleted, together with their own notifications (so a donor viewer told about a published report can still be removed). A user who uploaded documents, entered data points or created a webhook token cannot be deleted (400). A removed user's refresh token is refused at once, but an access token already issued is not checked against the database and stays valid until it expires (15 minutes). Only a platform_admin should change a platform_admin (F6).
+5. Users are hard-deleted, together with their own notifications (so a donor viewer told about a published report can still be removed). A user who uploaded documents, entered data points or created a webhook token cannot be deleted (400). A removed user's refresh token is refused at once, but an access token already issued is not checked against the database and stays valid until it expires (15 minutes). Only a platform admin can change, remove or reset the password of a platform admin (F6, closed): an org admin gets 403 on all three, so a platform admin cannot be demoted first and then reset.
 6. Donors still see assessment price estimates (`GET /assessments/:id/estimate`), and indicators the AI generated that nobody approved yet, with their AI rationale (F7, Phase 4). Assessments have no review step, so the AI assessment report is not shown to donors at all; reports reach donors only once an org admin publishes them (§8.3).
 7. Indicator values and the breakdowns staff enter are shown to donors exactly. Suppressing and rounding staff-entered breakdowns, and a protected sex × age table, are F8 (owner decision: donors' reporting templates often need exact disaggregated results).
 8. Respondent-level rows are recognised by their source (`dataSource: KoboToolbox`, which the webhook writes). Results staff enter are trusted to be results: a row typed or imported per household under another source would reach donors as a value (without notes, author or unlisted area). An explicit "respondent-level" flag set at ingestion needs a migration (F13).
@@ -221,3 +224,43 @@ Donor responses are built from explicit field lists in `src/services/privacy/don
 - Palestine: 7amleh position paper on the draft data-protection decree-law: https://7amleh.org/post/position-paper-personal-data-protection-draft-law-by-decree-from-a-human-rights-based-perspective · WAFA, 4 November 2025: https://www.wafa.ps/Pages/Details/135228 (no comprehensive law in force; check again when it is issued)
 
 No source gives one humanitarian cell size; the thresholds are a reasoned choice (§8.4).
+
+## 9. Passwords and email
+
+Owner approval of 13 October 2026 (staging sign-in), with the fixes from its security review. Code: `src/utils/passwordPolicy.ts` (the policy and the generator, pure), `src/services/auth/passwords.ts`, `src/utils/tokens.ts`, `src/utils/email.ts`, `src/middleware/rateLimit.ts`, `src/routes/auth.ts`, `src/routes/users.ts`, `prisma/seedAccounts.ts`. Tests: `tests/passwordPolicy.test.ts`, `tests/resetToken.test.ts`, `tests/email.test.ts`, `tests/rateLimit.test.ts`, `tests/seedAccounts.test.ts`, `tests/passwordRoutes.test.ts`.
+
+**Policy.** One policy for a changed password, a password set through a reset link and every temporary password. A password is compared and hashed in its Unicode NFC form, so the same Arabic text typed on another keyboard is the same password. It must:
+
+- have at least 10 and at most 200 characters (counted as characters, so an Arabic letter counts once);
+- differ from the current password;
+- not contain the part of the account's email address before the @, in any case (also the part before a `+` tag; parts shorter than 3 characters are not checked, they would forbid ordinary letter pairs);
+- use at least 4 different characters (so not only spaces, `aaaaaaaaaa` or `1212121212`);
+- not be a common password, also with digits or symbols around it (`Password2026!`, `1234567890`, `qwertyuiop`; about 120 entries in English and Arabic, NIST SP 800-63B §3.1.1.2), and not contain the product's name (Raqib, Momentum, in English or Arabic) or the organisation's name or one of its distinctive words.
+
+A refused password answers 400 with `{ message, code }`, the code being `password_too_short`, `password_too_long`, `password_same_as_current`, `password_contains_email`, `password_too_simple` or `password_too_common`, so the web app shows its own English or Arabic text (its copy of the policy is `src/lib/passwordPolicy.ts` in raqib-frontend). Messages never repeat the password or the email address.
+
+**Temporary passwords.** 16 characters from `crypto.randomInt` over 56 letters and digits without look-alikes (no 0, O, o, 1, l, I): about 93 bits. They meet the policy for the account (a new one is drawn otherwise). They are created when an admin invites a user (`POST /api/users/invite`) or resets another user's password (`POST /api/users/:id/reset-password`, org admins and platform admins).
+
+**Email off (no `RESEND_API_KEY`): shown once.** Staging starts without email. Then:
+
+- the invite answer (201) adds `temporaryPassword` and `emailSent: false`; the admin reset answer (200) is `{ id, emailSent: false, temporaryPassword }`. Both carry `Cache-Control: no-store`. The password is in that one answer only: the API keeps its bcrypt hash and nothing else, so it cannot be shown again; another admin reset makes a new one. The admin passes it to the tester by a separate channel;
+- `POST /api/auth/forgot-password` sends nothing and creates no link (the answer stays the same generic one); a tester who forgot their password asks an admin to reset it;
+- the log holds one line, `[Email] <kind> not sent: email is not configured (user <id>)` (kinds: `invite`, `admin reset`, `password reset`), in production and in tests. Only with `NODE_ENV=development` is there a readable `[DEV]` line, with the reset link of "Forgot password?" (never a temporary password).
+
+**Email on: links, never passwords.** No email carries a password. An invitation and an admin reset email a single-use link to choose a password (72 hours); "Forgot password?" emails a single-use reset link (one hour). All three open `${APP_URL}/reset-password?token=…`. When Resend accepted the email the answer is `{ …, emailSent: true }` with no password, and the temporary password the account was given is known to nobody. When the email fails (a Resend `{ error }` answer or a network error), the answer falls back to showing the temporary password once, as with email off, so the account never ends up with a password nobody knows. Errors are logged by their name only (`[Email] invite not sent: Resend error validation_error (user <id>)`), because Resend's messages quote the recipient. Every email is in English and Arabic, the person's language (`languagePref`) first and its subject in that language; each part is marked with its `lang` and `dir`. The sender is `EMAIL_FROM`.
+
+**Admin reset rules.** Organisation first: another organisation's user answers 404, whatever the roles (also for platform admins). Then: one's own account answers 400 with code `use_change_password`, and an org admin resetting a platform admin answers 403. M&E officers and donor viewers get 403. The old password, every reset link and every session issued for it stop working at once. Editing (`PATCH /api/users/:id`) and removing (`DELETE /api/users/:id`) a platform admin are refused to org admins the same way (403), so a platform admin cannot be demoted first and then reset.
+
+**Change password.** `POST /api/auth/change-password` with `{ currentPassword, newPassword }`, for every role, the caller's own account only (`self` in the role matrix). Success answers 200 with a new `{ accessToken, refreshToken }` (`Cache-Control: no-store`): the caller's session continues with it, and every other session of the account ends. A wrong current password answers 400 with code `current_password_incorrect`; policy errors answer 400 with their code; a password changed meanwhile answers 409 `password_changed_meanwhile`. Limited to 10 attempts per 15 minutes per user.
+
+**Sessions end when the password changes.** A refresh token is signed with `JWT_REFRESH_SECRET` (which must differ from `JWT_SECRET`) for the audience `raqib:refresh`, HS256, valid 7 days, and carries `pwd`, the fingerprint of the password hash it was issued for. `POST /api/auth/refresh` checks the algorithm, audience, claim shapes (no `purpose`), expiry and that `pwd` still matches the current hash (in constant time); any failure answers 401 with code `session_ended`. A change of password (change, reset link, admin reset) therefore ends every other session at its next refresh; an access token already issued stays valid until it expires (at most 15 minutes, §8.6). Refresh tokens issued before this change have no audience and are refused once: everyone signs in again after the deploy.
+
+**Reset links are single-use (owner-approved follow-up F1).** A reset token is signed with the API secret for the audience `raqib:password-reset` (RFC 8725 §3.12), with `purpose: 'reset'` and `pwd`, the first 16 hex characters of SHA-256 of the user's current bcrypt hash. `POST /api/auth/reset-password` checks the signature, audience, purpose, expiry (one hour, or 72 hours for a set-password link) and that `pwd` still matches the current hash, and replaces the hash only if it is still the one the link was issued for (so two requests at once with one link: one wins). The link therefore stops working after it is used and after any other password change (change password, admin reset, another link). Every failure answers 401 with code `reset_link_invalid`. `authenticate` refuses any token with a `purpose` or `aud` claim, so neither a reset token nor a refresh token is ever an access token, and `/refresh` refuses both reset and access tokens even if the two secrets were equal.
+
+**Sign-in.** An unknown email and a wrong password answer the same 401 and take as long: for an unknown email the password is compared with a hash of a random value made at start-up, so the answer time does not tell which emails have an account. "Forgot password?" answers the same for known and unknown addresses and does not wait for the email.
+
+**Rate limits on `/api/auth`.** Each kind of request has its own count, so testers behind one office address are not signed out by refreshes and a burst of failed sign-ins does not block refreshes: sign-in 30 failed attempts per 15 minutes per IP (successful sign-ins are not counted); refresh 300 per 15 minutes per IP; forgotten password and reset links 30 per 15 minutes per IP together, and "Forgot password?" also 5 an hour per email address (keyed by a hash of the address); change password 10 per 15 minutes per user. `tests/rateLimit.test.ts` checks each limit with the real configuration.
+
+**Seeded accounts.** `npm run seed` refuses `NODE_ENV=production`. In local development without `SEED_PASSWORD` the three demo accounts share the documented demo password. Anywhere else `SEED_PASSWORD` is required; it must meet the policy for every seeded account (so it cannot contain `admin`, `donor`, `momentum` or `raqib`), and it becomes the org admin's password only. The M&E officer and donor viewer accounts get a random password nobody knows: the admin gives each tester their own one-time temporary password from Settings → Team members → Reset password. The seed never prints `SEED_PASSWORD`.
+
+**Logs and audit.** No log line holds a password, a temporary password, a token, a reset link or a hash; error-handler lines for these routes hold the API's own message only. The audit row of an invite, an admin reset or a password change keeps the field names the request sent (for example `["currentPassword","newPassword"]`), never values, and never anything from the answer (§8.5), so the token pair change password returns is not recorded. `tests/passwordRoutes.test.ts` records every console line and every audit row while it runs every route above, and fails if any holds a password or token it saw.
