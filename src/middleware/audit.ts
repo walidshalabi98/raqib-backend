@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { safeErrorSummary } from '../services/ai/errors';
 
@@ -44,7 +45,7 @@ const INDICATOR_VALUES = [
   'currentValue', 'startDate', 'endDate', 'actualStartDate', 'actualEndDate',
 ] as const;
 const RESULT_VALUES = ['id', 'code', 'level', 'text', 'textAr', 'parentId'] as const;
-const PROJECT_VALUES = [
+export const PROJECT_VALUES = [
   'id', 'name', 'nameAr', 'status', 'sector', 'sectors', 'donor', 'donorType', 'budgetUsd', 'startDate', 'endDate',
   'targetBeneficiaries',
 ] as const;
@@ -80,6 +81,58 @@ export const AUDIT_VALUE_ROUTES: Readonly<Record<string, readonly string[]>> = {
   'PATCH /api/reports/:id/publish': REPORT_VALUES,
   'PATCH /api/reports/:id/unpublish': REPORT_VALUES,
 };
+
+/** The action ("METHOD /path", no query string), entity (first path segment after /api) and entity id of a request's audit row. */
+export function requestAuditTarget(req: Request): { action: string; entity: string; entityId: string } {
+  const path = req.originalUrl.split('?')[0];
+  const entity = path.replace(/^\/api\/?/, '').split('/')[0] || 'unknown';
+  // req.params is the route's after a route answered; after an error it may be reset, so fall back to the path.
+  const entityId = req.params?.id || path.match(UUID_PATTERN)?.[0] || 'N/A';
+  return { action: `${req.method} ${path}`, entity, entityId };
+}
+
+/**
+ * The audit row of a request, written by the route inside its own transaction, so the change and its record
+ * commit together, with what the middleware cannot know: the previous value (for example the status a project
+ * had before it was archived, or what a permanent delete removed). Same action, entity, entity id and
+ * `newValue = { status, fields, values }` as the middleware's rows; the action is the route as registered
+ * with its ids filled in (`POST /api/projects/<id>/archive`), whatever the spelling of the request path.
+ * Call markRequestAudited(res) once the transaction has committed, so the middleware does not write a second
+ * row; if the transaction fails, the middleware writes its usual row with the error status.
+ * Never put personal data or free text from a request body in `previousValue` or `extra`.
+ */
+export async function writeRequestAudit(
+  db: Prisma.TransactionClient,
+  req: Request,
+  entry: { status: number; previousValue: unknown; values?: Record<string, unknown> | null; extra?: Record<string, unknown> },
+): Promise<void> {
+  if (!req.user) throw new Error('writeRequestAudit needs a signed-in user');
+  const { entity, entityId } = requestAuditTarget(req);
+  const routePath = req.route?.path ? `${req.baseUrl}${req.route.path}` : null;
+  const path = routePath
+    ? routePath.replace(/:(\w+)/g, (match, name: string) => (typeof req.params?.[name] === 'string' ? req.params[name] : match))
+    : req.originalUrl.split('?')[0];
+  await db.auditLog.create({
+    data: {
+      userId: req.user.id,
+      action: `${req.method} ${path}`,
+      entity,
+      entityId,
+      ...(entry.previousValue != null && { previousValue: JSON.parse(JSON.stringify(entry.previousValue)) }),
+      newValue: JSON.parse(JSON.stringify({
+        status: entry.status,
+        fields: bodyFieldNames(req.body),
+        ...(entry.values && { values: entry.values }),
+        ...entry.extra,
+      })),
+    },
+  });
+}
+
+/** After the route's transaction (with its writeRequestAudit row) committed: the middleware writes no second row. */
+export function markRequestAudited(res: Response): void {
+  res.locals.auditRecorded = true;
+}
 
 /** The allow-listed fields of a response body (a plain object), or null when there are none. */
 export function auditValues(fields: readonly string[], body: unknown): Record<string, unknown> | null {
@@ -119,10 +172,9 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
       written = true;
       // req.user is set by route-level authenticate, after this middleware runs.
       if (!req.user) return;
-      const path = req.originalUrl.split('?')[0];
-      const entity = path.replace(/^\/api\/?/, '').split('/')[0] || 'unknown';
-      // req.params is the route's after a route answered; after an error it may be reset, so fall back to the path.
-      const entityId = req.params?.id || path.match(UUID_PATTERN)?.[0] || 'N/A';
+      // The route already wrote this request's row in its own transaction (writeRequestAudit).
+      if (res.locals.auditRecorded === true) return;
+      const { action, entity, entityId } = requestAuditTarget(req);
       const fields = bodyFieldNames(req.body);
       const newValue = {
         status: res.statusCode,
@@ -130,7 +182,7 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
         ...(values && { values }),
         ...(!res.writableFinished && { aborted: true }),
       };
-      auditLog(req.user.id, `${req.method} ${path}`, entity, entityId, undefined, newValue).catch(err => {
+      auditLog(req.user.id, action, entity, entityId, undefined, newValue).catch(err => {
         console.error(`[Audit] Could not write the audit row for ${req.method} ${entity}: ${safeErrorSummary(err)}`);
       });
     };

@@ -144,12 +144,13 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
   });
 }));
 
-// GET /api/dashboard/overview — Org-level overview
+// GET /api/dashboard/overview — Org-level overview of the projects that are not archived (like GET /api/projects:
+// an archived project is hidden from the lists, and its indicators raise no alerts).
 router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
 
   const projects = await prisma.project.findMany({
-    where: { organizationId: orgId },
+    where: { organizationId: orgId, status: { not: 'archived' } },
     include: {
       frameworks: {
         ...CURRENT_FRAMEWORK,

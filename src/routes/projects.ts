@@ -1,6 +1,8 @@
 import { Router, Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { assertProjectAccess } from '../middleware/access';
+import { auditValues, markRequestAudited, PROJECT_VALUES, writeRequestAudit } from '../middleware/audit';
 import { authenticate, authorize } from '../middleware/auth';
 import { hasStaffRole } from '../middleware/roles';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
@@ -8,6 +10,10 @@ import { validationErrorBody } from '../services/dataPoints/fields';
 import { DOCUMENT_FIELDS, withTextLength } from './documents';
 import { sortResultNodes } from '../services/indicators/hierarchy';
 import { parseProjectCreate, parseProjectUpdate } from '../services/projects/validation';
+import {
+  ALREADY_ARCHIVED, CONFIRM_NAME_MISMATCH, confirmNameMatches, DELETE_BLOCKED_MESSAGE, DELETE_TRANSACTION_OPTIONS, deleteProjectRows, lockProject,
+  NOT_ARCHIVED, removeStoredFiles, restoreStatus,
+} from '../services/projects/lifecycle';
 import { loadBeneficiaryAggregates, toDonorBeneficiarySummary } from '../services/beneficiaries/donorSummary';
 import {
   donorDataPointWhere, donorDocumentWhere, donorReportWhere, toDonorAssessment, toDonorDocument, toDonorIndicatorData,
@@ -16,12 +22,13 @@ import {
 
 const router = Router();
 
-// GET /api/projects
-// Counts follow what the caller can see (SECURITY_SETUP §8.3): donor viewers count donor-visible documents and
-// never KoboToolbox rows.
+// GET /api/projects — the organisation's projects that are not archived; ?archived=true lists only the archived
+// ones (any other value counts as false). Counts follow what the caller can see (SECURITY_SETUP §8.3): donor
+// viewers count donor-visible documents and never KoboToolbox rows.
 router.get('/', authenticate, asyncHandler(async (req: Request, res: Response) => {
+  const archived = req.query.archived === 'true';
   const projects = await prisma.project.findMany({
-    where: { organizationId: req.user!.organizationId },
+    where: { organizationId: req.user!.organizationId, status: archived ? 'archived' : { not: 'archived' } },
     include: {
       _count: {
         select: {
@@ -54,7 +61,7 @@ router.post('/', authenticate, authorize('org_admin', 'platform_admin'), asyncHa
   res.status(201).json(project);
 }));
 
-// GET /api/projects/:id
+// GET /api/projects/:id — also for an archived project (read-only view)
 router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
@@ -86,8 +93,9 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
   res.json({ ...project, documents: hasStaffRole(req.user) ? documents : documents.map(toDonorDocument) });
 }));
 
-// PATCH /api/projects/:id — any subset of the create fields, plus status.
-// Changing `sector` or `sectors` keeps the primary sector in `sectors`.
+// PATCH /api/projects/:id — any subset of the create fields, plus status (never `archived`: archiving is
+// POST /:id/archive, admins only). Changing `sector` or `sectors` keeps the primary sector in `sectors`.
+// An archived project answers 409 project_archived (restore it first).
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const current = await assertProjectAccess(req, req.params.id);
 
@@ -284,16 +292,92 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
   });
 }));
 
-// DELETE /api/projects/:id — Archive
-router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
-  await assertProjectAccess(req, req.params.id);
+// POST /api/projects/:id/archive — Archive (org admins, platform admins): hidden from the project list, nothing is
+// lost, read-only until restored. The audit row keeps the status before archiving (previousValue.status).
+router.post('/:id/archive', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
+  // Not the read-only rule: an archived project answers its own 409 here.
+  await assertProjectAccess(req, req.params.id, { allowArchived: true });
 
-  await prisma.project.update({
-    where: { id: req.params.id },
-    data: { status: 'archived' },
+  const archived = await prisma.$transaction(async tx => {
+    const locked = await lockProject(tx, req.params.id);
+    if (!locked) throw new AppError(404, 'Project not found');
+    if (locked.status === 'archived') throw new AppError(409, ALREADY_ARCHIVED.message, ALREADY_ARCHIVED.code);
+    const project = await tx.project.update({ where: { id: locked.id }, data: { status: 'archived' } });
+    await writeRequestAudit(tx, req, {
+      status: 200,
+      previousValue: { status: locked.status },
+      values: auditValues(PROJECT_VALUES, project),
+    });
+    return project;
   });
+  markRequestAudited(res);
 
-  res.json({ message: 'Project archived' });
+  res.json(archived);
+}));
+
+// POST /api/projects/:id/restore — Restore an archived project (org admins, platform admins) to the status recorded
+// by its latest archive audit row; without one: active with an approved framework, framework_review with any
+// framework, else setup.
+router.post('/:id/restore', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
+  await assertProjectAccess(req, req.params.id, { allowArchived: true });
+
+  const restored = await prisma.$transaction(async tx => {
+    const locked = await lockProject(tx, req.params.id);
+    if (!locked) throw new AppError(404, 'Project not found');
+    if (locked.status !== 'archived') throw new AppError(409, NOT_ARCHIVED.message, NOT_ARCHIVED.code);
+    const { status, source } = await restoreStatus(tx, locked.id);
+    const project = await tx.project.update({ where: { id: locked.id }, data: { status } });
+    await writeRequestAudit(tx, req, {
+      status: 200,
+      previousValue: { status: locked.status },
+      values: auditValues(PROJECT_VALUES, project),
+      extra: { restoredFrom: source },
+    });
+    return project;
+  });
+  markRequestAudited(res);
+
+  res.json(restored);
+}));
+
+// DELETE /api/projects/:id — Delete forever (org admins, platform admins), from any status. Body: { confirmName },
+// which must be the project's name (trimmed, exact, same capitals); otherwise 400 confirm_name_mismatch and nothing
+// is deleted. Every row of the project goes in one transaction (services/projects/lifecycle.ts), with its audit row
+// (previousValue: name, status and the rows removed per table); the stored files of its documents are removed after
+// the transaction commits, best effort. For test or mistaken projects: real projects are archived.
+router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), asyncHandler(async (req: Request, res: Response) => {
+  const project = await assertProjectAccess(req, req.params.id, { allowArchived: true });
+  const confirmName: unknown = req.body?.confirmName;
+  if (!confirmNameMatches(confirmName, project.name)) {
+    throw new AppError(400, CONFIRM_NAME_MISMATCH.message, CONFIRM_NAME_MISMATCH.code);
+  }
+
+  const { removed, storedFiles } = await prisma.$transaction(async tx => {
+    const locked = await lockProject(tx, project.id);
+    if (!locked) throw new AppError(404, 'Project not found');
+    // Checked again on the locked row: the project may have been renamed meanwhile.
+    if (!confirmNameMatches(confirmName, locked.name)) {
+      throw new AppError(400, CONFIRM_NAME_MISMATCH.message, CONFIRM_NAME_MISMATCH.code);
+    }
+    const result = await deleteProjectRows(tx, locked);
+    await writeRequestAudit(tx, req, {
+      status: 200,
+      previousValue: { name: locked.name, status: locked.status, removed: result.removed },
+    });
+    return result;
+  }, DELETE_TRANSACTION_OPTIONS).catch(err => {
+    // A row of another project refers to one of this project's rows (the API never creates one): the whole
+    // transaction rolled back, nothing was deleted.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2003') throw new AppError(409, DELETE_BLOCKED_MESSAGE);
+    throw err;
+  });
+  markRequestAudited(res);
+
+  const files = await removeStoredFiles(storedFiles);
+  res.json({
+    deleted: true,
+    removed: { ...removed, storageFilesRemoved: files.removed, storageFilesFailed: files.failed },
+  });
 }));
 
 export default router;

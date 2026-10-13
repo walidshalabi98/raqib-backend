@@ -68,7 +68,10 @@ const updateSchema = z.object({
   endDate: dateField().optional(),
   targetBeneficiaries: optionalNumber({ integer: true, max: MAX_TARGET_BENEFICIARIES }),
   geographicScope: optionalText(),
-  status: enumField(ProjectStatus).optional(),
+  // Archiving has its own route (POST /api/projects/:id/archive, admins only, recorded for restore).
+  status: enumField(ProjectStatus)
+    .refine(status => status !== 'archived', { message: 'cannot be set to archived here: archive the project instead' })
+    .optional(),
   humanitarian: humanitarianField.optional(),
 }, { invalid_type_error: 'must be a JSON object' });
 

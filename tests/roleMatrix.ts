@@ -48,7 +48,9 @@ export const ROLE_MATRIX: Record<string, Access> = {
   'get /api/projects/:id': 'all', // donors: donor-visible documents only
   'patch /api/projects/:id': STAFF,
   'get /api/projects/:id/export': 'all', // donors: the donor export, no beneficiaries
-  'delete /api/projects/:id': ADMIN,
+  'delete /api/projects/:id': ADMIN, // delete forever, after typing the project name (owner decision, 13 October 2026)
+  'post /api/projects/:id/archive': ADMIN,
+  'post /api/projects/:id/restore': ADMIN,
   'get /api/projects/:id/documents': 'all', // donors: donor-visible documents only
   'post /api/projects/:id/documents': STAFF, // AI document analysis
   'get /api/documents/:id/download': 'all', // donors: 404 for hidden documents

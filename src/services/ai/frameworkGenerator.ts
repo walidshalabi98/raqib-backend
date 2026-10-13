@@ -293,9 +293,10 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
       data: { status: 'expert_review', aiModelUsed: aiModel, generationError: null },
     });
 
-    // Update project status
-    await tx.project.update({
-      where: { id: projectId },
+    // Update project status. A project archived while its framework was being generated stays archived (it is
+    // read-only until restored, and restore puts back the status it had when archived).
+    await tx.project.updateMany({
+      where: { id: projectId, status: { not: 'archived' } },
       data: { status: 'framework_review' },
     });
 

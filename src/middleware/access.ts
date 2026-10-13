@@ -1,4 +1,5 @@
 import { Request } from 'express';
+import type { ProjectStatus } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { AppError } from './errorHandler';
 
@@ -7,6 +8,13 @@ import { AppError } from './errorHandler';
  * project-owned resource must load it through one of these, so a user can
  * only ever reach records of their own organisation. Resources of another
  * organisation are reported as 404 (never 403) so ids cannot be probed.
+ *
+ * They are also where an archived project becomes read-only (owner decision of 13 October 2026): a write
+ * request (POST, PUT, PATCH, DELETE) that reaches a resource of an archived project through any of these
+ * helpers answers 409 `project_archived`; reads are unaffected. Only the routes that act on the archive state
+ * itself pass `{ allowArchived: true }` to assertProjectAccess: restore and permanent delete (and archive, which
+ * answers its own 409 `project_already_archived`). The webhooks resolve a project from the token's organisation
+ * and apply the same rule with assertProjectWritable.
  */
 
 /** The caller's organisation. No user, or a user without an organisation, is 401: never an unscoped query. */
@@ -16,11 +24,33 @@ function orgId(req: Request): string {
   return organizationId;
 }
 
-export async function assertProjectAccess(req: Request, projectId: string) {
+/** Requests that read. Everything else (POST, PUT, PATCH, DELETE, or a method missing) counts as a write. */
+const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+export const PROJECT_ARCHIVED_MESSAGE = 'This project is archived. Restore it to make changes.';
+export const PROJECT_ARCHIVED_CODE = 'project_archived';
+
+/** 409 `project_archived` for a write request (POST, PUT, PATCH, DELETE) to a resource of an archived project. */
+export function assertProjectWritable(req: Pick<Request, 'method'>, project: { status: ProjectStatus }): void {
+  if (project.status !== 'archived') return;
+  const method = typeof req.method === 'string' ? req.method.toUpperCase() : '';
+  if (!READ_METHODS.has(method)) throw new AppError(409, PROJECT_ARCHIVED_MESSAGE, PROJECT_ARCHIVED_CODE);
+}
+
+export interface ProjectAccessOptions {
+  /**
+   * Skip the archived read-only rule. Only for POST /api/projects/:id/restore and DELETE /api/projects/:id
+   * (and POST /api/projects/:id/archive, which refuses an archived project with its own code).
+   */
+  allowArchived?: boolean;
+}
+
+export async function assertProjectAccess(req: Request, projectId: string, options: ProjectAccessOptions = {}) {
   const project = await prisma.project.findFirst({
     where: { id: projectId, organizationId: orgId(req) },
   });
   if (!project) throw new AppError(404, 'Project not found');
+  if (!options.allowArchived) assertProjectWritable(req, project);
   return project;
 }
 
@@ -30,6 +60,7 @@ export async function assertFrameworkAccess(req: Request, frameworkId: string) {
     include: { project: true },
   });
   if (!framework) throw new AppError(404, 'Framework not found');
+  assertProjectWritable(req, framework.project);
   return framework;
 }
 
@@ -39,6 +70,7 @@ export async function assertIndicatorAccess(req: Request, indicatorId: string) {
     include: { framework: { include: { project: true } } },
   });
   if (!indicator) throw new AppError(404, 'Indicator not found');
+  assertProjectWritable(req, indicator.framework.project);
   return indicator;
 }
 
@@ -48,6 +80,7 @@ export async function assertDocumentAccess(req: Request, documentId: string) {
     include: { project: true },
   });
   if (!document) throw new AppError(404, 'Document not found');
+  assertProjectWritable(req, document.project);
   return document;
 }
 
@@ -57,6 +90,7 @@ export async function assertAssessmentAccess(req: Request, assessmentId: string)
     include: { project: true },
   });
   if (!assessment) throw new AppError(404, 'Assessment not found');
+  assertProjectWritable(req, assessment.project);
   return assessment;
 }
 
@@ -66,6 +100,7 @@ export async function assertQualitativeAccess(req: Request, entryId: string) {
     include: { project: true, assessment: true },
   });
   if (!entry) throw new AppError(404, 'Entry not found');
+  assertProjectWritable(req, entry.project);
   return entry;
 }
 
@@ -75,6 +110,7 @@ export async function assertReportAccess(req: Request, reportId: string) {
     include: { project: true },
   });
   if (!report) throw new AppError(404, 'Report not found');
+  assertProjectWritable(req, report.project);
   return report;
 }
 
@@ -84,6 +120,7 @@ export async function assertBeneficiaryAccess(req: Request, beneficiaryId: strin
     include: { project: true },
   });
   if (!beneficiary) throw new AppError(404, 'Beneficiary not found');
+  assertProjectWritable(req, beneficiary.project);
   return beneficiary;
 }
 
@@ -113,5 +150,6 @@ export async function assertResultAccess(req: Request, resultId: string) {
     include: { framework: { include: { project: true } } },
   });
   if (!result) throw new AppError(404, 'Result not found');
+  assertProjectWritable(req, result.framework.project);
   return result;
 }

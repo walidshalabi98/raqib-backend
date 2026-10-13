@@ -21,7 +21,9 @@ const ROUTES: RouteCase[] = [
   { method: 'get', route: '/api/projects/:id', path: b => `/api/projects/${b.project.id}` },
   { method: 'patch', route: '/api/projects/:id', path: b => `/api/projects/${b.project.id}`, body: () => ({ name: 'Hijacked' }) },
   { method: 'get', route: '/api/projects/:id/export', path: b => `/api/projects/${b.project.id}/export` },
-  { method: 'delete', route: '/api/projects/:id', path: b => `/api/projects/${b.project.id}` },
+  { method: 'delete', route: '/api/projects/:id', path: b => `/api/projects/${b.project.id}`, body: b => ({ confirmName: b.project.name }) },
+  { method: 'post', route: '/api/projects/:id/archive', path: b => `/api/projects/${b.project.id}/archive` },
+  { method: 'post', route: '/api/projects/:id/restore', path: b => `/api/projects/${b.project.id}/restore` },
   // Documents
   { method: 'get', route: '/api/projects/:id/documents', path: b => `/api/projects/${b.project.id}/documents` },
   { method: 'post', route: '/api/projects/:id/documents', path: b => `/api/projects/${b.project.id}/documents`, upload: true },

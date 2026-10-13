@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import type { QualitativeType } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
-import { assertIndicatorsInProject } from '../middleware/access';
+import { assertIndicatorsInProject, assertProjectWritable } from '../middleware/access';
 import { authenticateWebhook, logWebhookRejection } from '../middleware/webhookAuth';
 import { normaliseValue } from '../services/dataPoints/validation';
 import { describeRedactions, redactQualitativeFields, redactionTotal } from '../services/qualitative/redactEntry';
@@ -13,13 +13,23 @@ const router = Router();
 // Every webhook needs a valid organisation token (X-Raqib-Webhook-Token).
 router.use(authenticateWebhook);
 
-/** Loads a project only if it belongs to the organisation that owns the webhook token. */
+/**
+ * Loads a project only if it belongs to the organisation that owns the webhook token. An archived project is
+ * read-only: 409 project_archived, as for every write through the access helpers (nothing is imported).
+ */
 async function findTokenProject(req: Request, projectId: unknown) {
   if (typeof projectId !== 'string' || !projectId) return null;
   const project = await prisma.project.findFirst({
     where: { id: projectId, organizationId: req.webhook!.organizationId },
   });
-  if (!project) logWebhookRejection(req, 'project_not_in_organization', { organizationId: req.webhook!.organizationId });
+  if (!project) {
+    logWebhookRejection(req, 'project_not_in_organization', { organizationId: req.webhook!.organizationId });
+    return null;
+  }
+  if (project.status === 'archived') {
+    logWebhookRejection(req, 'project_archived', { organizationId: req.webhook!.organizationId, projectId: project.id });
+    assertProjectWritable(req, project);
+  }
   return project;
 }
 
