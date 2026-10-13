@@ -389,6 +389,10 @@ Decisions already made (12 October 2026):
 - **Failed AI assessments:** Phase 6 adds a retry (backend endpoint and button).
 - **Frontend `npm audit`:** the 5 high findings in Tailwind 3's dev-only file-watcher chain are accepted until Tailwind is upgraded in Phase 6.
 
+Decisions already made (13 October 2026):
+
+- **Donor viewers:** 13 Oct 2026: donor viewers read-only, no beneficiary personal data; owner approved. Every write, delete and AI route refuses donor viewers; donors get aggregated beneficiary figures with small counts hidden (below 5, or below 10 for vulnerability and services) and every other count rounded to the nearest 5, KoboToolbox submissions only as monthly aggregates published after the month closes (never counted one by one), and never names, phone numbers, ID numbers, transcripts, unreviewed AI output or places finer than a governorate (backend `docs/SECURITY_SETUP.md` §8). Access tokens must carry an organisation and a role; reset tokens are refused. D2: the live database holds no AuditLog, WebhookToken or Beneficiary rows (checked read-only), so nothing to clean or rotate.
+
 ---
 
 ## Status table

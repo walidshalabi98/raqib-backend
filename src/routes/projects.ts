@@ -2,21 +2,34 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { assertProjectAccess } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
+import { hasStaffRole } from '../middleware/roles';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { validationErrorBody } from '../services/dataPoints/fields';
 import { DOCUMENT_FIELDS, withTextLength } from './documents';
 import { sortResultNodes } from '../services/indicators/hierarchy';
 import { parseProjectCreate, parseProjectUpdate } from '../services/projects/validation';
+import { loadBeneficiaryAggregates, toDonorBeneficiarySummary } from '../services/beneficiaries/donorSummary';
+import {
+  donorDataPointWhere, donorDocumentWhere, donorReportWhere, toDonorAssessment, toDonorDocument, toDonorIndicatorData,
+  toDonorQualitativeEntry,
+} from '../services/privacy/donorView';
 
 const router = Router();
 
 // GET /api/projects
+// Counts follow what the caller can see (SECURITY_SETUP §8.3): donor viewers count donor-visible documents and
+// never KoboToolbox rows.
 router.get('/', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const projects = await prisma.project.findMany({
     where: { organizationId: req.user!.organizationId },
     include: {
       _count: {
-        select: { documents: true, frameworks: true, assessments: true, dataPoints: true },
+        select: {
+          documents: { where: donorDocumentWhere(req.user) },
+          frameworks: true,
+          assessments: true,
+          dataPoints: { where: donorDataPointWhere(req.user) },
+        },
       },
     },
     orderBy: { createdAt: 'desc' },
@@ -46,8 +59,8 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
-      // The same document fields as GET /projects/:id/documents: never parsedText or fileUrl.
-      documents: { select: DOCUMENT_FIELDS, orderBy: { uploadedAt: 'desc' } },
+      // The same document fields and the same donor filter as GET /projects/:id/documents: never parsedText or fileUrl.
+      documents: { select: DOCUMENT_FIELDS, where: donorDocumentWhere(req.user), orderBy: { uploadedAt: 'desc' } },
       // The current framework: the newest version whose AI generation did not fail.
       frameworks: {
         where: { generationError: null },
@@ -55,14 +68,22 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
         take: 1,
         include: { indicators: { orderBy: { sortOrder: 'asc' } } },
       },
+      // Counts of what the caller can see: donors count no KoboToolbox rows and published reports only.
       _count: {
-        select: { assessments: true, dataPoints: true, qualitativeEntries: true, reports: true },
+        select: {
+          assessments: true,
+          dataPoints: { where: donorDataPointWhere(req.user) },
+          qualitativeEntries: true,
+          reports: { where: donorReportWhere(req.user) },
+        },
       },
     },
   });
 
   if (!project) throw new AppError(404, 'Project not found');
-  res.json({ ...project, documents: await withTextLength(project.documents) });
+  const documents = await withTextLength(project.documents);
+  // Donor viewers: no AI analysis (not reviewed) and no uploader names on documents (SECURITY_SETUP §8.3).
+  res.json({ ...project, documents: hasStaffRole(req.user) ? documents : documents.map(toDonorDocument) });
 }));
 
 // PATCH /api/projects/:id — any subset of the create fields, plus status.
@@ -84,8 +105,14 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
   res.json(updated);
 }));
 
-// GET /api/projects/:id/export - Export project data as JSON (for Excel conversion)
+// GET /api/projects/:id/export - Export project data as JSON (for Excel conversion).
+// Staff (audience 'staff'): everything, beneficiaries included. Everyone else (audience 'donor',
+// personalData 'excluded'): every part built from an explicit field list (SECURITY_SETUP §8.3): no
+// beneficiaries key, a beneficiary summary (small counts hidden, other counts rounded), data points without
+// notes, attachments, author or unlisted areas, KoboToolbox rows as released monthly aggregates only,
+// qualitative entries as type, month and participants only, and assessments without their AI text or price.
 router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: Response) => {
+  const staff = hasStaffRole(req.user);
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
@@ -102,12 +129,6 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
               dataPoints: { orderBy: { collectionDate: 'desc' } },
             },
           },
-        },
-      },
-      beneficiaries: {
-        orderBy: { registrationDate: 'desc' },
-        include: {
-          services: { orderBy: { dateProvided: 'desc' } },
         },
       },
       assessments: { orderBy: { requestedAt: 'desc' } },
@@ -167,21 +188,65 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
       libraryId: ind.libraryId,
       standardReferenceCode: ind.standardReferenceCode,
       provenance: ind.provenance,
-      dataPoints: ind.dataPoints.map(dp => ({
-        id: dp.id,
-        value: dp.value,
-        collectionDate: dp.collectionDate,
-        collectionMethod: dp.collectionMethod,
-        dataSource: dp.dataSource,
-        geographicArea: dp.geographicArea,
-        notes: dp.notes,
-        breakdown: dp.breakdown,
-      })),
+      ...(staff ? {
+        dataPoints: ind.dataPoints.map(dp => ({
+          id: dp.id,
+          value: dp.value,
+          collectionDate: dp.collectionDate,
+          collectionMethod: dp.collectionMethod,
+          dataSource: dp.dataSource,
+          geographicArea: dp.geographicArea,
+          notes: dp.notes,
+          breakdown: dp.breakdown,
+        })),
+      } : toDonorIndicatorData(ind.dataPoints, () => ind.unit)),
     }))
   );
 
+  const projectFields = {
+    id: project.id,
+    name: project.name,
+    nameAr: project.nameAr,
+    description: project.description,
+    sector: project.sector,
+    sectors: project.sectors,
+    humanitarian: project.humanitarian,
+    donor: project.donor,
+    donorType: project.donorType,
+    budgetUsd: project.budgetUsd,
+    startDate: project.startDate,
+    endDate: project.endDate,
+    targetBeneficiaries: project.targetBeneficiaries,
+    geographicScope: project.geographicScope,
+    status: project.status,
+  };
+
+  if (!staff) {
+    res.json({
+      audience: 'donor',
+      personalData: 'excluded',
+      project: projectFields,
+      frameworks,
+      indicators,
+      beneficiarySummary: toDonorBeneficiarySummary(await loadBeneficiaryAggregates(project.id)),
+      qualitativeEntries: project.qualitativeEntries.map(toDonorQualitativeEntry),
+      assessments: project.assessments.map(toDonorAssessment),
+      exportedAt: new Date().toISOString(),
+    });
+    return;
+  }
+
+  // Staff only: beneficiaries with services, loaded after the role check so a donor request never reads them.
+  const beneficiaryRows = await prisma.beneficiary.findMany({
+    where: { projectId: project.id },
+    orderBy: { registrationDate: 'desc' },
+    include: {
+      services: { orderBy: { dateProvided: 'desc' } },
+    },
+  });
+
   // Flatten beneficiaries with services
-  const beneficiaries = project.beneficiaries.map(b => ({
+  const beneficiaries = beneficiaryRows.map(b => ({
     id: b.id,
     fullName: b.fullName,
     fullNameAr: b.fullNameAr,
@@ -208,23 +273,8 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
   }));
 
   res.json({
-    project: {
-      id: project.id,
-      name: project.name,
-      nameAr: project.nameAr,
-      description: project.description,
-      sector: project.sector,
-      sectors: project.sectors,
-      humanitarian: project.humanitarian,
-      donor: project.donor,
-      donorType: project.donorType,
-      budgetUsd: project.budgetUsd,
-      startDate: project.startDate,
-      endDate: project.endDate,
-      targetBeneficiaries: project.targetBeneficiaries,
-      geographicScope: project.geographicScope,
-      status: project.status,
-    },
+    audience: 'staff',
+    project: projectFields,
     frameworks,
     indicators,
     beneficiaries,

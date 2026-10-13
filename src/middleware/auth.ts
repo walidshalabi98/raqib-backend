@@ -51,16 +51,27 @@ export function authenticate(req: Request, res: Response, next: NextFunction): v
   next();
 }
 
-export function authorize(...roles: UserRole[]) {
-  return (req: Request, res: Response, next: NextFunction): void => {
+/** A role check, tagged with the roles it allows so tests/roles.test.ts can compare every route with its matrix entry. */
+export type RoleGuard = ((req: Request, res: Response, next: NextFunction) => void) & { readonly allowedRoles: readonly UserRole[] };
+
+/**
+ * Refuses (403 "Insufficient permissions") any role not listed, including a missing role. At least one
+ * role is required: there is no "empty list allows everyone" form. Put it straight after `authenticate`,
+ * before multer and any rate limiter, so a refused request costs nothing.
+ */
+export function authorize(...roles: [UserRole, ...UserRole[]]): RoleGuard {
+  if (roles.length === 0) throw new Error('authorize() needs at least one role');
+  const allowedRoles: readonly UserRole[] = Object.freeze([...roles]);
+  const roleGuard = (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {
       res.status(401).json({ message: 'Not authenticated' });
       return;
     }
-    if (roles.length > 0 && !roles.includes(req.user.role)) {
+    if (!allowedRoles.includes(req.user.role)) {
       res.status(403).json({ message: 'Insufficient permissions' });
       return;
     }
     next();
   };
+  return Object.assign(roleGuard, { allowedRoles });
 }

@@ -46,6 +46,9 @@ export async function createOrgFixture(label: string) {
   const officer = await prisma.user.create({
     data: { organizationId: org.id, email: `me-${label}@example.org`, passwordHash: 'x', fullName: `Officer ${label}`, role: 'me_officer' },
   });
+  const donor = await prisma.user.create({
+    data: { organizationId: org.id, email: `donor-${label}@example.org`, passwordHash: 'x', fullName: `Donor ${label}`, role: 'donor_viewer' },
+  });
   const project = await prisma.project.create({
     data: {
       organizationId: org.id, name: `Project ${label}`, sector: 'education', donor: 'EU', donorType: 'eu',
@@ -85,9 +88,10 @@ export async function createOrgFixture(label: string) {
   });
 
   return {
-    org, admin, officer, project, framework, result, indicator, assessment, dataPoint, qualitative, report, beneficiary, document,
+    org, admin, officer, donor, project, framework, result, indicator, assessment, dataPoint, qualitative, report, beneficiary, document,
     adminAuth: bearer(admin),
     officerAuth: bearer(officer),
+    donorAuth: bearer(donor),
   };
 }
 

@@ -92,6 +92,8 @@ npm test
 
 Without `TEST_DATABASE_URL` the integration tests are skipped. AI calls are always mocked in tests (`tests/setup.ts` also points the SDK at an unreachable address, so an unmocked call fails at once); `npm run ai:smoke` is the only command that calls the real API.
 
+Every new route needs a role decision in `tests/roleMatrix.ts`, and every new `app.use` / `router.use` layer a review in `tests/roles.test.ts`: that test (no database) fails otherwise. A route open to donor viewers (`all` or `self`) also needs a request in `tests/donorAi.test.ts` (no donor request may reach an AI model) and, for a GET, in `tests/donorAccess.test.ts` (no personal data in the answer); their coverage tests fail otherwise. See [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md) §8.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every pull request and on `main`: install, Prisma generate, lint, typecheck, tests against a pgvector Postgres service, build and `npm audit --audit-level=high`.
