@@ -20,6 +20,7 @@ import {
   verifyResetToken,
 } from '../utils/tokens';
 import { sendPasswordResetEmail } from '../utils/email';
+import { normalizeEmail } from '../utils/emailAddress';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
@@ -62,8 +63,9 @@ function sessionTokens(user: Pick<User, 'id' | 'email' | 'organizationId' | 'rol
 
 // POST /api/auth/login — an unknown email and a wrong password take as long and answer the same
 router.post('/login', authLimiters.signIn, asyncHandler(async (req: Request, res: Response) => {
-  const email = bodyString(req.body, 'email');
+  const rawEmail = bodyString(req.body, 'email');
   const password = bodyString(req.body, 'password');
+  const email = rawEmail ? normalizeEmail(rawEmail) : '';
   if (!email || !password) throw new AppError(400, 'Email and password are required');
 
   const found = await prisma.user.findUnique({
@@ -116,7 +118,8 @@ router.post(
   authLimiters.passwordReset,
   authLimiters.forgotPasswordPerEmail,
   asyncHandler(async (req: Request, res: Response) => {
-    const email = bodyString(req.body, 'email')?.trim();
+    const rawEmail = bodyString(req.body, 'email');
+    const email = rawEmail ? normalizeEmail(rawEmail) : '';
     if (!email) throw new AppError(400, 'Email is required');
 
     const user = await prisma.user.findUnique({ where: { email } });
