@@ -392,6 +392,7 @@ Decisions already made (12 October 2026):
 Decisions already made (13 October 2026):
 
 - **Donor viewers:** 13 Oct 2026: donor viewers read-only, no beneficiary personal data; owner approved. Every write, delete and AI route refuses donor viewers; donors get aggregated beneficiary figures with small counts hidden (below 5, or below 10 for vulnerability and services) and every other count rounded to the nearest 5, KoboToolbox submissions only as monthly aggregates published after the month closes (never counted one by one), and never names, phone numbers, ID numbers, transcripts, unreviewed AI output or places finer than a governorate (backend `docs/SECURITY_SETUP.md` §8). Access tokens must carry an organisation and a role; reset tokens are refused. Reports reach donor viewers only once an org admin publishes them from the reading view, after reading the AI-written text; they can be taken back to draft. D2: the live database holds no AuditLog, WebhookToken or Beneficiary rows (checked read-only), so nothing to clean or rotate.
+- **Staging sign-in:** no pre-filled login; change and reset password screens; with email off, temporary passwords are shown once to the admin and never logged; reset links are single-use (owner approved).
 
 ---
 

@@ -112,6 +112,7 @@ const ROUTES: RouteCase[] = [
   },
   { method: 'patch', route: '/api/users/:id', path: b => `/api/users/${b.officer.id}`, body: () => ({ fullName: 'Hijacked' }) },
   { method: 'delete', route: '/api/users/:id', path: b => `/api/users/${b.officer.id}` },
+  { method: 'post', route: '/api/users/:id/reset-password', path: b => `/api/users/${b.officer.id}/reset-password` },
   { method: 'patch', route: '/api/notifications/:id/read', path: b => `/api/notifications/${b.notificationId}/read` },
 ];
 
@@ -191,6 +192,7 @@ describe.skipIf(!hasTestDatabase)('organisation isolation', () => {
     expect((await prisma.beneficiary.findUniqueOrThrow({ where: { id: b.beneficiary.id } })).fullName).toBe('Person b');
     expect((await prisma.organization.findUniqueOrThrow({ where: { id: b.org.id } })).name).toBe('Org b');
     expect(await prisma.user.findUnique({ where: { id: b.officer.id } })).not.toBeNull();
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: b.officer.id } })).passwordHash).toBe('x');
     expect(await prisma.dataPoint.count({ where: { projectId: b.project.id } })).toBe(1);
     expect(await prisma.indicator.count({ where: { frameworkId: b.framework.id } })).toBe(1);
     expect(await prisma.framework.count({ where: { projectId: b.project.id } })).toBe(1);

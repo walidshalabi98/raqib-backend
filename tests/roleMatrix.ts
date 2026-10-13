@@ -10,7 +10,7 @@ import type { UserRole } from '@prisma/client';
  * - 'all': any signed-in user of the organisation (`authenticate`, no role guard); donor viewers get the
  *   donor projection where the route has personal data (§8);
  * - 'self': signed in, and the route only touches the caller's own records;
- * - 'public': no sign-in (health, sign-in, refresh, password reset);
+ * - 'public': no sign-in (health, sign-in, refresh, forgotten password, reset link);
  * - 'webhook': an organisation webhook token (`authenticateWebhook` on the webhooks router);
  * - 'signed-url': a short-lived signed URL the API issued after its own check.
  */
@@ -27,6 +27,7 @@ export const ROLE_MATRIX: Record<string, Access> = {
   'post /api/auth/refresh': 'public',
   'post /api/auth/forgot-password': 'public',
   'post /api/auth/reset-password': 'public',
+  'post /api/auth/change-password': 'self', // every role: the caller's own password, with the current one
   'post /api/webhooks/manasati': 'webhook',
   'post /api/webhooks/kobotoolbox': 'webhook',
   'get /api/files/local': 'signed-url',
@@ -38,6 +39,7 @@ export const ROLE_MATRIX: Record<string, Access> = {
   'delete /api/organizations/:id/webhook-tokens/:tokenId': ADMIN,
   'get /api/users/': ADMIN,
   'post /api/users/invite': ADMIN,
+  'post /api/users/:id/reset-password': ADMIN, // not for oneself; org admins cannot reset a platform admin (403)
   'patch /api/users/:id': ADMIN,
   'delete /api/users/:id': ADMIN,
   // Projects and documents
@@ -131,10 +133,11 @@ export const AI_ROUTES: ReadonlySet<string> = new Set([
 
 /** Non-GET routes allowed without `authorize`, with the reason. The roles test fails if this list changes without review. */
 export const NON_GET_WITHOUT_AUTHORIZE: Readonly<Record<string, string>> = {
-  'post /api/auth/login': 'before sign-in; authLimiter',
-  'post /api/auth/refresh': 'refresh token',
-  'post /api/auth/forgot-password': 'before sign-in; authLimiter',
-  'post /api/auth/reset-password': 'reset token',
+  'post /api/auth/login': 'before sign-in; failed attempts limited per IP',
+  'post /api/auth/refresh': 'refresh token bound to the current password hash; limited per IP',
+  'post /api/auth/forgot-password': 'before sign-in; limited per IP and per address',
+  'post /api/auth/reset-password': 'reset token; limited per IP',
+  'post /api/auth/change-password': "the caller's own password only (authenticate; the current password is required); limited per user",
   'post /api/webhooks/manasati': 'organisation webhook token (authenticateWebhook)',
   'post /api/webhooks/kobotoolbox': 'organisation webhook token (authenticateWebhook)',
   'patch /api/notifications/:id/read': "the caller's own notifications only (userId filter)",

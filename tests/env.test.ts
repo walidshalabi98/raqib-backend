@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseEnv } from '../src/config/env';
+import { DEFAULT_EMAIL_FROM, parseEnv } from '../src/config/env';
 import { aiCallPruneSettings } from '../src/services/maintenance/aiCallRetention';
 
 const valid = {
@@ -30,6 +30,13 @@ describe('environment validation', () => {
     expect(() => parseEnv({ ...valid, JWT_REFRESH_SECRET: 'x'.repeat(31) })).toThrow(/JWT_REFRESH_SECRET/);
   });
 
+  it('refuses one value for both JWT secrets (SR-2: a reset or access token would then pass as a refresh token)', () => {
+    const same = 'c'.repeat(64);
+    expect(() => parseEnv({ ...valid, JWT_SECRET: same, JWT_REFRESH_SECRET: same }))
+      .toThrow(/JWT_REFRESH_SECRET: must be different from JWT_SECRET/);
+    expect(() => parseEnv({ ...valid, JWT_SECRET: same, JWT_REFRESH_SECRET: `${same}d` })).not.toThrow();
+  });
+
   it('lists every problem at once', () => {
     expect(() => parseEnv({})).toThrow(/DATABASE_URL[\s\S]*JWT_SECRET[\s\S]*JWT_REFRESH_SECRET[\s\S]*ANTHROPIC_API_KEY/);
   });
@@ -55,6 +62,32 @@ describe('environment validation', () => {
     const env = parseEnv({ ...valid, WEBHOOK_SECRET: '', VOYAGE_API_KEY: '  ' });
     expect(env.webhookSecret).toBeUndefined();
     expect(env.voyageApiKey).toBeUndefined();
+  });
+});
+
+describe('EMAIL_FROM', () => {
+  it('defaults to the Raqib by Momentum Labs sender (also when blank)', () => {
+    expect(parseEnv(valid).emailFrom).toBe('Raqib by Momentum Labs <noreply@raqib.momentumlabs.ps>');
+    expect(parseEnv({ ...valid, EMAIL_FROM: '  ' }).emailFrom).toBe(DEFAULT_EMAIL_FROM);
+  });
+
+  it.each(['Raqib Staging <staging@raqib.example.org>', 'noreply@raqib.momentumlabs.ps', ' Raqib <a.b+c@mail.example.co.uk> '])(
+    'accepts %s',
+    value => {
+      expect(parseEnv({ ...valid, EMAIL_FROM: value }).emailFrom).toBe(value.trim());
+    },
+  );
+
+  it.each([
+    ['no address', 'Raqib'],
+    ['no domain dot', 'Raqib <noreply@localhost>'],
+    ['two addresses', 'a@example.org, b@example.org'],
+    ['a line break (header injection)', 'Raqib <a@example.org>\nBcc: x@example.org'],
+    ['angle brackets in the name', 'Ra<qib <a@example.org>'],
+    ['quotes in the name', '"Raqib" <a@example.org>'],
+    ['a missing closing bracket', 'Raqib <a@example.org'],
+  ])('refuses a sender with %s', (_label, value) => {
+    expect(() => parseEnv({ ...valid, EMAIL_FROM: value })).toThrow(/EMAIL_FROM: must be an email address/);
   });
 });
 

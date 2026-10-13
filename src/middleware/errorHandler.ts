@@ -5,6 +5,8 @@ export class AppError extends Error {
   constructor(
     public statusCode: number,
     message: string,
+    /** Optional stable code sent with the message (e.g. `password_too_short`), so the web app can show its own EN/AR text. */
+    public code?: string,
   ) {
     super(message);
     this.name = 'AppError';
@@ -43,7 +45,7 @@ export function errorHandler(err: Error, _req: Request, res: Response, _next: Ne
   for (const line of errorLogLines(err)) console.error(line);
 
   if (err instanceof AppError) {
-    res.status(err.statusCode).json({ message: err.message });
+    res.status(err.statusCode).json(err.code ? { message: err.message, code: err.code } : { message: err.message });
     return;
   }
 
