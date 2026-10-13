@@ -1107,6 +1107,25 @@ describe('Phase 4 review fixes: thresholds, value kinds, names, standard codes, 
       expect(documentValueSupported('30%', 'target', true, facts, docs)).toBeNull();
     });
 
+    it('"coverage from 60% to 85%": a word ending in "age" keeps the baseline on both paths (finisher re-check SPEC-2)', () => {
+      const text = 'The project will increase vaccination coverage from 60% to 85% by 2027.';
+      const ctx = docContext(text);
+      const right = validate(raw({ baselineSuggestion: '60%', baselineBasis: 'document', targetSuggestion: '85%', targetBasis: 'document' }), ctx);
+      expect(right).toMatchObject({ baselineSuggestion: '60%', baselineBasis: 'document', targetSuggestion: '85%', targetBasis: 'document' });
+      const swapped = validate(raw({ baselineSuggestion: '85%', baselineBasis: 'document', targetSuggestion: '60%', targetBasis: 'document' }), ctx);
+      expect(swapped).toMatchObject({ baselineBasis: 'none', targetBasis: 'method_only' });
+      // Framework generation: the verified baseline is kept, as in Phase 3.
+      const figures = verifyDocumentFigures([
+        { resultCode: 'O1', kind: 'baseline', value: '60%', description: '', quote: text },
+        { resultCode: 'O1', kind: 'target', value: '85%', description: '', quote: text },
+      ], [{ fileName: 'proposal.pdf', text }]);
+      const facts = factsFromVerifiedFigures(figures);
+      const docs: DocumentText[] = [{ documentId: '', fileName: 'proposal.pdf', text }];
+      expect(documentValueSupported('60%', 'baseline', true, facts, docs)).not.toBeNull();
+      expect(documentValueSupported('85%', 'target', true, facts, docs)).not.toBeNull();
+      expect(documentValueSupported('60%', 'target', true, facts, docs)).toBeNull();
+    });
+
     it('generation facts supply only their verified figures, and a clause stating the other kind wins over a wrong verified kind', () => {
       const text = 'By the end of the project, 75% of households, up from 45% in the 2025 survey, will treat their drinking water.';
       const docs: DocumentText[] = [{ documentId: '', fileName: 'proposal.pdf', text }];
@@ -1226,6 +1245,32 @@ describe('Phase 4 review fixes: thresholds, value kinds, names, standard codes, 
     expect(nameFiguresUnsupported('Number of youth trained (over 500)', [])).toEqual(['500']);
     expect(nameFiguresUnsupported('Number of children under 18 reached', [])).toEqual([]);
     expect(nameFiguresUnsupported('Number of people aged over 60 reached', [])).toEqual([]);
+  });
+
+  it('an age range or an acronym after the counted noun qualifies it (finisher re-check AI-5 and SPEC-3)', () => {
+    for (const name of ['Number of youth (15-29) employed', 'Number of children 6-59 months screened for acute malnutrition',
+      '% of women 15-49 with access to modern contraception', 'Number of youth NEET enrolled', 'Number of children 5 years old enrolled']) {
+      expect(isPeopleLevelIndicator(name), name).toBe(true);
+      expect(isPeopleLevelIndicator(name, 'عدد الشبان'), name).toBe(true);
+      expect(peopleLevelIndependent(name), name).toBe(true);
+      const s = validate(customRaw({ name, nameAr: 'عدد الشبان', disaggregation: ['location'] }));
+      expect(s.disaggregation, name).toContain('sex');
+    }
+    // Things stay things: a number does not turn a counted thing into people.
+    expect(isPeopleLevelIndicator('Number of IDP sites with functioning latrines')).toBe(false);
+    expect(isPeopleLevelIndicator('Number of 20-litre jerrycans distributed')).toBe(false);
+    // An age range right after the people counted is definitional, not a target in the name.
+    for (const name of ['% of women 15-49 using a modern contraceptive method', '% of youth 15-29 in employment 6 months after training',
+      'Number of youth (15-29) employed']) {
+      expect(nameFiguresUnsupported(name, []), name).toEqual([]);
+      expect(codes(validate(customRaw({ name })).warnings), name).not.toContain('target_in_name');
+    }
+    // A range that is not an age stays checked; so does a set the project itself defines (its output target).
+    expect(nameFiguresUnsupported('Number of households reached 3,000-3,500', [])).toEqual(['3,000', '3,500']);
+    expect(nameFiguresUnsupported('Number of women in the 40 cooperatives supported', [])).toEqual(['40']);
+    // The eval's own name check also catches "(from 40 to 70)" (validate.ts already flags it).
+    expect(nameHasTargetIndependent('Number of households with acceptable FCS (from 40 to 70)')).toBe(true);
+    expect(codes(validate(customRaw({ name: 'Number of households with acceptable FCS (from 40 to 70)' })).warnings)).toContain('target_in_name');
   });
 
   it('AI-5 side effect: rule 7 adds sex only when the counted noun is people', () => {

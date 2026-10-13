@@ -189,3 +189,34 @@ describe('rule 3 after the Phase 4 review (SPEC-3, SPEC-9)', () => {
     expect(library.filter(e => nameHasTargetOrDirection(e.name, e.nameAr)).map(e => e.id)).toEqual([]);
   });
 });
+
+describe('rule 3 after the finisher re-check: names that only start like a direction or a count', () => {
+  it.each([
+    'Higher education gross enrolment ratio',
+    'Greater Amman Municipality service satisfaction score',
+    'Better Cotton farmers trained (number)',
+    'Larger farms adopting drip irrigation (number)',
+    'More than one meal per day: % of households',
+    '24-hour recall dietary diversity score',
+    '5-year-old children enrolled in kindergarten (number)',
+    '1,000-day window: % of pregnant women counselled',
+    '3W reporting completeness rate',
+    '12 months after training: share of graduates employed',
+  ])('does not flag %s', name => {
+    expect(nameHasTargetOrDirection(name)).toBe(false);
+    expect(nameHasTargetOrDirection(name, 'مؤشر')).toBe(false);
+  });
+
+  it.each([
+    'Higher % of households with acceptable FCS',
+    'More households with acceptable FCS',
+    'Fewer children out of school',
+    'Better access to safe drinking water among displaced households',
+    'Lower share of households using crisis coping strategies',
+    '3,500 displaced households receiving food vouchers',
+    '500-1,000 households reached with hygiene kits',
+    'At least 3,500 households receive food vouchers',
+  ])('still flags %s', name => {
+    expect(nameHasTargetOrDirection(name)).toBe(true);
+  });
+});

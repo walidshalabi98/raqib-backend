@@ -368,12 +368,14 @@ const NAME_AGE_PEOPLE = '(?:children|child|girls|boys|infants|babies|adolescents
   + '|fathers|elderly|older\\s+(?:people|persons|adults)|students|pupils|learners|members|those|الأطفال|أطفال|اطفال|الطفل|طفل|النساء|نساء|الفتيات|فتيات'
   + '|الشباب|شباب|الأشخاص|أشخاص|الاشخاص|اشخاص|البالغين|بالغين|الطلاب|طلاب|كبار\\s+السن)';
 /**
- * Age phrases: "aged 15–49", "aged from 6 to 59", "aged over 60", "ages 15-24", Arabic "بعمر 15-49", "دون سن 18"; and a
- * comparative only after a people word: "children under 18", "people over 60", "women between 15 and 49", "الأطفال دون 18".
+ * Age phrases: "aged 15–49", "aged from 6 to 59", "aged over 60", "ages 15-24", Arabic "بعمر 15-49", "دون سن 18"; a
+ * comparative only after a people word: "children under 18", "people over 60", "women between 15 and 49", "الأطفال دون 18";
+ * and a range right after a people word: "women 15-49", "youth (15-29)" (finisher re-check).
  * A bare "(over 500)", "(above 3,500)" or ", between 3,000 and 3,500" is a target, not an age (SPEC-3 re-check).
  */
 const NAME_AGE_PHRASE = new RegExp(`(?<!\\p{L})(?:aged?|ages|بعمر|عمر|دون\\s+سن|فوق\\s+سن)\\s+(?:(?:from|over|under|above|below|between)\\s+)?${NAME_NUMBER}${NAME_RANGE}`
-  + `|(?<=(?<!\\p{L})${NAME_AGE_PEOPLE}\\s+)(?:under|over|below|above|between|اقل\\s+من|أقل\\s+من|بين|فوق|دون)\\s+${NAME_NUMBER}${NAME_RANGE}`, 'giu');
+  + `|(?<=(?<!\\p{L})${NAME_AGE_PEOPLE}\\s+)(?:under|over|below|above|between|اقل\\s+من|أقل\\s+من|بين|فوق|دون)\\s+${NAME_NUMBER}${NAME_RANGE}`
+  + `|(?<=(?<!\\p{L})${NAME_AGE_PEOPLE}\\s+\\(?)${NAME_NUMBER}\\s*(?:-|to)\\s*${NAME_NUMBER}(?=\\)|\\s|$)`, 'giu');
 /**
  * A limit on a count of people inside the definition: "no more than 20 people per latrine", "fewer than 50 students per
  * class", "more than 500 people" (the comparative and the number are followed by the counted people or "per").

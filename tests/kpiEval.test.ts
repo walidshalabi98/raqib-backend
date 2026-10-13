@@ -675,7 +675,7 @@ describe('report', () => {
     expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual(report);
 
     const table = formatSummaryTable(report);
-    expect(table.split('\n')[0]).toBe('KPI Assistant evaluation · prompt kpi-v1 · system system-v1-ab12cd · main m · fast f · retrieval keyword · library 1.0.0 · mode fake');
+    expect(table.split('\n')[0]).toBe(`KPI Assistant evaluation · prompt ${KPI_PROMPT_VERSION} · system system-v1-ab12cd · main m · fast f · retrieval keyword · library 1.0.0 · mode fake`);
     expect(table).toMatch(/^case\s+suggestions\s+assertions\s+library use\s+avg quality\s+hallucinated \(raw→final\)\s+base←target\s+cost USD\s+result s\s+batch s\s+out tok\/sugg$/m);
     expect(table).toMatch(/^CASE-X\s+1 \(\+0 AC\)\s+1\/1\s+100%\s+100\s+0→0\s+0\s+0\.04\s+8\.0\s+20\.0\s+300$/m);
     expect(table).toMatch(/^total\s+1 \(\+0 AC\)\s+1\/1 100%\s+100%\s+100\s+0→0\s+0\s+0\.04\s+p50 8\.0 \/ max 8\.0/m);
@@ -820,7 +820,7 @@ describe('scripts/eval-kpi: run in-process', () => {
     expect(report.systemPromptVersion).toBeNull();
     expect(report.cases).toHaveLength(8);
     const printed = out.join('\n');
-    expect(printed).toContain('KPI Assistant evaluation · prompt kpi-v1');
+    expect(printed).toContain(`KPI Assistant evaluation · prompt ${KPI_PROMPT_VERSION}`);
     expect(printed).toContain('mode fake');
     expect(printed).toMatch(/^result complete · schema validity 100% PASS/m);
     expect(printed).toContain(`Saved ${nodePath.join(dir, files[0])}`);

@@ -2,7 +2,7 @@
  * Framework generator structure prompt and answer schema (feature "framework.structure", main tier), used by
  * src/services/ai/frameworkGenerator.ts, and the closed sets shared with the KPI Assistant (prompts/kpi.ts) and the
  * indicator form. Since Phase 4 the indicator step runs through the KPI pipeline (knowledge/kpi-assistant-spec.md §A2
- * last row; design section 4.6, D19): its prompt and schema live in prompts/kpi.ts (kpi-v1).
+ * last row; design section 4.6, D19): its prompt and schema live in prompts/kpi.ts (kpi-v2).
  *
  * The AI client sends the shared M&E system prompt first; FRAMEWORK_STRUCTURE_SYSTEM is the feature-specific
  * instructions. Answers are structured outputs: the schema enforces the shape, so the prompt carries the content rules

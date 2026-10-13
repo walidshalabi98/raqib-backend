@@ -23,12 +23,14 @@ export const MIN_EXCERPT_CHARS = 20;
 /** Cue words, matched in normaliseForMatch(excerpt) at word boundaries (EN) or as tokens (AR, after Arabic normalisation). */
 export const FACT_CUES: { target: readonly string[]; baseline: readonly string[] } = {
   target: [
-    'target', 'targets', 'will', 'by the end', 'expected', 'planned', 'plan', 'plans', 'aim', 'aims', 'goal', 'achieve', 'reach',
-    'intend to', 'intends to', 'intended to', 'at endline', 'by endline',
-    'المستهدف', 'هدف', 'سيتم', 'بحلول', 'نهدف', 'الوصول إلى',
+    'target', 'targets', 'will', 'by the end', 'expected', 'planned', 'plan', 'plans', 'planning to', 'expect', 'expects',
+    'aim', 'aims', 'goal', 'achieve', 'reach', 'intend to', 'intends to', 'intended to', 'at endline', 'by endline',
+    'المستهدف', 'هدف', 'سيتم', 'بحلول', 'نهدف', 'الوصول إلى', 'يخطط', 'تخطط', 'نخطط', 'من المخطط', 'من المتوقع', 'يتوقع',
+    'نتوقع',
   ],
   baseline: [
-    'baseline', 'currently', 'at present', 'as of', 'survey found', 'assessment found', 'found that', 'stood at', 'stands at',
+    'baseline', 'currently', 'at present', 'as of', 'today', 'survey found', 'assessment found', 'found that', 'stood at',
+    'stands at',
     'حاليًا', 'حاليا', 'خط الأساس', 'أظهر المسح', 'أظهرت الدراسة',
   ],
 };
@@ -114,6 +116,12 @@ const CUE_GUARDS: Readonly<Record<string, { before?: string; after?: string }>> 
   targets: { after: `(?!\\s+${TARGET_ADJECTIVE_NOUNS}(?![\\p{L}\\p{N}]))` },
   // "hard-to-reach areas" describes where people live, not an intended value.
   reach: { before: '(?<!hard[\\s-]to[\\s-])' },
+  // The verb only ("plans to train 600"): the noun ("the 2025 response plan", "the work plan foresees") is context.
+  plan: { after: '(?=\\s+to(?![\\p{L}\\p{N}]))' },
+  plans: { after: '(?=\\s+to(?![\\p{L}\\p{N}]))' },
+  // "planned" as a verb ("are planned to be trained", "Planned: 600"), not before a noun ("the 12 planned water points":
+  // only that number is planned, PLANNED_BEFORE_NOUN), which would make every value of its clause a target.
+  planned: { after: `(?!\\s+(?!${'(?:to|for|by|in|at|as|and|or|with|under|until|before|after|during|over|from|on|is|are|was|were)'}(?![\\p{L}\\p{N}]))\\p{L})` },
 };
 
 /**
@@ -172,11 +180,12 @@ export function factCuePositions(excerpt: string): FactCue[] {
 // ------------------------------------------------------------------ the kind of one value (rules 8–9, D14)
 
 /** Baseline cues that only date a statement: "currently plans to train 600" states a plan, not a measured value. */
-const TIME_CUES: ReadonlySet<string> = new Set(['currently', 'at present', 'as of', 'حاليًا', 'حاليا']);
+const TIME_CUES: ReadonlySet<string> = new Set(['currently', 'at present', 'as of', 'today', 'حاليًا', 'حاليا']);
 /** Target cues that announce a plan or the future. */
 const FUTURE_CUES: ReadonlySet<string> = new Set([
-  'will', 'plan', 'plans', 'planned', 'expected', 'aim', 'aims', 'by the end', 'intend to', 'intends to', 'intended to',
-  'سيتم', 'بحلول', 'نهدف',
+  'will', 'plan', 'plans', 'planned', 'planning to', 'expected', 'expect', 'expects', 'aim', 'aims', 'by the end',
+  'intend to', 'intends to', 'intended to', 'سيتم', 'بحلول', 'نهدف', 'يخطط', 'تخطط', 'نخطط', 'من المخطط', 'من المتوقع',
+  'يتوقع', 'نتوقع',
 ]);
 /** A time cue followed this closely (at most three words, no number between) by a future cue dates the plan. */
 const TIME_FUTURE_GAP = /^[^\d]{0,30}$/u;
@@ -203,10 +212,15 @@ const CHANGE_WORDS_EN = /(?<!\p{L})(?:increas|rais|rise|rising|rose|risen|reduc|
 const CHANGE_WORDS_AR = /(?:زياد|يزيد|رفع|خفض|تقليل|تحسين|ارتفا|ارتفع|يرتفع|انخفا|انخفض|ينخفض|تقليص|تخفيض|نمو|ينمو)/u;
 /** After Y: a duration or age unit makes "from 6 to 59 months" a range, not a change. */
 const RANGE_UNIT_AFTER = /^\s*(?:years?|yrs?|months?|weeks?|days?|hours?|minutes?|mins?|km|kilomet\p{L}*|سنة|سنوات|عام|اعوام|أعوام|شهر|شهرا|أشهر|اشهر|يوم|أيام|ايام|ساعة|ساعات|دقيقة|دقائق)(?!\p{L})/u;
-/** Before X: an age or range phrase ("aged from 6", "between 15"). */
-const RANGE_BEFORE = /(?:aged?|ages|between|بعمر|بين|اعمارهم|أعمارهم)\s*$/u;
+/**
+ * Before X: an age or range phrase ("aged from 6", "between 15"), as a whole word: "coverage from 60% to 85%",
+ * "percentage from", "average from" and "shortage from" are changes, not age ranges.
+ */
+const RANGE_BEFORE = /(?<!\p{L})(?:aged?|ages|between|بعمر|بين|اعمارهم|أعمارهم)\s*$/u;
+/** "the current", "the present", "the existing" before a starting value ("from the current 40% to 70%"). */
+const CURRENT_BEFORE = '(?:(?:the\\s+)?(?:current|present|existing)\\s+(?:level\\s+of\\s+|rate\\s+of\\s+)?)?';
 
-const FROM_TO_EN = new RegExp(`(?<!\\p{L})from\\s+(?:(?:a|the)\\s+baseline\\s+(?:value\\s+)?of\\s+)?(${NUM})([^;]{0,60}?)\\s(?:to|up to)\\s+(?:(?:a|the)\\s+target\\s+of\\s+)?(?:at\\s+least\\s+)?(${NUM})`, 'gu');
+const FROM_TO_EN = new RegExp(`(?<!\\p{L})from\\s+(?:(?:a|the)\\s+baseline\\s+(?:value\\s+)?of\\s+)?${CURRENT_BEFORE}(${NUM})([^;]{0,60}?)\\s(?:to|up to)\\s+(?:(?:a|the)\\s+target\\s+of\\s+)?(?:at\\s+least\\s+)?(${NUM})`, 'gu');
 const FROM_TO_AR = new RegExp(`(?<!\\p{L})من\\s+(${NUM})([^;]{0,60}?)\\s*(?:إلى|الى|إلي|الي)\\s*(${NUM})`, 'gu');
 const UP_FROM_EN = new RegExp(`(?<!\\p{L})(?:up|down|increas\\p{L}*|decreas\\p{L}*|ris\\p{L}*|rose|fall\\p{L}*|fell|drop\\p{L}*|improv\\p{L}*|declin\\p{L}*)\\s+from\\s+(?:(?:a|the)\\s+baseline\\s+(?:value\\s+)?of\\s+)?(${NUM})`, 'gu');
 const UP_FROM_AR = new RegExp(`(?:ارتفاعا|ارتفاعًا|انخفاضا|انخفاضًا)\\s+من\\s+(${NUM})`, 'gu');
@@ -223,6 +237,12 @@ const REFERENCE_AFTER = new RegExp(`^((?:\\s+[\\p{L}'-]+){0,4}?)\\s*(?:\\(\\s*($
 const COMPARATOR_EN = new RegExp(`(?<!\\p{L})(?:compared\\s+(?:with|to)|as\\s+against|against|versus|vs\\.?|relative\\s+to)\\s+(?:(?:a|the)\\s+(baseline|target)\\s+(?:value\\s+|level\\s+)?of\\s+)?(?:only\\s+|just\\s+)?(${NUM})`, 'gu');
 /** "from X in 2025", "from X at baseline", "from X currently" (a starting value without "to Y"). */
 const FROM_DATED_EN = new RegExp(`(?<!\\p{L})from\\s+(${NUM})`, 'gu');
+/** "from the current X", "from the present X" (a starting value, with or without "to Y"). */
+const FROM_CURRENT_EN = new RegExp(`(?<!\\p{L})from\\s+(?:the\\s+)?(?:current|present|existing)\\s+(?:level\\s+of\\s+|rate\\s+of\\s+)?(${NUM})`, 'gu');
+/** "X last year", "X the previous year" (at most four words between, no number): a past value, never a target. */
+const LAST_YEAR_AFTER = new RegExp(`(${NUM})((?:\\s+[\\p{L}'-]+){0,4}?)\\s+(?:last|the\\s+previous|the\\s+past)\\s+year(?![\\p{L}\\p{N}])`, 'gu');
+/** "N planned <noun>" ("the 12 planned water points"): that number is planned; the others of the clause are not. */
+const PLANNED_BEFORE_NOUN = new RegExp(`(${NUM})\\s+planned\\s+(?!(?:to|for|by|in|at|as|and|or|with|under|until|before|after|during|over|from|on|is|are|was|were)(?![\\p{L}\\p{N}]))\\p{L}`, 'gu');
 /** A value in brackets dated or labelled as the reference: "(45% in 2025)", "(45%, 2025)", "(45% at baseline)". */
 const PAREN_REFERENCE = new RegExp(`\\(\\s*(${NUM})\\s*(?:,\\s*(${YEAR_PART})|\\s+(?:in|as\\s+of|during)\\s+(${YEAR_PART})|\\s+at\\s+(?:the\\s+)?baseline)\\s*\\)`, 'gu');
 /** A value dated with a year a few words later, no number or punctuation between: "45% in 2025", "1,200 households reached in 2025". */
@@ -305,6 +325,11 @@ function explicitValueKinds(text: string): ExplicitKind[] {
     const year = referenceAfter(text, start + m[1].length, 0);
     if (year !== null && pastReference(year)) add(start, m[1], 'baseline');
   }
+  for (const m of text.matchAll(FROM_CURRENT_EN)) add((m.index ?? 0) + m[0].length - m[1].length, m[1], 'baseline');
+  for (const m of text.matchAll(LAST_YEAR_AFTER)) {
+    if (!/\d/.test(m[2])) add(m.index ?? 0, m[1], 'baseline');
+  }
+  for (const m of text.matchAll(PLANNED_BEFORE_NOUN)) add(m.index ?? 0, m[1], 'target');
   for (const m of text.matchAll(PAREN_REFERENCE)) {
     const start = (m.index ?? 0) + m[0].indexOf(m[1]);
     const year = Number(m[2] ?? m[3] ?? 0);

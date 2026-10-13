@@ -104,7 +104,7 @@ describe.skipIf(!hasTestDatabase)('donor viewers see approved indicators only (r
       data: {
         frameworkId: fx.framework.id, resultId: fx.result.id, indicatorText: 'AI-suggested indicator awaiting approval', level: 'outcome',
         dataCollectionMethod: 'observation', frequency: 'biannual', phases: [], provenance: 'ai_suggested', aiModel: 'claude-sonnet-5-5',
-        promptVersion: 'kpi-v1', status: 'off_track', sortOrder: 2,
+        promptVersion: 'kpi-v2', status: 'off_track', sortOrder: 2,
       },
     });
     const service = (indicatorId: string | null, day: string) => prisma.beneficiaryService.create({
@@ -332,7 +332,7 @@ describe.skipIf(!hasTestDatabase)('donor viewers see approved indicators only (r
   });
 });
 
-describe.skipIf(!hasTestDatabase)('analyzeProjectRisks approvedOnly (src/services/ai/riskAnalyzer.ts)', () => {
+describe.skipIf(!hasTestDatabase)('analyzeProjectRisks is a staff tool with no donor option (src/services/ai/riskAnalyzer.ts; TQ-08)', () => {
   let projectId: string;
   let approvedId: string;
   let unapprovedId: string;
@@ -368,29 +368,24 @@ describe.skipIf(!hasTestDatabase)('analyzeProjectRisks approvedOnly (src/service
     mocks.generateStructured.mockResolvedValue({ data: { risks: [] } });
   });
 
-  it('approvedOnly: true analyses (and sends to the model) approved indicators only', async () => {
-    const risks = await realAnalyze(projectId, { approvedOnly: true });
-    expect(risks.map(r => r.indicatorId)).toEqual([approvedId]);
+  it('analyses every at-risk indicator, approved or not, and takes no donor option (the route refuses donor viewers)', async () => {
+    expect((await realAnalyze(projectId)).map(r => r.indicatorId)).toEqual([approvedId, unapprovedId]);
     expect(mocks.generateStructured).toHaveBeenCalledTimes(1);
     expect(sentPrompt()).toContain(approvedId);
-    expect(sentPrompt()).not.toContain(unapprovedId);
-    expect(sentPrompt()).not.toContain('Unapproved at-risk indicator');
+    expect(sentPrompt()).toContain(unapprovedId);
+    // The donor-only approvedOnly branch is gone (SDA-06 superseded by the donor-access PR): one parameter, the project.
+    expect(realAnalyze.length).toBe(1);
   });
 
-  it('approvedOnly: false and the default analyse every at-risk indicator, as before Phase 4', async () => {
-    expect((await realAnalyze(projectId, { approvedOnly: false })).map(r => r.indicatorId)).toEqual([approvedId, unapprovedId]);
-    expect((await realAnalyze(projectId)).map(r => r.indicatorId)).toEqual([approvedId, unapprovedId]);
-    expect(mocks.generateStructured).toHaveBeenCalledTimes(2);
-  });
-
-  it('returns [] without a model call when only unapproved indicators are at risk', async () => {
-    await prisma.indicator.update({ where: { id: approvedId }, data: { status: 'on_track' } });
+  it('returns [] without a model call when nothing is at risk', async () => {
+    await prisma.indicator.updateMany({ where: { id: { in: [approvedId, unapprovedId] } }, data: { status: 'on_track' } });
     try {
-      expect(await realAnalyze(projectId, { approvedOnly: true })).toEqual([]);
+      expect(await realAnalyze(projectId)).toEqual([]);
       expect(mocks.generateStructured).not.toHaveBeenCalled();
-      expect((await realAnalyze(projectId)).map(r => r.indicatorId)).toEqual([unapprovedId]);
     } finally {
       await prisma.indicator.update({ where: { id: approvedId }, data: { status: 'off_track' } });
+      await prisma.indicator.update({ where: { id: unapprovedId }, data: { status: 'at_risk' } });
     }
   });
 });
+

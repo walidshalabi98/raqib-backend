@@ -108,7 +108,7 @@ describe.skipIf(!hasTestDatabase)('KPI suggestion runs end to end with the AI mo
 
     const res = await post(suggestPath(), { scope: 'result', resultId: o1.id });
     expect(res.status).toBe(200);
-    expect(res.body.run).toMatchObject({ status: 'completed', step: 'done', scope: 'result', retrieval: 'keyword', model: resolveModel('main'), promptVersion: 'kpi-v1' });
+    expect(res.body.run).toMatchObject({ status: 'completed', step: 'done', scope: 'result', retrieval: 'keyword', model: resolveModel('main'), promptVersion: 'kpi-v2' });
     expect(res.body.suggestions.length).toBeGreaterThanOrEqual(2);
     expect(res.body.suggestions.map((s: any) => s.sortOrder)).toEqual(res.body.suggestions.map((_: unknown, i: number) => i + 1));
     expect(res.body.suggestions.every((s: any) => s.resultId === o1.id && s.status === 'pending' && Array.isArray(s.warnings) && s.draft.resultId === o1.id)).toBe(true);
@@ -124,7 +124,7 @@ describe.skipIf(!hasTestDatabase)('KPI suggestion runs end to end with the AI mo
     const stored = await prisma.kpiSuggestion.findMany({ where: { projectId } });
     expect(JSON.stringify(stored)).not.toContain(PHONE);
     const calls = await prisma.aiCall.findMany({ where: { projectId } });
-    expect(calls.map(c => [c.feature, c.status, c.organizationId, c.promptVersion])).toEqual([['kpi.suggest', 'success', organizationId, 'kpi-v1']]);
+    expect(calls.map(c => [c.feature, c.status, c.organizationId, c.promptVersion])).toEqual([['kpi.suggest', 'success', organizationId, 'kpi-v2']]);
 
     const first = res.body.suggestions[0];
     const accepted = await post(`/api/kpi-suggestions/${first.id}/accept`, {});
@@ -135,7 +135,7 @@ describe.skipIf(!hasTestDatabase)('KPI suggestion runs end to end with the AI mo
     const indicator = await prisma.indicator.findUniqueOrThrow({ where: { id: accepted.body.indicator.id } });
     expect(indicator).toMatchObject({
       provenance: 'ai_suggested', libraryId: first.libraryId, standardReferenceCode: first.draft.standardReferenceCode, aiModel: resolveModel('main'),
-      promptVersion: 'kpi-v1', resultId: o1.id, level: 'outcome', isApproved: false,
+      promptVersion: 'kpi-v2', resultId: o1.id, level: 'outcome', isApproved: false,
     });
     expect(first.libraryId).toMatch(/^[A-Z]{2}-\d{2}$/);
     expect(indicator.standardReferenceCode).toEqual(expect.stringMatching(/\S/));

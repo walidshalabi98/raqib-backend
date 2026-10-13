@@ -124,7 +124,7 @@ One row per AI model call, written by `src/services/ai/client.ts` (the only modu
 
 | Field | Meaning |
 |---|---|
-| `feature` | stable feature id: `framework.structure`, `framework.indicators` (from Phase 4 through the KPI pipeline, prompt `kpi-v1`), `document.analysis`, `qualitative.coding`, `report.narrative`, `risk.analysis`, `assessment.report`, and from Phase 4 `kpi.suggest` (Suggest KPIs for a framework or a result) and `kpi.alternatives` (alternatives to one indicator or suggestion). `indicator.alternatives` is legacy: the Phase 3 alternatives generator was removed in Phase 4, older rows keep the id |
+| `feature` | stable feature id: `framework.structure`, `framework.indicators` (from Phase 4 through the KPI pipeline, prompt `kpi-v2`), `document.analysis`, `qualitative.coding`, `report.narrative`, `risk.analysis`, `assessment.report`, and from Phase 4 `kpi.suggest` (Suggest KPIs for a framework or a result) and `kpi.alternatives` (alternatives to one indicator or suggestion). `indicator.alternatives` is legacy: the Phase 3 alternatives generator was removed in Phase 4, older rows keep the id |
 | `model` | model requested (`AI_MODEL_MAIN` or `AI_MODEL_FAST`) |
 | `servedModel` | model that produced the answer; differs from `model` after a server-side fallback; empty when no answer came back |
 | `promptVersion`, `systemPromptVersion` | version of the feature prompt (e.g. `framework-v4`) and of the shared system prompt |
@@ -335,7 +335,7 @@ Two tables for the KPI Assistant (`knowledge/kpi-assistant-spec.md` §A5–A6). 
 | `frameworkWarnings` | run-level notes as `KpiWarning[]` (`{ code, severity, message, params, penalty }`, `src/services/kpi/types.ts`), e.g. `result_cap`, `accountability_added`, `model_note`; default `[]` |
 | `suggestionCount` | suggestions saved by the run |
 | `retrieval` | how library candidates were ranked: `vector` or `keyword` |
-| `model`, `promptVersion` | served model and prompt version (`kpi-v1`) |
+| `model`, `promptVersion` | served model and prompt version (`kpi-v2`) |
 | `modelCalls`, `embeddingCalls`, `inputTokens`, `outputTokens`, `estimatedCostUsd` (`numeric(12,6)`), `latencyMs` | size and cost of the run, summed over its AI calls (each call also has its own `AiCall` row, §7) |
 | `requestedBy` | user id, without a foreign key (users can be deleted), like `Framework.approvedBy` |
 | `createdAt`, `updatedAt`, `finishedAt` | `updatedAt` is the **heartbeat**: it moves at every step and every 30 seconds while the run executes in the API process. A `running` run whose `updatedAt` is older than 15 minutes is reported as `failed` / `interrupted` (and stored so on the next list call); a process that is stopped marks its own running runs interrupted at once. `updatedAt` has no database default (Prisma sets it): a raw SQL insert must set it, and `id` too (`@default(uuid())` is applied by Prisma) |
@@ -353,7 +353,7 @@ Indexes: (`projectId`, `createdAt`) for a project's recent runs; (`frameworkId`,
 | `qualityScore`, `warnings` | deterministic quality score 0–100 (bands: 85 and above strong, 65–84 review, below 65 weak) and the validation notes (`KpiWarning[]`, default `[]`) |
 | `libraryId`, `isCustom` | the library entry it uses (emptied when the entry is removed), or `isCustom` true for an indicator the model wrote |
 | `method` | data collection method (`CollectionMethod`), used for the organisation's preferred methods |
-| `alternativeOfIndicatorId`, `alternativeOfSuggestionId` | for alternatives: the indicator or suggestion it would replace (emptied when that is deleted) |
+| `alternativeOfIndicatorId`, `alternativeOfSuggestionId` | for alternatives: the indicator or suggestion it would replace (emptied when that is deleted). Accepting an alternative of an indicator with `replaceSource: true` deletes that indicator in the same transaction, after expiring the other pending alternatives of it; an indicator with data points or linked services is never deleted this way (409 `source_has_data`). The app asks "Replace the old indicator?" first (Replace or Keep both) |
 | `status` (`SuggestionStatus`) | `pending` (default), `accepted`, `edited_accepted` (accepted after the officer changed fields), `rejected`, `expired` (a newer run replaced it for the same result, a sibling was accepted, or its framework version is no longer current) |
 | `model`, `promptVersion` | served model and prompt version, copied onto the indicator on accept |
 | `createdAt`, `decidedAt`, `decidedBy` | when it was made and decided, and by whom (user id, no foreign key) |
@@ -392,7 +392,7 @@ Renaming an id follows everywhere (`ON UPDATE CASCADE`). Row level security is e
 | GET /api/projects/:id/framework, GET /api/frameworks/:id/indicators, GET /api/frameworks/:id/status | unapproved indicators; the generation status itself is the same for every role |
 | GET /api/dashboard/projects/:id/dashboard | unapproved indicators in every figure: status and level counts, `totalIndicators`, trends, geographic counts, and **recent activity** (data points of unapproved indicators) |
 | GET /api/dashboard/overview | unapproved indicators in the indicator counts and the off-track alerts |
-| GET /api/dashboard/projects/:id/risks | 403: the AI risk analysis is staff only (donor-data-access PR, `docs/SECURITY_SETUP.md` §8.2; this supersedes the Phase 4 design, which built a donor viewer's analysis from approved indicators only, SDA-06). `analyzeProjectRisks`'s `approvedOnly` option stays, unused by the route |
+| GET /api/dashboard/projects/:id/risks | 403: the AI risk analysis is staff only (donor-data-access PR, `docs/SECURITY_SETUP.md` §8.2; this supersedes the Phase 4 design, which built a donor viewer's analysis from approved indicators only, SDA-06). `analyzeProjectRisks` has no donor option any more (its `approvedOnly` branch was removed, review finding TQ-08) |
 | GET /api/indicators/:id/data | an unapproved indicator answers 404 "Indicator not found", as another organisation's id does |
 | GET /api/beneficiaries/:id, GET /api/projects/:id/beneficiaries | 403: beneficiary records are staff only (donor-data-access PR, `docs/SECURITY_SETUP.md` §8.3). For staff, each service on GET /api/beneficiaries/:id names its indicator by `id` and `indicatorText` only |
 | every KPI Assistant route | 403: suggestions are never shown to donor viewers |

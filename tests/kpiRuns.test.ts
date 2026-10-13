@@ -43,7 +43,7 @@ function pipelineResult(suggestions: ValidatedSuggestion[], extra: Partial<KpiPi
 
 function call(extra: Partial<KpiCallInfo> = {}): KpiCallInfo {
   return {
-    feature: 'kpi.suggest', tier: 'main', model: 'served-model-1', promptVersion: 'kpi-v1', resultCodes: ['O1'], outcome: 'success',
+    feature: 'kpi.suggest', tier: 'main', model: 'served-model-1', promptVersion: 'kpi-v2', resultCodes: ['O1'], outcome: 'success',
     inputTokens: 1000, outputTokens: 300, cacheReadTokens: 0, cacheWriteTokens: 0, estimatedCostUsd: 0.02, latencyMs: 900, aiCallId: null,
     ...extra,
   };
@@ -110,13 +110,13 @@ describe('runFailure and toRunDto (design 7.4)', () => {
 
   it('maps the columns of a run and hides cost and token columns', () => {
     const dto = toRunDto(runRow({
-      status: 'completed', step: 'done', retrieval: 'keyword', model: 'm', promptVersion: 'kpi-v1', suggestionCount: 3,
+      status: 'completed', step: 'done', retrieval: 'keyword', model: 'm', promptVersion: 'kpi-v2', suggestionCount: 3,
       frameworkWarnings: [{ code: 'result_cap' }], finishedAt: new Date('2026-10-13T08:00:14Z'), inputTokens: 999,
     }), now);
     expect(dto).toEqual({
       id: 'run-1', projectId: 'p-1', frameworkId: 'f-1', scope: 'result', resultId: 'r-1', sourceIndicatorId: null, sourceSuggestionId: null,
       status: 'completed', step: 'done', errorCode: null, message: null, frameworkWarnings: [{ code: 'result_cap' }], suggestionCount: 3,
-      retrieval: 'keyword', model: 'm', promptVersion: 'kpi-v1', createdAt: '2026-10-13T08:00:00.000Z', updatedAt: '2026-10-13T08:00:10.000Z',
+      retrieval: 'keyword', model: 'm', promptVersion: 'kpi-v2', createdAt: '2026-10-13T08:00:00.000Z', updatedAt: '2026-10-13T08:00:10.000Z',
       finishedAt: '2026-10-13T08:00:14.000Z', serverNow: now.toISOString(),
     });
     expect(toRunDto(runRow({ frameworkWarnings: { not: 'an array' }, step: 'weird', retrieval: 'other' }), now))
@@ -130,7 +130,7 @@ describe('toSuggestionDto', () => {
     const row: KpiSuggestion = {
       id: 's-1', projectId: 'p-1', frameworkId: 'f-1', runId: 'run-1', resultId: 'r-1', level: 'outcome', sortOrder: 2,
       payload: storedPayload(v) as never, qualityScore: 75, warnings: v.warnings as never, libraryId: null, isCustom: true, method: 'observation',
-      alternativeOfIndicatorId: null, alternativeOfSuggestionId: null, status: 'pending', model: 'm', promptVersion: 'kpi-v1',
+      alternativeOfIndicatorId: null, alternativeOfSuggestionId: null, status: 'pending', model: 'm', promptVersion: 'kpi-v2',
       createdAt: new Date('2026-10-13T08:00:00Z'), decidedAt: null, decidedBy: null, rejectReason: null, rejectNote: null, indicatorId: null,
     };
     const dto = toSuggestionDto(row);
@@ -505,7 +505,7 @@ describe.skipIf(!hasTestDatabase)('KPI runs on the database', () => {
     expect(seen.opts?.callContext).toEqual({ organizationId: fx.org.id, projectId: fx.project.id });
     const stored = await runOf(run.id);
     expect(stored).toMatchObject({
-      status: 'completed', step: 'done', suggestionCount: 2, retrieval: 'keyword', model: 'served-model-1', promptVersion: 'kpi-v1',
+      status: 'completed', step: 'done', suggestionCount: 2, retrieval: 'keyword', model: 'served-model-1', promptVersion: 'kpi-v2',
       modelCalls: 2, embeddingCalls: 0, inputTokens: 1200, outputTokens: 350, errorCode: null,
     });
     expect(Number(stored.estimatedCostUsd)).toBeCloseTo(0.03, 6);
@@ -515,8 +515,8 @@ describe.skipIf(!hasTestDatabase)('KPI runs on the database', () => {
 
     const rows = await prisma.kpiSuggestion.findMany({ where: { runId: run.id }, orderBy: { sortOrder: 'asc' } });
     expect(rows.map(r => [r.sortOrder, r.status, r.model, r.promptVersion, r.level, r.method, r.isCustom])).toEqual([
-      [1, 'pending', 'served-model-1', 'kpi-v1', 'outcome', 'observation', true],
-      [2, 'pending', 'served-model-1', 'kpi-v1', 'outcome', 'observation', true],
+      [1, 'pending', 'served-model-1', 'kpi-v2', 'outcome', 'observation', true],
+      [2, 'pending', 'served-model-1', 'kpi-v2', 'outcome', 'observation', true],
     ]);
     expect(rows[0].payload).not.toHaveProperty('warnings');
     expect(rows[0].payload).toMatchObject({ name: 'Number of schools with a functioning parents committee', rank: 1, resultCode: 'O1' });

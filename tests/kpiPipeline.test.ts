@@ -485,7 +485,7 @@ describe('runKpiPipeline', () => {
     expect(progress.map(p => p.batchesTotal)).toEqual([2, 2]);
     expect(progress.map(p => p.batchesDone).sort()).toEqual([1, 2]);
     expect(out.retrieval).toBe('keyword');
-    expect(out.promptVersion).toBe('kpi-v1');
+    expect(out.promptVersion).toBe('kpi-v2');
     expect(out.model).toBe('fake-main-model');
     expect(out.embeddingCalls).toBe(0);
     // Two batch calls, then one call of its own for each result left without a suggestion (AI-2: here O2.1, whose
@@ -661,7 +661,7 @@ describe('runKpiPipeline through the real client with a fake Anthropic SDK', () 
     expect(big.body.max_tokens).toBe(KPI_CALLS.batch.maxTokens);
     expect(big.options?.timeout).toBe(KPI_CALLS.batch.timeoutMs);
     expect(log.records.map(x => [x.feature, x.promptVersion, x.status, x.organizationId, x.projectId]))
-      .toEqual(sdk.sent.map(() => ['kpi.suggest', 'kpi-v1', 'success', 'org-1', 'p-1']));
+      .toEqual(sdk.sent.map(() => ['kpi.suggest', 'kpi-v2', 'success', 'org-1', 'p-1']));
     expect(out.model).toBe(resolveModel('main'));
     expect(out.calls.every(c => c.aiCallId?.startsWith('call-'))).toBe(true);
     expect(out.suggestions.length).toBeGreaterThan(0);

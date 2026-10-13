@@ -21,7 +21,12 @@ import { scopedResults } from '../../kpi/scope';
 import type { AiEffort, ModelTier } from '../client';
 import type { AlternativesSource, ContextResult, DocumentFact, KpiLibraryEntry, ProjectContext } from '../../kpi/types';
 
-export const KPI_PROMPT_VERSION = 'kpi-v1';
+/**
+ * kpi-v2 (review fixes, 13 Oct 2026): the recognised-threshold rule (standard_threshold), the DOCUMENT FACTS line format
+ * with per-value kinds, the candidates' thresholds part and the SCOPE count changed after kpi-v1 (commit 51c1773), which
+ * never ran in production; its eval numbers, if any, are not comparable.
+ */
+export const KPI_PROMPT_VERSION = 'kpi-v2';
 
 export const KPI_SUGGESTION_SCHEMA = z.object({
   resultCode: z.string().describe('Code of the result this indicator measures, exactly as listed under SUGGEST FOR (e.g. "O1.2").'),

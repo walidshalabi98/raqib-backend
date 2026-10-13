@@ -402,7 +402,7 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
 
     it('CC-07 (re-check): calls of an unpriced model count at the highest known rates, so the budget still stops KPI requests', async () => {
       const call = (data: Partial<Prisma.AiCallCreateManyInput>): Prisma.AiCallCreateManyInput => ({
-        feature: 'kpi.suggest', model: 'claude-sonnet-5-5', promptVersion: 'kpi-v1', status: 'success', latencyMs: 1, organizationId: fx.org.id, ...data,
+        feature: 'kpi.suggest', model: 'claude-sonnet-5-5', promptVersion: 'kpi-v2', status: 'success', latencyMs: 1, organizationId: fx.org.id, ...data,
       });
       // 600k output tokens of a model missing from models.ts, stored without a cost: 15 USD at the highest output rate (25/M).
       await prisma.aiCall.createMany({ data: [call({ model: 'claude-sonnet-9-9', estimatedCostUsd: null, outputTokens: 600_000 })] });
@@ -422,8 +422,8 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
     it('CC-07: a priced model (also as a dated snapshot id) counts at its stored estimate only', async () => {
       await prisma.aiCall.createMany({
         data: [
-          { feature: 'kpi.suggest', model: 'claude-sonnet-5-5-20261001', promptVersion: 'kpi-v1', status: 'success', latencyMs: 1, organizationId: fx.org.id, estimatedCostUsd: new Prisma.Decimal(0.5), outputTokens: 1_000_000 },
-          { feature: 'kpi.suggest', model: 'claude-haiku-5-5', servedModel: 'claude-haiku-5-5', promptVersion: 'kpi-v1', status: 'success', latencyMs: 1, organizationId: fx.org.id, estimatedCostUsd: new Prisma.Decimal(0.25), outputTokens: 500_000 },
+          { feature: 'kpi.suggest', model: 'claude-sonnet-5-5-20261001', promptVersion: 'kpi-v2', status: 'success', latencyMs: 1, organizationId: fx.org.id, estimatedCostUsd: new Prisma.Decimal(0.5), outputTokens: 1_000_000 },
+          { feature: 'kpi.suggest', model: 'claude-haiku-5-5', servedModel: 'claude-haiku-5-5', promptVersion: 'kpi-v2', status: 'success', latencyMs: 1, organizationId: fx.org.id, estimatedCostUsd: new Prisma.Decimal(0.25), outputTokens: 500_000 },
         ],
       });
       expect(await organisationSpendUsd(prisma, fx.org.id, new Date())).toBeCloseTo(0.75, 6);
@@ -517,7 +517,7 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
       const indicator = await prisma.indicator.findUniqueOrThrow({ where: { id: res.body.indicator.id } });
       expect(indicator).toMatchObject({
         frameworkId: fx.framework.id, resultId: fx.result.id, level: 'outcome', provenance: 'ai_suggested', libraryId: 'ED-02',
-        standardReferenceCode: 'SDG 4.1.1 (aligned)', aiModel: row.model, promptVersion: 'kpi-v1', isApproved: false,
+        standardReferenceCode: 'SDG 4.1.1 (aligned)', aiModel: row.model, promptVersion: 'kpi-v2', isApproved: false,
         indicatorText: '% of children in supported schools achieving minimum proficiency in reading', unit: 'percent', dataCollectionMethod: 'observation',
         baselineValue: null, baselineDate: null, targetValue: null, sortOrder: 1,
       });
@@ -806,7 +806,7 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
 
     it('status reports whether the AI is configured, the retrieval mode and the prompt version', async () => {
       status.configured = false;
-      expect((await get('/api/kpi-assistant/status')).body).toEqual({ aiConfigured: false, embeddings: 'none', promptVersion: 'kpi-v1' });
+      expect((await get('/api/kpi-assistant/status')).body).toEqual({ aiConfigured: false, embeddings: 'none', promptVersion: 'kpi-v2' });
       expect((await get('/api/kpi-assistant/status', fx.adminAuth)).status).toBe(200);
     });
   });

@@ -26,7 +26,7 @@ const WA02 = {
 const NORMALIZE_CONTEXT: NormalizeIndicatorsContext = {
   frameworkId: 'fw-1', resultNodes: NODES, knownLibraryIds: new Set(['WA-02']), libraryEntries: new Map([['WA-02', WA02]]),
   verifiedFigures: [{ resultCode: 'O1', kind: 'baseline', value: '45%', description: '', quote: 'The survey found 45% of households.', source: 'baseline.pdf' }],
-  aiModel: 'model-x', promptVersion: 'kpi-v1',
+  aiModel: 'model-x', promptVersion: 'kpi-v2',
 };
 
 /** The payload validateSuggestion builds (D22: empty model method, date, assumptions and responsibility). */

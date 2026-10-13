@@ -150,7 +150,7 @@ Two integration tests do not rely on the lists: `tests/donorAi.test.ts` calls ev
 | Exports | indicators export as for data points | beneficiary register | |
 | Templates | read | | create, import, edit, delete: platform_admin only |
 
-The AI routes are document upload, framework generation, KPI suggestions and indicator alternatives (the KPI Assistant), assessment requests, qualitative create, upload and coding, report generation and the risk analysis. None is open to donor viewers. The AI risk analysis is a staff tool: it runs a model on every request and its output is not reviewed; project staff share their conclusions with donors in reports. This supersedes the Phase 4 design, which kept it open to donor viewers on approved indicators only (SDA-06); `analyzeProjectRisks`'s `approvedOnly` option stays, unused by the route. Donors receive no unreviewed AI output from the routes listed here (§8.3), with the exceptions in §8.6.
+The AI routes are document upload, framework generation, KPI suggestions and indicator alternatives (the KPI Assistant), assessment requests, qualitative create, upload and coding, report generation and the risk analysis. None is open to donor viewers. The AI risk analysis is a staff tool: it runs a model on every request and its output is not reviewed; project staff share their conclusions with donors in reports. This supersedes the Phase 4 design, which kept it open to donor viewers on approved indicators only (SDA-06); the donor-only `approvedOnly` option of `analyzeProjectRisks` was removed with it (review finding TQ-08). Donors receive no unreviewed AI output from the routes listed here (§8.3), with the exceptions in §8.6.
 
 ### 8.3 What donor viewers receive
 

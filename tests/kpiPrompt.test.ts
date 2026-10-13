@@ -120,7 +120,7 @@ function validRaw() {
 
 describe('KPI call settings and instructions', () => {
   it('versions the prompt and names the features (design 6.3)', () => {
-    expect(KPI_PROMPT_VERSION).toBe('kpi-v1');
+    expect(KPI_PROMPT_VERSION).toBe('kpi-v2');
     expect(KPI_FEATURES).toEqual({ suggest: 'kpi.suggest', alternatives: 'kpi.alternatives' });
   });
 

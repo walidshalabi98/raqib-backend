@@ -26,14 +26,29 @@ const LEADING_VERB_EN = /^(?:to\s+)?(?:increas|decreas|reduc|improv|rais|achiev|
  */
 const STANDARD_TERM_START = /^(?:reduced\s+coping\s+strateg(?:y|ies)\s+index|enhanced\s+vegetation\s+index|improved\s+(?:drinking[\s-]+)?water\s+sources?|improved\s+sanitation)\b/i;
 
-/** Leading comparatives state a direction: "Higher % of households …", "More households with …", "Fewer …". */
-const LEADING_COMPARATIVE_EN = /^(?:higher|more|fewer|greater|better|bigger|larger)\b/i;
+/** What a leading comparative compares when it states a direction: a measure, a common outcome noun or the people counted. */
+const COMPARED_EN = '(?:%|per\\s*cent(?:age)?s?|percentages?|proportions?|shares?|numbers?|rates?|levels?|access|use|uptake|coverage'
+  + '|incomes?|yields?|consumption|participation|enrol?ment|attendance|retention|resilience|awareness|knowledge|satisfaction'
+  + '|productivity|quality|households?|famil(?:y|ies)|people|persons|individuals|women|men|girls|boys|children|youths?|adolescents'
+  + '|students|pupils|farmers|beneficiaries|participants|communities|refugees|idps|caregivers|mothers|patients|teachers|workers)';
+/**
+ * Leading comparatives state a direction: "Higher % of households …", "More households with …", "Fewer children …",
+ * "Better access to …" (the comparative followed by what it compares, COMPARED_EN). Names that only start with such a
+ * word are not flagged (finisher re-check): "Higher education gross enrolment ratio", "Greater Amman Municipality …",
+ * "Better Cotton farmers trained", "Larger farms adopting …", and the threshold "More than one meal per day: …".
+ */
+const LEADING_COMPARATIVE_EN = new RegExp(`^(?:higher|more|fewer|greater|better|bigger|larger|lower|less)\\s+${COMPARED_EN}(?![\\p{L}\\p{N}])`, 'iu');
 
 /** "target: 3,500", "(target 500)", "target of 3,500", "target = 80%": a target value in the name ("target households" is not). */
 const TARGET_VALUE_EN = /(?<![\p{L}])targets?\s*(?:[:=]|of\s+(?:at\s+least\s+)?[0-9٠-٩]|[0-9٠-٩])/iu;
 
-/** A name that starts with a count ("3,500 displaced households …", "At least 3,500 households …"): a target, not an indicator. */
-const LEADING_NUMBER_EN = /^(?:(?:at\s+least|no\s+(?:fewer|less)\s+than|more\s+than|over|up\s+to|a\s+minimum\s+of|minimum\s+of|≥|>)\s*)?[0-9٠-٩۰-۹]/i;
+/**
+ * A name that starts with a count ("3,500 displaced households …", "At least 3,500 households …"): a target, not an
+ * indicator. A number that is part of a compound or a code ("24-hour recall …", "5-year-old children …", "1,000-day
+ * window: …", "3W reporting …", "24/7 hotline …") or a duration ("12 months after training: …") is not a count.
+ */
+const LEADING_NUMBER_EN = new RegExp(`^(?:(?:at\\s+least|no\\s+(?:fewer|less)\\s+than|more\\s+than|over|up\\s+to|a\\s+minimum\\s+of|minimum\\s+of|≥|>)\\s*)?${NUMBER}`
+  + `(?![0-9٠-٩۰-۹.,٫٬]|-?\\p{L}|\\/|\\s*(?:years?|months?|weeks?|days?|hours?|minutes?)(?![\\p{L}]))`, 'iu');
 
 /** "500 by (the) end (of …)", "1,200 by 2027": a number with its target date. */
 const NUMBER_BY_DATE_EN = new RegExp(`${NUMBER}%?\\s+by\\s+(?:the\\s+)?(?:end\\b|(?:19|20)\\d\\d\\b)`, 'iu');
@@ -69,8 +84,12 @@ const ARABIC_RATE_TARGET = new RegExp(`(?<!\\p{L})و?(?:بنسبة|الي)\\s*${
 /** Arabic "المستهدف: 3500", "(المستهدف 500)", "القيمة المستهدفة: 80%", after normaliseArabic ("الأسر المستهدفة" is not). */
 const ARABIC_TARGET_VALUE = new RegExp(`(?<!\\p{L})(?:ال)?مستهدف[ةه]?\\s*(?:[:=]\\s*)?${NUMBER}`, 'u');
 
-/** An Arabic name that starts with a count ("3500 أسرة نازحة …", "ما لا يقل عن 3500 أسرة …"), after normaliseArabic. */
-const ARABIC_LEADING_NUMBER = new RegExp(`^(?:(?:ما\\s+لا\\s+يقل\\s+عن|علي\\s+الاقل|اكثر\\s+من)\\s*)?${NUMBER}`, 'u');
+/**
+ * A name that starts with a count ("3500 أسرة نازحة …", "ما لا يقل عن 3500 أسرة …"), after normaliseArabic; as in
+ * LEADING_NUMBER_EN, a compound, code or duration ("24-hour …", "3W …", "24 ساعة …") is not a count. Applied to both names.
+ */
+const ARABIC_LEADING_NUMBER = new RegExp(`^(?:(?:ما\\s+لا\\s+يقل\\s+عن|علي\\s+الاقل|اكثر\\s+من)\\s*)?${NUMBER}`
+  + `(?![0-9٠-٩۰-۹.,٫٬]|-?\\p{L}|\\/|\\s*(?:years?|months?|weeks?|days?|hours?|minutes?|ساعة|ساعات|يوم|أيام|ايام|شهر|أشهر|اشهر|سنة|سنوات)(?![\\p{L}]))`, 'u');
 
 function hasReachWord(name: string): boolean {
   for (const match of name.matchAll(REACH_WORD)) {

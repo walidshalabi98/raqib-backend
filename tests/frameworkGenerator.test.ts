@@ -1284,7 +1284,7 @@ describe('framework prompts and answer schemas', () => {
       expect(frameworkPrompts, removed).not.toHaveProperty(removed);
     }
     expect(FRAMEWORK_PROMPT_VERSION).toBe('framework-v4');
-    expect(KPI_PROMPT_VERSION).toBe('kpi-v1');
+    expect(KPI_PROMPT_VERSION).toBe('kpi-v2');
   });
 
   it('use the database enums, the shared unit list and every unit of the seed library', () => {
@@ -1365,7 +1365,7 @@ function structureAnswer(overrides: Record<string, unknown> = {}): Record<string
 }
 
 /**
- * One suggestion of the indicator step's answer (KPI_SUGGESTION_SCHEMA, prompt kpi-v1; design 4.6, D19, D22): the
+ * One suggestion of the indicator step's answer (KPI_SUGGESTION_SCHEMA, prompt kpi-v2; design 4.6, D19, D22): the
  * spec's fields only; the server fills baseline method and date, intermediate targets, assumptions and responsibility.
  */
 function kpiSuggestion(overrides: Partial<KpiRawSuggestion> = {}): KpiRawSuggestion {
@@ -1540,7 +1540,7 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     vi.restoreAllMocks();
   });
 
-  it('creates the results chain and writes validated KPI-pipeline indicators (kpi-v1 batches, ECHO cap, citations)', async () => {
+  it('creates the results chain and writes validated KPI-pipeline indicators (kpi-v2 batches, ECHO cap, citations)', async () => {
     const { org, admin, project, framework } = await setup({
       humanitarian: true, sector: 'livelihoods', sectors: ['livelihoods', 'youth'], donorType: 'echo', documentText: DOCS[0],
     });
@@ -1596,7 +1596,7 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
-    // Calls: the structure call (unchanged) and one KPI batch of the four results (main tier, low effort, kpi-v1).
+    // Calls: the structure call (unchanged) and one KPI batch of the four results (main tier, low effort, kpi-v2).
     expect(features()).toEqual(['framework.structure', 'framework.indicators']);
     expect(callOf('framework.structure')).toMatchObject({
       model: 'main', effort: 'medium', maxTokens: 12_000, timeoutMs: 180_000, promptVersion: 'framework-v4',

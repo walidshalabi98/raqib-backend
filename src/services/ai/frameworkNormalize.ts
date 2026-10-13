@@ -907,6 +907,8 @@ const ADVERBS_EN = new Set([
   'fully', 'newly', 'partially', 'regularly', 'directly', 'indirectly', 'successfully', 'safely', 'correctly', 'properly', 'actively',
   'consistently', 'exclusively', 'effectively', 'appropriately', 'adequately', 'currently', 'still', 'also', 'now', 'meaningfully',
 ]);
+/** Units after a number in a counted noun phrase ("children 6-59 months", "children 5 years old"). */
+const AGE_UNITS_EN = new Set(['months', 'month', 'years', 'year', 'yrs', 'old', 'weeks', 'week', 'days', 'day']);
 /** "… among target households", "… amongst the displaced population's children": the measure is taken over people. */
 const AMONG_PEOPLE_EN = /\bamong(?:st)?\s+(?:the\s+)?((?:[\p{L}'’-]+\s+){0,2}[\p{L}'’-]+)/iu;
 /** "Heads of household(s)" counts people although its head noun is "heads". */
@@ -926,8 +928,18 @@ function countedHeadsEn(name: string): string[] | null {
   const words = name.slice(head[0].length).split(/[\s,;:()]+/).filter(Boolean);
   const heads: string[] = [];
   let current: string | null = null;
+  let afterNumber = false;
   for (const raw of words) {
     const word = raw.toLowerCase().replace(/['’]s$/, '');
+    // An age range or a number ("youth (15-29)", "children 6-59 months", "women 15-49") and the unit after it qualify the
+    // noun; an acronym after the noun ("youth NEET") describes it. Neither is the counted noun (finisher re-check AI-5).
+    if (/\d/.test(word)) {
+      afterNumber = true;
+      continue;
+    }
+    if (afterNumber && AGE_UNITS_EN.has(word)) continue;
+    afterNumber = false;
+    if (current !== null && /^[A-Z]{2,}$/.test(raw)) continue;
     if (PHRASE_STOP_EN.has(word)) break;
     if (word === 'and' || word === 'or' || word === 'and/or' || word === '&') {
       if (current) heads.push(current);

@@ -225,7 +225,7 @@ export function kpiSuggestionPayloadFixture(
   return payload;
 }
 
-/** A KpiSuggestionRun row (default: a completed result-scope run with one suggestion, keyword retrieval, kpi-v1). */
+/** A KpiSuggestionRun row (default: a completed result-scope run with one suggestion, keyword retrieval, kpi-v2). */
 export async function createKpiRunRow(input: {
   projectId: string; frameworkId: string; resultId?: string | null; requestedBy?: string | null;
   data?: Partial<Prisma.KpiSuggestionRunUncheckedCreateInput>;

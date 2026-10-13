@@ -197,6 +197,54 @@ describe('the kind of each value comes from its own clause (SPEC-2)', () => {
     expect(kindOfValue(only('The project will reach 75% of households in 2027 and keep 3,500 enrolled by 2027.'), '75%')).toBe('target');
   });
 
+  it('a word ending in "age" before "from X to Y" is no age range (finisher re-check SPEC-2: coverage, percentage, average)', () => {
+    for (const [text, x, y] of [
+      ['The project will increase vaccination coverage from 60% to 85% by 2027.', '60%', '85%'],
+      ['The project will reduce the percentage from 40% to 20% by 2027.', '40%', '20%'],
+      ['The project will raise the average from 3.2 to 4.5 by 2027.', '3.2', '4.5'],
+      ['The shortage from 30% to 10% is the aim of the action.', '30%', '10%'],
+      ['Increase coverage from 40% to 70% by 2027.', '40%', '70%'],
+      ['Coverage is expected to increase from the current 40% to 70%.', '40%', '70%'],
+    ]) {
+      const fact = only(text);
+      expect(fact.kind, text).toBe('mixed');
+      expect(kindOfValue(fact, x), text).toBe('baseline');
+      expect(kindOfValue(fact, y), text).toBe('target');
+    }
+    // Real ranges keep their sentence's cue: "aged from 6 to 59 months", "between 15 and 29".
+    expect(kindOfValue(only('Children aged from 6 to 59 months will be screened.'), '6')).toBe('target');
+    expect(kindOfValue(only('The project will train youth aged between 15 and 29 in Hebron.'), '15')).toBe('target');
+  });
+
+  it('plan and expect verbs in English and Arabic state a plan; the noun "plan" and "N planned <noun>" do not (finisher re-check SPEC-2)', () => {
+    for (const [text, value] of [
+      ['Currently, the organisation expects 450 graduates to find work.', '450'],
+      ['The organisation is currently planning to train 600 young people.', '600'],
+      ['حاليا يخطط المشروع لتدريب 600 شاب.', '600'],
+      ['حاليا، من المخطط تدريب 600 شاب.', '600'],
+      ['حاليا، من المتوقع أن يجد 450 خريجا عملا.', '450'],
+      ['The project plans to rehabilitate 12 water points in the camp.', '12'],
+    ]) expect(kindOfValue(only(text), value), text).toBe('target');
+    // The noun is context: no cue, so no fact kind and no baseline or target evidence.
+    expect(factKind('Under the 2025 response plan, 12,000 households received food vouchers.')).toBeNull();
+    expect(factKind('The work plan foresees 12 training sessions for 300 teachers.')).toBeNull();
+    // "the 12 planned water points": 12 is planned, 3 (dated "as of") is what was reached.
+    const progress = only('As of June 2026, 3 of the 12 planned water points had been rehabilitated.');
+    expect(kindOfValue(progress, '3')).toBe('baseline');
+    expect(kindOfValue(progress, '12')).toBe('target');
+    // "planned" as a verb still announces a plan.
+    expect(kindOfValue(only('Currently 600 young people are planned to be trained.'), '600')).toBe('target');
+  });
+
+  it('a value dated "last year" or "today" is a baseline inside a target sentence (finisher re-check SPEC-2)', () => {
+    const lastYear = only('The project will raise acceptable FCS to 75%; it was 45% last year.');
+    expect(kindOfValue(lastYear, '45%')).toBe('baseline');
+    expect(kindOfValue(lastYear, '75%')).toBe('target');
+    const today = only('Today only 20% of women participate in committees; the project aims for 40%.');
+    expect(kindOfValue(today, '20%')).toBe('baseline');
+    expect(kindOfValue(today, '40%')).toBe('target');
+  });
+
   it('"stood at" labels a baseline and "at endline" a target', () => {
     const fact = only('45% at baseline, 70% at endline.');
     expect(fact.kind).toBe('mixed');

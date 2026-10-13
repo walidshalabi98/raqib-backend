@@ -284,7 +284,16 @@ export function peopleLevelIndependent(name: string, nameAr?: string | null): bo
   if (counted) {
     const words = counted[1].split(/[\s,;:()]+/).filter(Boolean);
     let last = '';
+    let afterNumber = false;
     for (const [i, word] of words.entries()) {
+      // Ages and their units ("women 15-49", "children 6-59 months") and an acronym after the noun ("youth NEET") qualify it.
+      if (/\d/.test(word)) {
+        afterNumber = true;
+        continue;
+      }
+      if (afterNumber && /^(?:months?|years?|yrs|old|weeks?|days?)$/i.test(word)) continue;
+      afterNumber = false;
+      if (last !== '' && /^[A-Z]{2,}$/.test(word)) continue;
       if (i > 0 && METRIC_PHRASE_END.test(word)) break;
       if (/^(?:and|or)$/i.test(word)) {
         if (PEOPLE_EN.test(last)) return true;
@@ -313,10 +322,11 @@ export function nameHasTargetIndependent(name: string, nameAr?: string | null): 
   const standard = /^(reduced coping strateg|enhanced vegetation index|improved (drinking[ -]+)?water source|improved sanitation)/.test(en);
   const english = /\d\s?%/.test(en)
     || /\btargets?\s*(:|=|of\s+\d|\d)/.test(en)
-    || /^((at least|more than|over|up to)\s+)?\d/.test(en)
+    || /^((at least|more than|over|up to)\s+)?\d[\d,.]*(?![\d,.]|-?[a-z]|\/|\s*(years?|months?|weeks?|days?|hours?)\b)/.test(en)
     || /\d\s+by\s+(the\s+)?(end\b|(19|20)\d\d\b)/.test(en)
     || /\b(increase|reduce|decrease|raise|improve)d?\s+(to|by)\b/.test(en)
-    || (!standard && /^(to\s+)?(increas|reduc|decreas|improv|achiev|ensur|enhanc|strengthen|higher|more|fewer|doubl|halv|tripl)/.test(en))
+    || (!standard && /^(to\s+)?(increas|reduc|decreas|improv|achiev|ensur|enhanc|strengthen|doubl|halv|tripl)/.test(en))
+    || /^(higher|more|fewer|greater|better|lower|less)\s+(%|percent|percentage|proportion|share|number|rate|levels?|access|use|coverage|incomes?|households?|families|people|women|men|girls|boys|children|youths?|students|farmers|beneficiaries|participants)(?![a-z])/.test(en)
     || /(^|[^\w-])reach([^\w-]|$)/.test(en.replace(/(hard|difficult)[ -]to[ -]reach/g, ' '));
   const arabic = /\d\s?%/.test(ar) || /^(زياده|تحسين|خفض|رفع|تعزيز|تقليل|مضاعفه)/.test(ar) || /مستهدف[هة]?\s*[:=]?\s*\d/.test(ar) || /^\d/.test(ar);
   return english || arabic || trailingCount(en) || trailingCount(ar);
@@ -324,10 +334,10 @@ export function nameHasTargetIndependent(name: string, nameAr?: string | null): 
 
 /**
  * A count at the end of a name, after "(", "," or ":" with an optional comparative: "(over 500)", "(above 3,500)",
- * ", between 3,000 and 3,500", ": over 500", "(500 or more)" (years and single digits are not counts).
+ * ", between 3,000 and 3,500", ": over 500", "(500 or more)", "(from 40 to 70)" (years and single digits are not counts).
  */
 function trailingCount(text: string): boolean {
-  const m = /(?:\(|,|:)\s*(?:over|above|under|below|more than|at least|up to|between|minimum|maximum|about|approximately|اكثر من|اقل من|حوالي|بين)?\s*(\d[\d,.]*)(?:\s*(?:and|to|-|or|و|الي)\s*(\d[\d,.]*))?\s*(?:or more|or less|\+)?\s*\)?\s*$/.exec(text.trim());
+  const m = /(?:\(|,|:)\s*(?:over|above|under|below|more than|at least|up to|between|from|minimum|maximum|about|approximately|اكثر من|اقل من|حوالي|بين|من)?\s*(\d[\d,.]*)(?:\s*(?:and|to|-|or|و|الي)\s*(\d[\d,.]*))?\s*(?:or more|or less|\+)?\s*\)?\s*$/.exec(text.trim());
   if (!m) return false;
   return [m[1], m[2]].filter((n): n is string => !!n).some(n => !/^(19|20)\d\d$/.test(n) && n.replace(/[,.]/g, '').length > 1);
 }

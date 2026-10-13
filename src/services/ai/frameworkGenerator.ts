@@ -5,7 +5,7 @@
  *    documents (skipped without documents; the results chain is then built from the project's metadata).
  * 2. Indicators through the KPI Assistant pipeline (knowledge/kpi-assistant-spec.md §A2 last row; design section 4.6,
  *    D19): contextFromGeneration (planned results with codes as ids, verified document figures as facts) →
- *    runKpiPipeline with feature id "framework.indicators" (batches of ≤ 4 results, 3 at a time, prompt kpi-v1, run
+ *    runKpiPipeline with feature id "framework.indicators" (batches of ≤ 4 results, 3 at a time, prompt kpi-v2, run
  *    deadline 10 minutes) → validated drafts. Every generated indicator passes the same validation as a suggestion;
  *    responsibility, assumptions, baseline method and date, phases, milestones and intermediate targets are server
  *    defaults ("to be confirmed"), and the indicator dates are the project dates (D22).
@@ -51,7 +51,7 @@ import {
 /** Token limit and timeout of the structure call (thinking counts towards max tokens; the client retries a cut-off answer once with twice the limit). */
 const STRUCTURE_CALL = { maxTokens: 12_000, timeoutMs: 180_000 } as const;
 
-/** Feature id of the indicator step's model calls (AiCall rows and logs keep the Phase 3 id; the prompt is kpi-v1). */
+/** Feature id of the indicator step's model calls (AiCall rows and logs keep the Phase 3 id; the prompt is KPI_PROMPT_VERSION, kpi-v2). */
 export const FRAMEWORK_INDICATORS_FEATURE = 'framework.indicators';
 
 const LEVEL_ORDER: IndicatorLevel[] = ['impact', 'outcome', 'output', 'activity'];
