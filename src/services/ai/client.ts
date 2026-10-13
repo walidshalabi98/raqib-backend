@@ -27,7 +27,7 @@ import type * as z from 'zod/v4';
 import { type AiCallStatus, Prisma } from '@prisma/client';
 import { AI_REQUEST_TIMEOUT_MAX_MS, env } from '../../config/env';
 import { prisma } from '../../config/prisma';
-import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from './errors';
+import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError, type AiError } from './errors';
 import { estimateCostUsd, roundUsd, supportsEffort, supportsServerFallback } from './models';
 import { outputJsonSchema } from './outputSchema';
 import { loadSharedSystemPrompt, type SharedSystemPrompt } from './prompts/system';
@@ -348,6 +348,13 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
     }
   };
 
+  /** Writes the AiCall row of a failed call and attaches its usage and cost to the error that is then thrown (AI-4). */
+  const failed = async <E extends AiError>(error: E, status: AiCallStatus, errorType: string | null): Promise<E> => {
+    const aiCallId = await finish(status, errorType);
+    error.call = { usage: { ...state.usage }, estimatedCostUsd: callCost(state), aiCallId, model: state.servedModel };
+    return error;
+  };
+
   // Built before any request, inside a try: a broken knowledge file or a schema the converter
   // cannot express still writes the AiCall row and throws a typed error (nothing is sent).
   let prepared: { systemText: string; outputSchema: Record<string, unknown> };
@@ -355,8 +362,7 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
     shared = loadSharedSystemPrompt();
     prepared = { systemText: shared.text, outputSchema: outputJsonSchema(params.schema) };
   } catch (err) {
-    await finish('error', errorName(err));
-    throw new AiRequestError(params.feature, null, false, 0);
+    throw await failed(new AiRequestError(params.feature, null, false, 0), 'error', errorName(err));
   }
   const { systemText, outputSchema } = prepared;
   const effort = params.effort ?? 'medium';
@@ -389,22 +395,19 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
     }
   } catch (err) {
     const failure = err instanceof RequestFailure ? err : new RequestFailure(null, false, err);
-    await finish('error', errorName(failure.original));
-    throw new AiRequestError(params.feature, failure.status, failure.retryable, state.attempts);
+    throw await failed(new AiRequestError(params.feature, failure.status, failure.retryable, state.attempts), 'error', errorName(failure.original));
   }
 
   // Refusal first: the content of a refused response is not read.
   if (response.stop_reason === 'refusal') {
     const error = new AiRefusalError(params.feature, response.stop_details?.category ?? null);
-    await finish('refusal', error.name);
-    throw error;
+    throw await failed(error, 'refusal', error.name);
   }
   // Cut off: after the max_tokens retry, or because the context window is full (no retry:
   // more output tokens cannot help). Both are stored with status max_tokens and their stop reason.
   if (response.stop_reason === 'max_tokens' || response.stop_reason === 'model_context_window_exceeded') {
     const error = new AiOutputTruncatedError(params.feature, maxTokens, response.stop_reason);
-    await finish('max_tokens', error.name);
-    throw error;
+    throw await failed(error, 'max_tokens', error.name);
   }
 
   const text = (response.content ?? [])
@@ -417,14 +420,12 @@ export async function generateStructured<S extends z.ZodType>(params: GenerateSt
   } catch {
     // Never include the parser message: it quotes part of the answer.
     const error = new AiInvalidOutputError(params.feature, [text.trim() ? 'root: not valid JSON' : 'root: empty answer']);
-    await finish('invalid_output', error.name);
-    throw error;
+    throw await failed(error, 'invalid_output', error.name);
   }
   const result = params.schema.safeParse(parsed);
   if (!result.success) {
     const error = new AiInvalidOutputError(params.feature, describeIssues(result.error.issues));
-    await finish('invalid_output', error.name);
-    throw error;
+    throw await failed(error, 'invalid_output', error.name);
   }
 
   const aiCallId = await finish('success', null);

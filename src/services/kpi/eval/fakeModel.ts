@@ -1,7 +1,7 @@
 /**
  * A deterministic fake ModelCaller for `npm run eval:kpi -- --fake` and the tests (knowledge/kpi-assistant-spec.md §A8;
  * design section 10.2): per result the top min(allowance.max, 3) candidates, each library id for one result only
- * (dealt in rounds) → rawSuggestionFromLibrary;
+ * (dealt in rounds), plus the accountability indicator the prompt asks for → rawSuggestionFromLibrary;
  * outputTokens = ceil(answer JSON length / 4) as a latency proxy, other tokens 0; cost 0. No key, no network, no
  * database: it reads only request.meta (and, for the baselineFromTarget fault, the DOCUMENT FACTS lines of the prompt).
  */
@@ -40,10 +40,24 @@ export function firstTargetFactNumber(user: string): string | null {
 }
 
 /**
+ * The accountability requests of SUGGEST FOR in the prompt (rule 19, D11): result code → the AC ids it lists, from lines
+ * like `O1 [outcome]: suggest 2–3 · … · include one accountability to affected people indicator (one of AC-01, AC-03)`.
+ */
+export function accountabilityRequests(user: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const m of user.matchAll(/^(\S+) \[\w+\]: suggest .*include one accountability to affected people indicator \(one of ([A-Z0-9, -]+)\)/gm)) {
+    out.set(m[1], m[2].split(',').map(id => id.trim()).filter(Boolean));
+  }
+  return out;
+}
+
+/**
  * The fake's answer for one request: up to min(allowance.max, 3) candidates per result of the batch, each library id
  * used for one result only (one library indicator measures one result, as the prompt asks; D12). Candidates are dealt
  * in rounds, like a model that first gives every result its best-fitting indicator: in each round every result, in batch
- * order, takes its highest-ranked candidate not used yet. Suggestions are listed per result in batch order.
+ * order, takes its highest-ranked candidate not used yet. Like a model that follows the prompt's accountability request
+ * (rule 19), a result asked for one includes the first listed AC id it has not used, in place of its last pick when its
+ * allowance is full. Suggestions are listed per result in batch order.
  */
 function answerFor(request: KpiModelRequest): KpiModelAnswer {
   const byId = new Map<string, KpiLibraryEntry>(request.meta.candidates.map(e => [e.id, e]));
@@ -59,6 +73,15 @@ function answerFor(request: KpiModelRequest): KpiModelAnswer {
       used.add(next);
       own.push(next);
     }
+  }
+  const asked = accountabilityRequests(request.user);
+  for (const result of request.meta.batch) {
+    const own = picks.get(result.id) as string[];
+    const id = (asked.get(result.code) ?? []).find(a => byId.has(a) && !used.has(a));
+    if (id === undefined || maxOf(result.id) === 0) continue;
+    if (own.length >= maxOf(result.id)) own.pop();
+    own.push(id);
+    used.add(id);
   }
   const suggestions: KpiRawSuggestion[] = request.meta.batch.flatMap(result =>
     (picks.get(result.id) as string[]).map(id => rawSuggestionFromLibrary(byId.get(id) as KpiLibraryEntry, result, FAKE_RATIONALE)));

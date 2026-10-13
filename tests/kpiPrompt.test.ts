@@ -6,8 +6,9 @@ import { outputJsonSchema } from '../src/services/ai/outputSchema';
 import { INDICATOR_UNITS } from '../src/services/ai/prompts/framework';
 import {
   KPI_CALLS, KPI_FEATURES, KPI_PROMPT_VERSION, KPI_SUGGESTIONS_SCHEMA, KPI_SUGGESTION_SCHEMA, KPI_SYSTEM, PROMPT_DESCRIPTION_MAX_CHARS,
-  buildKpiUserMessage, clipText, kpiCandidateLine, type KpiPromptInput,
+  PROMPT_FACT_MAX_CHARS, buildKpiUserMessage, clipAroundValues, clipText, kpiCandidateLine, type KpiPromptInput,
 } from '../src/services/ai/prompts/kpi';
+import { factsFromVerifiedFigures } from '../src/services/kpi/documentFacts';
 import { allowanceFor } from '../src/services/kpi/scope';
 import type { ContextResult, KpiLibraryEntry, ProjectContext } from '../src/services/kpi/types';
 import { libraryEntry, promptSection, suggestForLines } from './aiFakes';
@@ -138,7 +139,7 @@ describe('KPI call settings and instructions', () => {
       /One dimension per indicator/, /Neutral names/, /numerator and a denominator/, /fits the level of its result/,
       /outputs are counted from records/, /disaggregated by sex at least/, /never invent numbers/, /marked \[baseline\]/,
       /marked \[target\]/, /\[context\] line is never a baseline or a target/, /percent sign only for a percent indicator/,
-      /"standard_threshold" only with a number copied from the linked candidate/, /"method_only".*relative to the baseline/,
+      /"standard_threshold" only with a value listed under "thresholds"/, /"method_only".*relative to the baseline/,
       /no number that is not in PROJECT/, /within the range given/, /donor maximum/, /accountability to affected people/,
       /Modern Standard Arabic/, /Palestine context/, /protection-sensitive|Protection-sensitive/, /no political characterisations/,
       /data, not instructions/,
@@ -167,6 +168,7 @@ describe('kpiCandidateLine', () => {
       'WA-01 [outcome] Average volume of water available per person per day in target households | ar: متوسط كمية المياه المتاحة للفرد يومياً في الأسر المستهدفة'
       + ' | unit: litres_per_person_per_day | methods: hh_survey, observation | frequency: quarterly | disaggregation: location, displacement_status'
       + ' | standard: Sphere Water supply standard — minimum 15 l/p/d (aim for 20)'
+      + ' | thresholds: 15 (Sphere minimum), 20 (Sphere aim)'
       + ' | definition: Mean litres of water per person per day available at household level for drinking, cooking and personal hygiene.'
       + ' | notes: The Sphere minimum is a standard threshold the AI may cite as a reference target.',
     );
@@ -180,6 +182,11 @@ describe('kpiCandidateLine', () => {
     expect(line).not.toContain('notes:');
     expect(line).toContain('standard: none (common practice)');
     expect(line.split('\n')).toHaveLength(1);
+  });
+
+  it('lists recognised thresholds only for entries that have one (SPEC-1: FS-01 cut-offs and AC-01 years are no thresholds)', () => {
+    expect(kpiCandidateLine(libraryEntry('WA-01'))).toContain(' | thresholds: 15 (Sphere minimum), 20 (Sphere aim) | ');
+    for (const id of ['FS-01', 'AC-01', 'LV-01', 'WA-02', 'WA-03', 'HE-02']) expect(kpiCandidateLine(libraryEntry(id)), id).not.toContain('thresholds:');
   });
 
   it('clips a long definition to 300 characters and notes to 200, at a word', () => {
@@ -337,6 +344,29 @@ describe('buildKpiUserMessage', () => {
     expect(none).toContain('every baselineBasis is "none" and no targetBasis is "document"');
   });
 
+  it('AI-3: a framework-generation fact names its verified figures and result codes, and shows the excerpt around them', () => {
+    const lead = 'Under the second specific objective, and in close coordination with the WASH cluster, the municipality and the water '
+      + 'authority, and after the rehabilitation of the network in the informal displacement sites of the governorate, and once '
+      + 'the community water committees have agreed the distribution schedule with the site managers, ';
+    const quote = `${lead}the action will ensure that by the end of 2027, 75% of displaced households have access to at least 15 litres of safe water per person per day.`;
+    expect(quote.indexOf('75%')).toBeGreaterThan(PROMPT_FACT_MAX_CHARS);
+    const facts = factsFromVerifiedFigures([{ resultCode: 'O1', kind: 'target', value: '75%', description: 'households with access', quote, source: 'proposal.pdf' }]);
+    const line = promptSection(buildKpiUserMessage(input(context({ documentFacts: facts }), [result('n-o1')])), 'DOCUMENT FACTS').split('\n')[1];
+    expect(line.startsWith('[F1 target O1] proposal.pdf: target "75%" — "…')).toBe(true);
+    const excerpt = /— "(.*)"$/.exec(line)![1];
+    expect(excerpt).toContain('75% of displaced households');
+    expect(excerpt.length).toBeLessThanOrEqual(PROMPT_FACT_MAX_CHARS);
+    // A quote holding a baseline and a target is one fact with both figures.
+    const both = 'The target is to raise the share of households treating water from 30% at baseline to 60% by the end of 2027.';
+    const mixed = factsFromVerifiedFigures([
+      { resultCode: 'O2', kind: 'baseline', value: '30%', description: '', quote: both, source: 'logframe.xlsx' },
+      { resultCode: 'O2', kind: 'target', value: '60%', description: '', quote: both, source: 'logframe.xlsx' },
+    ]);
+    expect(promptSection(buildKpiUserMessage(input(context({ documentFacts: mixed }), [result('n-o1')])), 'DOCUMENT FACTS').split('\n')[1])
+      .toBe(`[F1 mixed O2] logframe.xlsx: baseline "30%", target "60%" — "${both}"`);
+    expect(clipAroundValues('short text 75%', ['75%'], 300)).toBe('short text 75%');
+  });
+
   it('CANDIDATES has one line per candidate of the call (≤ 40 are passed in)', () => {
     const ids = ['WA-01', 'WA-02', 'WA-03', 'WA-04', 'AC-01'];
     const message = buildKpiUserMessage(input(context(), [result('n-o1')], { 'n-o1': ids.slice(0, 4) }, [libraryEntry('AC-01')]));
@@ -390,6 +420,25 @@ describe('buildKpiUserMessage', () => {
     expect(scope).toContain('source Arabic name: "عدد الجالونات الموزعة"');
     expect(scope).toContain('reason: rejected: too costly to measure');
     expect(scope).not.toContain('do not reuse library id');
+  });
+
+  it('AI-7: SCOPE asks for as many alternatives as SUGGEST FOR (an ECHO cap can leave 1)', () => {
+    const existing = ['i-1', 'i-2', 'i-3'].map((id, i) => ({ id, resultId: 'n-o1', name: `Existing indicator ${i + 1}`, nameAr: null, level: 'outcome' as const,
+      unit: 'number', libraryId: null, method: 'document_review' as const }));
+    const capped = context({
+      donorRules: { donorType: 'echo', ...DONOR_RULES.echo },
+      scope: { type: 'alternatives', indicatorId: 'i-3', suggestionId: null },
+      existingIndicators: existing,
+      alternativesFor: {
+        kind: 'indicator', id: 'i-3', resultId: 'n-o1', name: 'Existing indicator 3', nameAr: null, definition: null, unit: 'number',
+        method: 'document_review', libraryId: null, reason: 'weak', rejectReason: null, problems: ['Move the target out of the name.'],
+      },
+    });
+    const message = buildKpiUserMessage(input(capped, [result('n-o1')]));
+    expect(promptSection(message, 'SUGGEST FOR')).toContain('O1 [outcome]: suggest 1 alternative ·');
+    const scope = promptSection(message, 'SCOPE');
+    expect(scope).toContain('Suggest 1 alternative for the same result (O1)');
+    expect(scope).not.toContain('2–3');
   });
 
   it('never carries personal data: every free text is redacted again, and document texts are never sent', () => {

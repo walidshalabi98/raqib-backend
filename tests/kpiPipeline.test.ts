@@ -13,7 +13,7 @@ import { KPI_CALLS, KPI_PROMPT_VERSION, KPI_SUGGESTIONS_SCHEMA, KPI_SYSTEM } fro
 import { loadSharedSystemPrompt } from '../src/services/ai/prompts/system';
 import {
   KPI_BATCH_CONCURRENCY, KPI_BATCH_MAX_RESULTS, KPI_MAX_CALLS_PER_RUN, KPI_MAX_CONCURRENT_CALLS, KPI_RUN_DEADLINE_MS, callConfigFor,
-  callModelForResults, candidatesForBatch, defaultModelCaller, kpiCallSlots, planBatches,
+  callModelForResults, candidatesForBatch, defaultModelCaller, exclusiveCandidates, kpiCallSlots, planBatches,
 } from '../src/services/kpi/callModel';
 import { QUERY_EMBEDDING_MAX_RETRIES, QUERY_EMBEDDING_TIMEOUT_MS, productionPipelineDeps, queryEmbeddingProvider } from '../src/services/kpi/deps';
 import { EMPTY_PIPELINE_RESULT, KpiPipelineError, emptyPipelineResult, runKpiPipeline } from '../src/services/kpi/pipeline';
@@ -77,12 +77,20 @@ function context(overrides: Partial<ProjectContext> = {}): ProjectContext {
 
 const WASH = libraryEntries().filter(e => e.sector === 'wash');
 
-/** A retrieval result that offers every result the same ranked WASH entries (callModelForResults tests need no ranking). */
+/** Entries for retrievalFor: the WASH entries first, then the other non-accountability entries. */
+const POOL = [...WASH, ...libraryEntries().filter(e => e.sector !== 'wash' && !e.id.startsWith('AC-'))];
+
+/**
+ * A retrieval result that offers every result the same 8 ranked entries (callModelForResults tests need no ranking);
+ * the results of the O2 group get 8 others, so the two batches of RESULTS share no candidate (AI-2 keeps a shared one in
+ * one batch only).
+ */
 function retrievalFor(ctx: ProjectContext, accountability: KpiLibraryEntry[] = []): RetrievalResult {
-  const ranked: RankedCandidate[] = WASH.map((entry, i) => ({ entry, score: 1 - i / 100 }));
+  const ranked: RankedCandidate[] = POOL.map((entry, i) => ({ entry, score: 1 - i / 100 }));
+  const reversed: RankedCandidate[] = [...POOL].reverse().map((entry, i) => ({ entry, score: 1 - i / 100 }));
   return {
     method: 'keyword',
-    byResult: new Map(ctx.resultsChain.map(res => [res.id, ranked.slice(0, 8)])),
+    byResult: new Map(ctx.resultsChain.map(res => [res.id, (res.id.startsWith('n-o2') ? reversed : ranked).slice(0, 8)])),
     accountability,
     library: new Map(libraryEntries().map(e => [e.id, e])),
     warnings: [],
@@ -365,6 +373,83 @@ describe('callModelForResults', () => {
 
 // ------------------------------------------------------------------ runKpiPipeline
 
+describe('AI-2: library ids across batches, and results left without suggestions', () => {
+  /** Every result ranks the same 8 entries the same way (the old fixture): only the earlier batch keeps them. */
+  function sharedRetrieval(ctx: ProjectContext): RetrievalResult {
+    const ranked: RankedCandidate[] = POOL.slice(0, 8).map((entry, i) => ({ entry, score: 1 - i / 100 }));
+    return { ...retrievalFor(ctx), byResult: new Map(ctx.resultsChain.map(res => [res.id, ranked])) };
+  }
+
+  it('an entry ranked for results of two batches is offered only in the batch where it ranks best', async () => {
+    const ctx = context();
+    const fake = fakeModelCaller();
+    await callModelForResults(ctx, sharedRetrieval(ctx), { callModel: fake.caller, now: () => new Date() }, opts());
+    expect(fake.requests).toHaveLength(2);
+    const offered = fake.requests.map(q => new Set(Object.values(q.meta.candidateIdsByResult).flat()));
+    expect([...offered[0]].filter(id => offered[1].has(id))).toEqual([]);
+
+    // The batch where the entry scores best keeps it; within a batch every result keeps its list.
+    const [a, b] = POOL;
+    const byResult = new Map<string, RankedCandidate[]>([
+      ['n-o1', [{ entry: a, score: 0.5 }, { entry: b, score: 0.9 }]], ['n-o1.1', [{ entry: a, score: 0.4 }]],
+      ['n-o2', [{ entry: a, score: 0.8 }, { entry: b, score: 0.3 }]],
+    ]);
+    const batches = [[RESULTS[1], RESULTS[3]], [RESULTS[2]]];
+    const out = exclusiveCandidates(batches, byResult);
+    expect(out.get('n-o1')!.map(c => c.entry.id)).toEqual([b.id]);
+    expect(out.get('n-o1.1')!.map(c => c.entry.id)).toEqual([]);
+    expect(out.get('n-o2')!.map(c => c.entry.id)).toEqual([a.id]);
+    // One batch: nothing changes; excluded ids are removed everywhere.
+    expect(exclusiveCandidates([[RESULTS[1], RESULTS[2]]], byResult).get('n-o2')!.map(c => c.entry.id)).toEqual([a.id, b.id]);
+    expect(exclusiveCandidates([[RESULTS[1]]], byResult, new Set([b.id])).get('n-o1')!.map(c => c.entry.id)).toEqual([a.id]);
+  });
+
+  it('a framework result the model skipped gets one call of its own, without the ids other results keep', async () => {
+    const fake = fakeModelCaller(request => {
+      const answer = kpiAnswerFromMeta(request);
+      return request.meta.batch.length > 1 ? { ...answer, suggestions: answer.suggestions.filter(x => x.resultCode !== 'O1.2') } : answer;
+    });
+    const out = await runKpiPipeline(context(), deps(fake.caller));
+    // O1.2 (skipped by the model) and O2.1 (its keyword candidates are used by other results) get a call each.
+    const retries = fake.requests.filter(q => q.meta.batch.length === 1);
+    expect(retries.map(q => q.meta.batch[0].code)).toEqual(['O1.2', 'O2.1']);
+    expect(retries[0]).toMatchObject({ feature: 'kpi.suggest', ...KPI_CALLS.result });
+    const keptElsewhere = new Set(out.suggestions.filter(x => x.resultCode !== 'O1.2').map(x => x.libraryId));
+    expect(retries[0].meta.candidateIdsByResult['n-o1.2'].length).toBeGreaterThan(0);
+    expect(retries[0].meta.candidateIdsByResult['n-o1.2'].filter(id => keptElsewhere.has(id))).toEqual([]);
+    expect(out.suggestions.some(x => x.resultCode === 'O1.2')).toBe(true);
+    expect(out.calls).toHaveLength(fake.requests.length);
+    expect(out.frameworkWarnings.filter(w => w.code === 'result_empty')).toEqual([]);
+  });
+
+  it('a result still without suggestions after its retry gets result_empty; the eval counts it as incomplete', async () => {
+    const fake = fakeModelCaller(request => {
+      const answer = kpiAnswerFromMeta(request);
+      return { ...answer, suggestions: answer.suggestions.filter(x => x.resultCode !== 'O2.1') };
+    });
+    const out = await runKpiPipeline(context(), deps(fake.caller));
+    expect(fake.requests.filter(q => q.meta.batch.length === 1).map(q => q.meta.batch[0].code)).toEqual(['O2.1']);
+    expect(out.frameworkWarnings.filter(w => w.code === 'result_empty').map(w => w.params)).toEqual([{ code: 'O2.1' }]);
+    expect(out.frameworkWarnings.filter(w => w.code === 'result_failed')).toEqual([]);
+  });
+
+  it('no retry without calls left, and none for result scope (an empty result is still reported)', async () => {
+    const skipO12 = (request: KpiModelRequest) => {
+      const answer = kpiAnswerFromMeta(request);
+      return { ...answer, suggestions: answer.suggestions.filter(x => x.resultCode !== 'O1.2') };
+    };
+    const capped = fakeModelCaller(skipO12);
+    const out = await runKpiPipeline(context(), deps(capped.caller), { maxCalls: 2 });
+    expect(capped.requests).toHaveLength(2);
+    expect(out.frameworkWarnings.filter(w => w.code === 'result_empty').map(w => w.params)).toEqual([{ code: 'O1.2' }, { code: 'O2.1' }]);
+
+    const nothing = fakeModelCaller(() => ({ suggestions: [], frameworkWarnings: [] }));
+    const result = await runKpiPipeline(context({ scope: { type: 'result', resultId: 'n-o1' } }), deps(nothing.caller));
+    expect(nothing.requests).toHaveLength(1);
+    expect(result.frameworkWarnings.filter(w => w.code === 'result_empty').map(w => w.params)).toEqual([{ code: 'O1' }]);
+  });
+});
+
 describe('runKpiPipeline', () => {
   it('returns the empty result without retrieval, steps or a model call when nothing is in scope (design m4)', async () => {
     const library: LibrarySource = { allEntries: vi.fn(), vectors: vi.fn() };
@@ -403,7 +488,13 @@ describe('runKpiPipeline', () => {
     expect(out.promptVersion).toBe('kpi-v1');
     expect(out.model).toBe('fake-main-model');
     expect(out.embeddingCalls).toBe(0);
-    expect(out.calls).toHaveLength(2);
+    // Two batch calls, then one call of its own for each result left without a suggestion (AI-2: here O2.1, whose
+    // keyword candidates the first batch or O2 already uses).
+    expect(fake.requests.slice(0, 2).map(q => q.meta.batch.length).sort()).toEqual([2, 4]);
+    expect(fake.requests.slice(2).map(q => q.meta.batch.map(x => x.code))).toEqual([['O2.1']]);
+    expect(out.calls).toHaveLength(fake.requests.length);
+    expect(out.frameworkWarnings.filter(w => w.code === 'result_empty')).toEqual([]);
+    expect(new Set(out.suggestions.map(x => x.resultCode))).toEqual(new Set(RESULTS.map(x => x.code)));
     expect(Object.keys(out.candidateIdsByResult).sort()).toEqual(RESULTS.map(x => x.id).sort());
     expect(out.raw.length).toBeGreaterThan(0);
     expect(out.suggestions.length).toBeGreaterThan(0);
@@ -551,7 +642,9 @@ describe('runKpiPipeline through the real client with a fake Anthropic SDK', () 
     configureAiClientForTests({ anthropic: sdk.client, logCall: log.logCall });
     const out = await runKpiPipeline(context(), deps(defaultModelCaller), { callContext: { organizationId: 'org-1', projectId: 'p-1' } });
 
-    expect(sdk.sent).toHaveLength(2);
+    // Two batches, then the AI-2 retry of a result left without a suggestion (one result per call).
+    expect(sdk.sent.length).toBeGreaterThanOrEqual(2);
+    expect(sdk.sent.slice(2).every(q => suggestForLines(q.body.messages[0].content).length === 1)).toBe(true);
     const schema = outputJsonSchema(KPI_SUGGESTIONS_SCHEMA);
     for (const request of sdk.sent) {
       expect(request.body.output_config.format).toEqual({ type: 'json_schema', schema });
@@ -562,14 +655,13 @@ describe('runKpiPipeline through the real client with a fake Anthropic SDK', () 
       expect(request.body.model).toBe(resolveModel('main'));
       expect(request.body.messages).toHaveLength(1);
     }
-    const sizes = sdk.sent.map(q => suggestForLines(q.body.messages[0].content).length).sort();
+    const sizes = sdk.sent.slice(0, 2).map(q => suggestForLines(q.body.messages[0].content).length).sort();
     expect(sizes).toEqual([2, 4]);
     const big = sdk.sent.find(q => suggestForLines(q.body.messages[0].content).length === 4)!;
     expect(big.body.max_tokens).toBe(KPI_CALLS.batch.maxTokens);
     expect(big.options?.timeout).toBe(KPI_CALLS.batch.timeoutMs);
-    expect(log.records.map(x => [x.feature, x.promptVersion, x.status, x.organizationId, x.projectId])).toEqual([
-      ['kpi.suggest', 'kpi-v1', 'success', 'org-1', 'p-1'], ['kpi.suggest', 'kpi-v1', 'success', 'org-1', 'p-1'],
-    ]);
+    expect(log.records.map(x => [x.feature, x.promptVersion, x.status, x.organizationId, x.projectId]))
+      .toEqual(sdk.sent.map(() => ['kpi.suggest', 'kpi-v1', 'success', 'org-1', 'p-1']));
     expect(out.model).toBe(resolveModel('main'));
     expect(out.calls.every(c => c.aiCallId?.startsWith('call-'))).toBe(true);
     expect(out.suggestions.length).toBeGreaterThan(0);
@@ -594,10 +686,14 @@ describe('runKpiPipeline through the real client with a fake Anthropic SDK', () 
     configureAiClientForTests({ anthropic: sdk.client, logCall: logger().logCall });
     const ctx = context({ resultsChain: RESULTS.slice(0, 2).concat(RESULTS.slice(3, 4)) });
     const out = await runKpiPipeline(ctx, deps(defaultModelCaller));
-    // 1 batch request + its 2× retry, then 3 single results
-    expect(sdk.sent).toHaveLength(5);
+    // 1 batch request + its 2× retry, then 3 single results (and any AI-2 retry of a result left without a suggestion)
+    expect(sdk.sent.length).toBeGreaterThanOrEqual(5);
     expect(sdk.sent[1].body.max_tokens).toBe(2 * KPI_CALLS.batch.maxTokens);
-    expect(out.calls.map(c => c.outcome)).toEqual(['truncated', 'success', 'success', 'success']);
+    expect(out.calls.slice(0, 4).map(c => c.outcome)).toEqual(['truncated', 'success', 'success', 'success']);
+    expect(out.calls.slice(4).every(c => c.outcome === 'success' && c.resultCodes.length === 1)).toBe(true);
+    // AI-4: the truncated call is billed: its tokens (both attempts) and cost are on the call info, with its AiCall id.
+    expect(out.calls[0]).toMatchObject({ outcome: 'truncated', outputTokens: 12_000, aiCallId: expect.stringMatching(/^call-/) });
+    expect(out.calls[0].estimatedCostUsd).toBeGreaterThan(0);
     expect(out.frameworkWarnings.filter(w => w.code === 'result_failed')).toEqual([]);
     expect(new Set(out.raw.map(s => s.resultCode))).toEqual(new Set(['G', 'O1', 'O1.1']));
     expect(out.suggestions.length).toBeGreaterThan(0);

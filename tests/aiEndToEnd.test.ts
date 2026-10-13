@@ -197,9 +197,15 @@ function suggestion(overrides: Partial<KpiRawSuggestion>): KpiRawSuggestion {
   };
 }
 
-/** The answer to the one KPI batch of the four results (G, O1, O1.1, O1.2). */
+/** The answer to the one KPI batch of the four results (G, O1, O1.1, O1.2): every result gets one (no AI-2 retry). */
 const INDICATORS_ANSWER = {
   suggestions: [
+    suggestion({
+      resultCode: 'G', level: 'impact', name: 'Incidence of acute watery diarrhoea among children under five in the governorate',
+      nameAr: 'معدل الإصابة بالإسهال المائي الحاد بين الأطفال دون سن الخامسة في المحافظة', unit: 'ratio', method: 'secondary_data', frequency: 'annual',
+      definition: 'New cases of acute watery diarrhoea per 1,000 children under five per year, from the health surveillance system.',
+      meansOfVerification: 'Ministry of Health disease surveillance bulletins',
+    }),
     suggestion({
       resultCode: 'O1', name: 'Average volume of water available per person per day in target households', libraryId: 'WA-01', isCustom: false, customReason: '',
       nameAr: 'متوسط كمية المياه المتاحة للفرد يوميًا في الأسر المستهدفة', standardReferenceCode: 'Sphere',
@@ -323,7 +329,7 @@ describe.skipIf(!hasTestDatabase)('AI services through the real client (fake SDK
     expect(structureReq.body.messages[0].content).toContain('[phone removed]');
     const indicatorPrompt: string = indicatorsReq.body.messages[0].content;
     expect(indicatorPrompt).toContain('SUGGEST FOR\nG [impact]');
-    expect(indicatorPrompt).toMatch(/\[F\d+ target\] proposal\.pdf: "Result 1\.1: 12,000 people receive trucked drinking water for nine months"/);
+    expect(indicatorPrompt).toMatch(/\[F\d+ target O1\.1\] proposal\.pdf: target "12,000" — "Result 1\.1: 12,000 people receive trucked drinking water for nine months"/);
     expect(indicatorPrompt).not.toContain('80 ILS');
 
     // --- stored rows
@@ -334,8 +340,8 @@ describe.skipIf(!hasTestDatabase)('AI services through the real client (fake SDK
     expect(stored).toMatchObject({ status: 'expert_review', aiModelUsed: MAIN_FALLBACK, generationError: null });
     // Goal, outcome, outputs and their activities.
     expect(stored.resultNodes.map(n => n.code).sort()).toEqual(['A1.1.1', 'A1.2.1', 'G', 'O1', 'O1.1', 'O1.2']);
-    // The three answered indicators plus AC-01, appended for this humanitarian project (rule 19).
-    expect(stored.indicators).toHaveLength(4);
+    // The four answered indicators plus AC-01, appended for this humanitarian project (rule 19).
+    expect(stored.indicators).toHaveLength(5);
     expect(stored.indicators.every(i => i.provenance === 'ai_generated' && i.aiModel === MAIN_FALLBACK && i.promptVersion === KPI_PROMPT_VERSION)).toBe(true);
     const byText = (text: string) => stored.indicators.find(i => i.indicatorText.startsWith(text))!;
     expect(byText('Average volume')).toMatchObject({ baselineValue: '6', baselineDate: null, targetValue: '15', unit: 'litres_per_person_per_day', libraryId: 'WA-01' });

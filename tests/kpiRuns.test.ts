@@ -1,11 +1,15 @@
 import type { KpiSuggestion, KpiSuggestionRun } from '@prisma/client';
+import express from 'express';
+import request from 'supertest';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { env } from '../src/config/env';
 import { prisma } from '../src/config/prisma';
 import { AppError, appErrorBody } from '../src/middleware/errorHandler';
-import { isKpiRunPoll, organisationKey, userKey } from '../src/middleware/rateLimit';
+import { aiLimiter, apiLimiter, isKpiRunPoll, kpiOrgLimiter, organisationKey, userKey } from '../src/middleware/rateLimit';
 import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from '../src/services/ai/errors';
 import { seedLibrary } from '../src/services/library/seed';
 import { KpiContextError } from '../src/services/kpi/context';
+import { rejectKpiSuggestion } from '../src/services/kpi/reject';
 import { emptyPipelineResult, KpiPipelineError, runKpiPipeline } from '../src/services/kpi/pipeline';
 import {
   activeRunIds, callTotals, errorCodeFor, executeKpiRun, findConflictingRun, interruptActiveRuns, INTERRUPTED_RUN_MESSAGE,
@@ -113,7 +117,7 @@ describe('runFailure and toRunDto (design 7.4)', () => {
       id: 'run-1', projectId: 'p-1', frameworkId: 'f-1', scope: 'result', resultId: 'r-1', sourceIndicatorId: null, sourceSuggestionId: null,
       status: 'completed', step: 'done', errorCode: null, message: null, frameworkWarnings: [{ code: 'result_cap' }], suggestionCount: 3,
       retrieval: 'keyword', model: 'm', promptVersion: 'kpi-v1', createdAt: '2026-10-13T08:00:00.000Z', updatedAt: '2026-10-13T08:00:10.000Z',
-      finishedAt: '2026-10-13T08:00:14.000Z',
+      finishedAt: '2026-10-13T08:00:14.000Z', serverNow: now.toISOString(),
     });
     expect(toRunDto(runRow({ frameworkWarnings: { not: 'an array' }, step: 'weird', retrieval: 'other' }), now))
       .toMatchObject({ frameworkWarnings: [], step: 'context', retrieval: null });
@@ -257,6 +261,68 @@ describe('small helpers', () => {
   });
 });
 
+describe('TQ-05: the KPI limiters in production (skipped in tests otherwise)', () => {
+  const ok = (_req: express.Request, res: express.Response) => { res.json({ ok: true }); };
+  function limitedApp() {
+    const app = express();
+    app.use((req, _res, next) => {
+      const user = req.header('x-user');
+      if (user) req.user = { id: user, organizationId: req.header('x-org') ?? '' } as never;
+      next();
+    });
+    app.use(apiLimiter);
+    app.get('/api/kpi-suggestion-runs/:id', ok);
+    app.get('/api/projects', ok);
+    app.post('/api/projects/:id/kpi-suggestions', kpiOrgLimiter, ok);
+    app.post('/api/ai', aiLimiter, ok);
+    return app;
+  }
+
+  it('aiLimiter answers 429 rate_limited with scope user after 60 AI requests of one person in an hour', async () => {
+    const saved = env.nodeEnv;
+    env.nodeEnv = 'production';
+    try {
+      const app = limitedApp();
+      const user = `u-${Date.now()}`;
+      for (let i = 0; i < 60; i++) expect((await request(app).post('/api/ai').set('x-user', user).set('x-org', 'o')).status).toBe(200);
+      const refused = await request(app).post('/api/ai').set('x-user', user).set('x-org', 'o');
+      expect(refused.status).toBe(429);
+      expect(refused.body).toMatchObject({ code: 'rate_limited', details: { scope: 'user' } });
+    } finally {
+      env.nodeEnv = saved;
+    }
+  });
+
+  it('apiLimiter skips run polls (they have their own per-user limit); kpiOrgLimiter counts per organisation', async () => {
+    const saved = env.nodeEnv;
+    env.nodeEnv = 'production';
+    try {
+      const app = limitedApp();
+      const poll = await request(app).get('/api/kpi-suggestion-runs/abc');
+      expect(poll.status).toBe(200);
+      expect(poll.headers['ratelimit-policy']).toBeUndefined();
+      const other = await request(app).get('/api/projects');
+      expect(other.headers['ratelimit-policy']).toBeDefined();
+
+      // 120 KPI requests per hour per organisation, whoever sends them: the 121st request of the organisation is refused.
+      const org = `org-${Date.now()}`;
+      for (let i = 0; i < 120; i++) {
+        const res = await request(app).post('/api/projects/p/kpi-suggestions').set('x-user', `u-${i}`).set('x-org', org);
+        expect(res.status, `request ${i + 1}`).toBe(200);
+      }
+      const refused = await request(app).post('/api/projects/p/kpi-suggestions').set('x-user', 'u-new').set('x-org', org);
+      expect(refused.status).toBe(429);
+      expect(refused.body.message).toMatch(/organisation reached the hourly limit/);
+      // UX-08 (b): a code and the scope, so the web app can tell the organisation's limit from the person's.
+      expect(refused.body).toMatchObject({ code: 'rate_limited', details: { scope: 'organisation' } });
+      // Another organisation is not affected.
+      expect((await request(app).post('/api/projects/p/kpi-suggestions').set('x-user', 'u-0').set('x-org', `${org}-b`)).status).toBe(200);
+    } finally {
+      env.nodeEnv = saved;
+    }
+  });
+});
+
 // ------------------------------------------------------------------ database
 
 describe.skipIf(!hasTestDatabase)('KPI runs on the database', () => {
@@ -329,6 +395,87 @@ describe.skipIf(!hasTestDatabase)('KPI runs on the database', () => {
     gate.resolve(pipelineResult([]));
     await created[0].value.done;
     expect(await runOf(created[0].value.run.id)).toMatchObject({ status: 'completed', step: 'done', suggestionCount: 0 });
+  });
+
+  /** Holds the project's KPI advisory lock in its own transaction until `release` is called. */
+  async function holdProjectLock(projectId: string) {
+    const release = deferred<void>();
+    const held = deferred<void>();
+    const done = prisma.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`kpi-run:${projectId}`}::text))`;
+      held.resolve(undefined as never);
+      await release.promise;
+    }, { timeout: 20_000 });
+    await held.promise;
+    return { release: () => release.resolve(undefined as never), done };
+  }
+
+  it('TQ-04: run creation waits for the project lock, so two starts never both pass the conflict check', async () => {
+    const gate = deferred<KpiPipelineResult>();
+    pipelineMock.mockImplementation(() => gate.promise);
+    const lock = await holdProjectLock(fx.project.id);
+    const starts = Promise.allSettled([start({ type: 'framework' }), start({ type: 'framework' })]);
+    await new Promise(resolve => setTimeout(resolve, 400));
+    // Both starts wait for the lock: no new run row exists yet (the fixture has a completed run).
+    expect(await prisma.kpiSuggestionRun.count({ where: { projectId: fx.project.id, id: { not: fx.kpiRun.id } } })).toBe(0);
+    lock.release();
+    await lock.done;
+    const results = await starts;
+    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter(r => r.status === 'rejected').map(r => (r as PromiseRejectedResult).reason)).toEqual([expect.objectContaining({ statusCode: 409, code: 'run_in_progress' })]);
+    gate.resolve(pipelineResult([]));
+    for (const r of results) if (r.status === 'fulfilled') await r.value.done;
+  });
+
+  it('TQ-03: a run marked interrupted while it waits to save is never completed (conditional claim and completion)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const gate = deferred<KpiPipelineResult>();
+    pipelineMock.mockImplementationOnce(() => gate.promise);
+    const { run, done } = await start(resultScope());
+    // Another transaction holds the project lock (say, a run of another result saving its cards) when this run saves.
+    const lock = await holdProjectLock(fx.project.id);
+    gate.resolve(pipelineResult([suggestion(fx.result, 1, 'Card saved after the interruption')]));
+    // The executor reached the save step and now waits for the project lock.
+    await vi.waitFor(async () => expect((await runOf(run.id)).step).toBe('saving'));
+    expect(await interruptActiveRuns(prisma)).toBe(1);
+    lock.release();
+    await lock.done;
+    await done;
+    expect(await runOf(run.id)).toMatchObject({ status: 'failed', errorCode: 'interrupted', suggestionCount: 0 });
+    expect(await prisma.kpiSuggestion.count({ where: { runId: run.id } })).toBe(0);
+    warn.mockRestore();
+  });
+
+  it('TQ-03: a pipeline failure after the run was marked interrupted keeps the interrupted code (conditional failure write)', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    pipelineMock.mockImplementationOnce(async () => {
+      await prisma.kpiSuggestionRun.updateMany({ where: { projectId: fx.project.id, status: 'running' }, data: { status: 'failed', errorCode: 'interrupted', error: INTERRUPTED_RUN_MESSAGE } });
+      throw new AiRefusalError('kpi.suggest', null);
+    });
+    const { run, done } = await start(resultScope());
+    await done;
+    expect(await runOf(run.id)).toMatchObject({ status: 'failed', errorCode: 'interrupted', error: INTERRUPTED_RUN_MESSAGE });
+    errors.mockRestore();
+  });
+
+  it('CC-05: a library id rejected while the run was preparing is not saved again (rejected_library_dropped)', async () => {
+    const libraryCard = (rank: number, name: string) => suggestion(fx.result, rank, name, { libraryId: 'ED-02', isCustom: false, customReason: '' });
+    const earlier = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: libraryCard(2, 'Reading proficiency (earlier card)') });
+    const gate = deferred<KpiPipelineResult>();
+    pipelineMock.mockImplementationOnce(() => gate.promise);
+    const { run, done } = await start(resultScope());
+    await vi.waitFor(async () => expect(pipelineMock).toHaveBeenCalled());
+    // The officer rejects the earlier card while the run is still preparing.
+    await rejectKpiSuggestion({ suggestionId: earlier.id, organizationId: fx.org.id, userId: fx.officer.id, body: { reason: 'not_relevant' } });
+    gate.resolve(pipelineResult([libraryCard(1, 'Reading proficiency (new card)'), suggestion(fx.result, 2, 'Number of reading clubs')]));
+    await done;
+    const saved = await prisma.kpiSuggestion.findMany({ where: { runId: run.id } });
+    expect(saved.map(x => x.libraryId)).toEqual([null]);
+    expect((await runOf(run.id)).frameworkWarnings).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'rejected_library_dropped', params: { libraryId: 'ED-02' } })]));
+    expect(planPersistence({
+      suggestions: [libraryCard(1, 'x')], scopeType: 'result', runCreatedAt: new Date(), liveResultIds: new Set([fx.result.id]),
+      indicators: [], pending: [], rejectedLibraryIds: ['ed-02'],
+    }).dropped).toEqual([{ resultCode: fx.result.code, name: 'x', reason: 'rejected', libraryId: 'ED-02' }]);
   });
 
   it('result scope: persists ranked pending suggestions with the run totals and expires the result\'s older pending cards', async () => {

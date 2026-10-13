@@ -230,6 +230,13 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
   // The served model of the first successful call (it may differ from the configured one after a server-side fallback).
   const aiModel = kpi.model ?? 'unknown';
   console.log(`[FrameworkGenerator] KPI pipeline: ${kpi.suggestions.length} indicators from ${kpi.calls.length} calls, ${kpi.frameworkWarnings.length} framework warnings, retrieval ${kpi.retrieval}`);
+  // AI-2: results left without an indicator (result_failed, result_empty) are named in the admins' notification, so the
+  // review starts with them instead of a framework that silently lacks indicators.
+  const withoutIndicators = Array.from(new Set(kpi.frameworkWarnings
+    .filter(w => w.code === 'result_failed' || w.code === 'result_empty')
+    .map(w => redactPersonalData(String(w.params.code ?? '')).text.trim())
+    .filter(Boolean)));
+  if (withoutIndicators.length > 0) console.warn(`[FrameworkGenerator] ${withoutIndicators.length} result(s) without generated indicators`);
 
   // Step 3: Create the results chain and the indicators together, so a failure leaves no partial framework
   const { resultCount, indicatorCount } = await prisma.$transaction(async tx => {
@@ -315,7 +322,9 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
         userId: admin.id,
         type: 'framework_approved',
         title: 'M&E Framework Generated',
-        message: `AI has generated an M&E framework for "${project.name}" with ${indicatorCount} indicators across ${resultCount} results. Please review.`,
+        message: `AI has generated an M&E framework for "${project.name}" with ${indicatorCount} indicators across ${resultCount} results.`
+          + (withoutIndicators.length > 0 ? ` No indicator could be generated for ${withoutIndicators.join(', ')}; add one or ask the KPI Assistant.` : '')
+          + ' Please review.',
         link: `/projects/${projectId}/framework`,
       },
     });

@@ -1,16 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { DONOR_RULES } from '../src/services/ai/donorRules';
 import {
-  DEFAULT_TARGET_METHOD, TO_BE_CONFIRMED, codeKey, excerptSupportsValue, isPercentUnit, normaliseForMatch,
-  standaloneValueOffsets,
+  DEFAULT_TARGET_METHOD, TO_BE_CONFIRMED, codeKey, excerptSupportsValue, isGenericMeansOfVerification, isPeopleLevelIndicator,
+  isPercentUnit, matchingFigure, normaliseForMatch, standaloneValueOffsets, verifyDocumentFigures,
 } from '../src/services/ai/frameworkNormalize';
+import type { VerifiedFigure } from '../src/services/ai/frameworkNormalize';
+import { STANDARD_THRESHOLDS, recognisedThreshold } from '../src/services/ai/standardThresholds';
 import { FRAMEWORK_DIRECTIONS, FRAMEWORK_FREQUENCIES, FRAMEWORK_METHODS, INDICATOR_UNITS } from '../src/services/ai/prompts/framework';
 import { parseIndicatorCreate } from '../src/services/indicators/validation';
 import { loadLibraryFile } from '../src/services/library/load';
 import {
   ACCOUNTABILITY_APPEND_ORDER, ACCOUNTABILITY_IDS, isAccountabilityEntry, isAccountabilityIndicator, isAccountabilityText,
 } from '../src/services/kpi/accountability';
-import { factKind } from '../src/services/kpi/documentFacts';
+import { extractDocumentFacts, factKind, factsFromVerifiedFigures } from '../src/services/kpi/documentFacts';
 import { draftToCreateInput } from '../src/services/kpi/draft';
 import { allowanceFor, exclusionsFor, scopedResults } from '../src/services/kpi/scope';
 import { KPI_PENALTIES, KPI_WARNING_CODES } from '../src/services/kpi/types';
@@ -21,9 +23,10 @@ import type {
 import {
   NEAR_DUPLICATE_COSINE, QUALITY_THRESHOLDS, applyResultCaps, documentValueSupported, dropDuplicates, ensureAccountability,
   factsFiguresFor, methodHasAbsoluteFigure, qualityBand, qualityScore, rawSuggestionFromLibrary, scoreExistingIndicator,
-  validateAndScore, validateSuggestion, valueKindInFact, warning, withoutUnverifiedSentences,
+  nameFiguresUnsupported, validateAndScore, validateSuggestion, valueKindInFact, warning, withoutUnverifiedSentences,
 } from '../src/services/kpi/validate';
 import type { ValidateDeps } from '../src/services/kpi/validate';
+import { nameHasTargetIndependent, peopleLevelIndependent } from '../src/services/kpi/eval/metrics';
 
 /**
  * KPI Assistant validation core (knowledge/kpi-assistant-spec.md §A4 step 3; me-foundations §2, §3, §6; design sections
@@ -261,10 +264,16 @@ describe('accountability entries and wording (rule 19, D11)', () => {
       '% treated with respect by staff', 'Assistance met priority needs', 'Feedback channels known']) {
       expect(isAccountabilityText(text)).toBe(true);
     }
-    for (const ar of ['ملاحظات المستفيدين', 'تغذية راجعة', 'المساءلة أمام المجتمعات', 'عوملوا باحترام', 'التشاور مع المجتمع', 'تقديم شكوى']) {
+    for (const ar of ['آلية الشكاوى والملاحظات', 'آلية التغذية الراجعة', 'المساءلة أمام المجتمعات', 'عوملوا باحترام', 'التشاور مع المجتمع', 'تقديم شكوى']) {
       expect(isAccountabilityText('x', ar)).toBe(true);
     }
     expect(isAccountabilityText('Number of water points rehabilitated', 'عدد نقاط المياه')).toBe(false);
+    // SPEC-7: routine process wording is not accountability to affected people (single words no longer count).
+    for (const text of ['Number of voucher distributions with post-distribution feedback forms completed', 'Training feedback score',
+      'Number of complaints about water quality from municipalities']) {
+      expect(isAccountabilityText(text), text).toBe(false);
+    }
+    for (const ar of ['الملاحظات الصفية', 'تقييم التغذية الراجعة من المتدربين', 'احترام المواعيد']) expect(isAccountabilityText('x', ar), ar).toBe(false);
   });
 });
 
@@ -357,6 +366,8 @@ describe('warnings, quality score and band', () => {
     ['generic_means_of_verification', {}, 'The means of verification is too general; to be confirmed by the M&E officer.'],
     ['figures_unverified', { figures: '37%' }, 'Text with numbers not found in the documents or the library was removed: 37%.'],
     ['level_adjusted', { level: 'outcome', code: 'O1' }, 'Level changed to outcome to match result O1.'],
+    ['level_mismatch_library', { libraryId: 'FS-04', entryLevel: 'output', level: 'outcome', code: 'O1' },
+      'Library indicator FS-04 is an output indicator; O1 is an outcome. Check that it measures this level.'],
     ['model_note', { message: 'O2 has no measurable change.' }, 'AI note: O2 has no measurable change.'],
     ['unknown_result', { code: 'O9' }, 'A suggestion for an unknown result (O9) was dropped.'],
     ['rejected_library_dropped', { libraryId: 'WA-03' }, 'A suggestion using WA-03 was dropped because your organisation rejected it.'],
@@ -366,6 +377,7 @@ describe('warnings, quality score and band', () => {
     ['accountability_added', { libraryId: 'AC-01', code: 'O1' }, 'Humanitarian project without an accountability indicator: AC-01 was added to O1.'],
     ['accountability_missing', {}, 'Humanitarian project without an accountability indicator.'],
     ['result_failed', { code: 'O2' }, 'No suggestions for O2: the AI answer could not be used or came too late. Try this result again.'],
+    ['result_empty', { code: 'O2.1' }, 'No suggestions were kept for O2.1. Ask for suggestions for this result again or add an indicator yourself.'],
     ['keyword_fallback', {}, 'Semantic search is not available, so candidates were matched by keywords.'],
   ];
 
@@ -557,11 +569,14 @@ describe('validateSuggestion: rules x1, 1–16, x2–x5', () => {
     expect(documentValueSupported('22.5%', 'baseline', true, [{ ...whole, excerpt: 'A survey we never uploaded found 22.5% of households.' }], ctx.documentTexts)).toBeNull();
   });
 
-  it('valueKindInFact: mixed facts take the kind of the nearest cue before the value (EN and AR)', () => {
+  it('valueKindInFact: each value takes the kind of the nearest cue in its clause, before it first (EN and AR)', () => {
     const at = (fact: DocumentFact, value: string) => standaloneValueOffsets(fact.excerpt, value)[0].start;
     expect(valueKindInFact(MIXED_FACT, at(MIXED_FACT, '45'))).toBe('baseline');
     expect(valueKindInFact(MIXED_FACT, at(MIXED_FACT, '75'))).toBe('target');
-    expect(valueKindInFact(MIXED_FACT, 0)).toBeNull();
+    // No cue before the value in its clause: the nearest cue after it ("45% … currently treat water").
+    const after: DocumentFact = { ...MIXED_FACT, excerpt: '45% of households currently treat water and the project will raise this to 75%.' };
+    expect(valueKindInFact(after, at(after, '45'))).toBe('baseline');
+    expect(valueKindInFact(after, at(after, '75'))).toBe('target');
     expect(valueKindInFact(CASE02_FACT, 0)).toBe('target');
     expect(valueKindInFact({ ...CASE02_FACT, kind: null }, 40)).toBeNull();
     const arabic: DocumentFact = { documentId: 'd', fileName: 'f.pdf', kind: 'mixed', excerpt: 'أظهر المسح أن ٤٥٪ من الأسر تعالج المياه، والمستهدف ٧٥٪ بحلول عام ٢٠٢٧.' };
@@ -646,7 +661,8 @@ describe('validateSuggestion: rules x1, 1–16, x2–x5', () => {
     const wa04 = validate(raw({ resultCode: 'O1.1', level: 'output', libraryId: 'WA-04', name: 'Number of people with access to improved drinking water and/or sanitation as a result of the project', nameAr: 'عدد الأشخاص الذين حصلوا على مياه شرب و/أو خدمات صرف صحي محسّنة بفضل المشروع', unit: 'number', numerator: '', denominator: '', disaggregation: ['sex', 'location'], method: 'document_review', standardReferenceCode: 'GERF 9.99' }));
     expect(wa04.standardReferenceCode).toBe('EU GERF 2.38');
     expect(wa04.draft.standardReferenceCode).toBe('EU GERF 2.38');
-    expect(validate(customRaw({ standardReferenceCode: 'IASC MHPSS O5.4' })).standardReferenceCode).toBe('IASC MHPSS O5.4');
+    // SPEC-4: a custom suggestion never keeps the model's code (it would show as donor-standard).
+    expect(validate(customRaw({ standardReferenceCode: 'IASC MHPSS O5.4' })).standardReferenceCode).toBeNull();
     expect(validate(customRaw({ standardReferenceCode: '' })).standardReferenceCode).toBeNull();
   });
 
@@ -786,6 +802,16 @@ describe('run-level rules 17, 18, 19 and x6 (validateAndScore)', () => {
     expect(dropDuplicates([s], context({ existingIndicators: [similar] })).kept).toEqual([s]);
   });
 
+  it('TQ-06: the near-duplicate threshold is the spec\'s cosine 0.92, inclusive', () => {
+    expect(NEAR_DUPLICATE_COSINE).toBe(0.92);
+    const s = validate(raw());
+    const similar = indicator({ resultId: 'n-o2', name: 'Share of households with basic drinking water' });
+    const at = (cosine: number) => dropDuplicates([s], context({ existingIndicators: [similar] }), () => cosine).kept;
+    expect(at(0.92)).toEqual([]);
+    expect(at(0.9199)).toEqual([s]);
+    expect(at(0.95)).toEqual([]);
+  });
+
   it('rule 18: repeats within the run keep the better one; one library id measures one result (D12)', () => {
     const medium = validate(raw({ confidence: 'medium' }), context(), deps(), { rank: 1 });
     const high = validate(raw({ confidence: 'high', name: '% of households using a basic drinking water service' }), context(), deps(), { rank: 2 });
@@ -795,10 +821,11 @@ describe('run-level rules 17, 18, 19 and x6 (validateAndScore)', () => {
     const sameName = validate(customRaw({ confidence: 'low' }), context(), deps(), { rank: 3 });
     const sameNameBetter = validate(customRaw({ confidence: 'high', libraryId: null }), context(), deps(), { rank: 4 });
     expect(dropDuplicates([sameName, sameNameBetter], context()).kept).toEqual([sameNameBetter]);
-    // Same library id for O2 (model order first) and O1: the first in chain order (O1) is kept.
+    // Same library id for O2 (model order first) and O1: the first in chain order (O1) is kept (D12, in applyResultCaps).
     const onO2 = validate(raw({ resultCode: 'O2' }), context(), deps(), { rank: 1 });
     const onO1 = validate(raw(), context(), deps(), { rank: 2 });
-    const across = dropDuplicates([onO2, onO1], context());
+    expect(dropDuplicates([onO2, onO1], context()).kept).toEqual([onO2, onO1]);
+    const across = applyResultCaps([onO2, onO1], context());
     expect(across.kept).toEqual([onO1]);
     expect(across.warnings).toEqual([warning('duplicate_in_run', { code: 'O2' })]);
   });
@@ -986,5 +1013,352 @@ describe('scoreExistingIndicator (trigger 3, M4)', () => {
     expect(out).toMatchObject({ qualityScore: 75, qualityBand: 'review', needsAlternatives: true });
     expect(codes(scoreExistingIndicator({ ...clean, calculation: null }).warnings)).toEqual(['percent_without_calculation']);
     expect(codes(scoreExistingIndicator({ ...clean, unit: 'number', indicatorText: 'Number of kits', calculation: null }).warnings)).toEqual([]);
+  });
+});
+
+// ------------------------------------------------------------------ fixes of the Phase 4 review (13 October 2026)
+
+describe('Phase 4 review fixes: thresholds, value kinds, names, standard codes, levels, accountability, MoV, caps', () => {
+  /** A library suggestion copied from the entry (name, unit, calculation), on `resultCode`, with `overrides`. */
+  const lib = (id: string, resultCode: string, overrides: Partial<KpiRawSuggestion> = {}): KpiRawSuggestion => {
+    const result = RESULTS.find(r => r.code === resultCode)!;
+    return { ...rawSuggestionFromLibrary(entry(id), result, 'Measures this result directly.'), ...overrides };
+  };
+
+  it('SPEC-1: only a recognised threshold of the linked entry is kept (FS-01 "35"/"7"/"42", AC-01 "2024"/"5", LV-01 "6" removed)', () => {
+    for (const [id, value] of [['FS-01', '35'], ['FS-01', '7'], ['FS-01', '42'], ['AC-01', '2024'], ['AC-01', '5'], ['LV-01', '6'],
+      ['WA-03', '0'], ['WA-02', '30'], ['HE-02', '4']] as const) {
+      const s = validate(lib(id, 'O1', { targetSuggestion: value, targetBasis: 'standard_threshold' }));
+      expect(s.targetBasis, `${id} ${value}`).toBe('method_only');
+      expect(s.targetSuggestion).toMatch(/^Proposed method: /);
+      expect(s.draft.targetValue).toBeNull();
+      expect(draftToCreateInput(s.draft).targetValue ?? null).toBeNull();
+      expect(codes(s.warnings)).toContain('standard_threshold_not_found');
+    }
+    const sphere = validate(lib('WA-01', 'O1', { targetSuggestion: '15', targetBasis: 'standard_threshold' }));
+    expect(sphere).toMatchObject({ targetSuggestion: '15', targetBasis: 'standard_threshold' });
+    expect(sphere.targetJustification).toMatch(/^Proposed standard threshold \(Sphere Water supply standard/);
+    // Every listed threshold is in its entry's own text and unit (knowledge/indicator-library.json).
+    for (const [id, thresholds] of Object.entries(STANDARD_THRESHOLDS)) {
+      const e = entry(id);
+      for (const t of thresholds) {
+        expect(e.unit).toBe(t.unit);
+        expect(standaloneValueOffsets([e.definition, e.notes ?? '', JSON.stringify(e.standardReference)].join(' '), t.value).length).toBeGreaterThan(0);
+        expect(recognisedThreshold(id, t.value, t.unit)).toEqual(t);
+      }
+    }
+    expect(recognisedThreshold('WA-01', 'at least 15 l/p/d')).not.toBeNull();
+    expect(recognisedThreshold('WA-01', '15 or 20')).toBeNull();
+  });
+
+  describe('SPEC-2: the kind of each document value comes from its own clause', () => {
+    const docContext = (text: string, extra: Partial<ProjectContext> = {}) => context({
+      documentFacts: extractDocumentFacts([{ id: 'd1', fileName: 'proposal.pdf', text }]),
+      documentTexts: [{ documentId: 'd1', fileName: 'proposal.pdf', text }],
+      ...extra,
+    });
+    const count = (overrides: Partial<KpiRawSuggestion>) => customRaw({ name: 'Number of young people trained', nameAr: 'عدد الشباب المدربين', ...overrides });
+
+    it('"currently plans to train 600": a plan, never a baseline', () => {
+      const ctx = docContext('The organisation currently plans to train 600 young women and men in Hebron.');
+      const baseline = validate(count({ baselineSuggestion: '600', baselineBasis: 'document' }), ctx);
+      expect(baseline).toMatchObject({ baselineSuggestion: '', baselineBasis: 'none' });
+      expect(codes(baseline.warnings)).toContain('baseline_not_found');
+      const target = validate(count({ targetSuggestion: '600', targetBasis: 'document' }), ctx);
+      expect(target).toMatchObject({ targetSuggestion: '600', targetBasis: 'document', sources: { target: 'proposal.pdf' } });
+    });
+
+    it('"As of the end of year two, 450 graduates will have found work": a target, never a baseline', () => {
+      const ctx = docContext('As of the end of year two, 450 graduates will have found work.');
+      expect(validate(count({ baselineSuggestion: '450', baselineBasis: 'document' }), ctx).baselineBasis).toBe('none');
+      expect(validate(count({ targetSuggestion: '450', targetBasis: 'document' }), ctx).targetBasis).toBe('document');
+    });
+
+    it('"75% …, up from 45% in the 2025 survey, will …": 45% is the baseline, never the target', () => {
+      const ctx = docContext('By the end of the project, 75% of households, up from 45% in the 2025 survey, will treat their drinking water.');
+      expect(ctx.documentFacts[0].kind).toBe('mixed');
+      const wrong = validate(raw({ targetSuggestion: '45%', targetBasis: 'document' }), ctx);
+      expect(wrong.targetBasis).toBe('method_only');
+      expect(codes(wrong.warnings)).toContain('target_not_found');
+      const right = validate(raw({ baselineSuggestion: '45%', baselineBasis: 'document', targetSuggestion: '75%', targetBasis: 'document' }), ctx);
+      expect(right).toMatchObject({ baselineSuggestion: '45%', baselineBasis: 'document', targetSuggestion: '75%', targetBasis: 'document' });
+    });
+
+    it('"from 30% at baseline to 60% by the end of 2027": the logframe pattern keeps 30% as baseline and 60% as target', () => {
+      const text = 'The target is to raise the share of households treating water from 30% at baseline to 60% by the end of 2027.';
+      const ctx = docContext(text);
+      const right = validate(raw({ baselineSuggestion: '30%', baselineBasis: 'document', targetSuggestion: '60%', targetBasis: 'document' }), ctx);
+      expect(right).toMatchObject({ baselineSuggestion: '30%', baselineBasis: 'document', targetSuggestion: '60%', targetBasis: 'document' });
+      expect(right.warnings).toEqual([]);
+      const swapped = validate(raw({ baselineSuggestion: '60%', baselineBasis: 'document', targetSuggestion: '30%', targetBasis: 'document' }), ctx);
+      expect(swapped).toMatchObject({ baselineBasis: 'none', targetBasis: 'method_only' });
+      expect(codes(swapped.warnings)).toEqual(expect.arrayContaining(['baseline_not_found', 'target_not_found']));
+
+      // Framework generation: the structure step's verified kinds are kept (the Phase 3 behaviour).
+      const figures = verifyDocumentFigures([
+        { resultCode: 'O1', kind: 'baseline', value: '30%', description: '', quote: text },
+        { resultCode: 'O1', kind: 'target', value: '60%', description: '', quote: text },
+      ], [{ fileName: 'proposal.pdf', text }]);
+      const facts = factsFromVerifiedFigures(figures);
+      const docs: DocumentText[] = [{ documentId: '', fileName: 'proposal.pdf', text }];
+      expect(documentValueSupported('30%', 'baseline', true, facts, docs)).not.toBeNull();
+      expect(documentValueSupported('60%', 'target', true, facts, docs)).not.toBeNull();
+      expect(documentValueSupported('60%', 'baseline', true, facts, docs)).toBeNull();
+      expect(documentValueSupported('30%', 'target', true, facts, docs)).toBeNull();
+    });
+
+    it('generation facts supply only their verified figures, and a clause stating the other kind wins over a wrong verified kind', () => {
+      const text = 'By the end of the project, 75% of households, up from 45% in the 2025 survey, will treat their drinking water.';
+      const docs: DocumentText[] = [{ documentId: '', fileName: 'proposal.pdf', text }];
+      const wrongKind = factsFromVerifiedFigures([{ resultCode: 'O1', kind: 'target', value: '45%', description: '', quote: text, source: 'proposal.pdf' }]);
+      expect(documentValueSupported('45%', 'target', true, wrongKind, docs)).toBeNull();
+      const onlyTarget = factsFromVerifiedFigures([{ resultCode: 'O1', kind: 'target', value: '75%', description: '', quote: text, source: 'proposal.pdf' }]);
+      expect(documentValueSupported('75%', 'target', true, onlyTarget, docs)).not.toBeNull();
+      // 45% is in the quote but was not a verified figure: it supplies nothing.
+      expect(documentValueSupported('45%', 'baseline', true, onlyTarget, docs)).toBeNull();
+    });
+
+    it('re-check (a): a time cue without a comma never makes a planned number a baseline', () => {
+      for (const text of [
+        'As of the end of year two 450 graduates will have found work.',
+        'Currently 600 young people are planned to be trained.',
+        'The organisation currently intends to train 600 young people.',
+      ]) {
+        const value = text.includes('450') ? '450' : '600';
+        const ctx = docContext(text);
+        const baseline = validate(count({ baselineSuggestion: value, baselineBasis: 'document' }), ctx);
+        expect(baseline.baselineBasis, text).toBe('none');
+        expect(codes(baseline.warnings), text).toContain('baseline_not_found');
+        expect(validate(count({ targetSuggestion: value, targetBasis: 'document' }), ctx).targetBasis, text).toBe('document');
+      }
+    });
+
+    it('re-check (b): a baseline inside a target sentence is a baseline and never a target', () => {
+      for (const text of [
+        'By 2027, 75% of households will have acceptable FCS compared with 45% in 2025.',
+        'By 2027, 75% of households will have acceptable FCS against 45% in 2025.',
+        'The project will raise acceptable FCS to 75% (45% in 2025).',
+        'Acceptable FCS stood at 45% in 2025 and is expected to reach 75% by 2027.',
+      ]) {
+        const ctx = docContext(text);
+        const wrong = validate(raw({ targetSuggestion: '45%', targetBasis: 'document' }), ctx);
+        expect(wrong.targetBasis, text).toBe('method_only');
+        expect(codes(wrong.warnings), text).toContain('target_not_found');
+        const right = validate(raw({ baselineSuggestion: '45%', baselineBasis: 'document', targetSuggestion: '75%', targetBasis: 'document' }), ctx);
+        expect(right, text).toMatchObject({ baselineSuggestion: '45%', baselineBasis: 'document', targetSuggestion: '75%', targetBasis: 'document' });
+      }
+      // The DB path keeps the endline target too.
+      const endline = validate(raw({ baselineSuggestion: '45%', baselineBasis: 'document', targetSuggestion: '70%', targetBasis: 'document' }),
+        docContext('45% at baseline, 70% at endline.'));
+      expect(endline).toMatchObject({ baselineBasis: 'document', targetSuggestion: '70%', targetBasis: 'document' });
+    });
+
+    it('re-check (c): framework generation keeps a verified baseline that a later cue of another value follows (Phase 3 parity)', () => {
+      for (const [text, baseline, target] of [
+        ['By 2027, 75% of households will have an acceptable FCS compared with 45% in 2025.', '45%', '75%'],
+        ['Acceptable FCS stood at 45% in 2025 and is expected to reach 75% by 2027.', '45%', '75%'],
+        ['Acceptable FCS was 45% in 2025 and is expected to reach 75% by 2027.', '45%', '75%'],
+        ['The project aims to reach 3,500 households, compared with 1,200 households reached in 2025.', '1,200', '3,500'],
+      ] as const) {
+        const figures: VerifiedFigure[] = [
+          { resultCode: 'O1', kind: 'baseline', value: baseline, description: '', quote: text, source: 'proposal.pdf' },
+          { resultCode: 'O1', kind: 'target', value: target, description: '', quote: text, source: 'proposal.pdf' },
+        ];
+        const facts = factsFromVerifiedFigures(figures);
+        const docs: DocumentText[] = [{ documentId: '', fileName: 'proposal.pdf', text: `Summary.\n${text}` }];
+        const percent = baseline.endsWith('%');
+        expect(documentValueSupported(baseline, 'baseline', percent, facts, docs), text).not.toBeNull();
+        expect(documentValueSupported(target, 'target', percent, facts, docs), text).not.toBeNull();
+        expect(matchingFigure(baseline, 'baseline', figures), text).not.toBeNull();
+      }
+      // A label right after the value still refuses a wrong verified kind ("45% at baseline" is never a target).
+      const text = '45% at baseline, 70% at endline.';
+      const wrong = factsFromVerifiedFigures([{ resultCode: 'O1', kind: 'target', value: '45%', description: '', quote: text, source: 'proposal.pdf' }]);
+      expect(documentValueSupported('45%', 'target', true, wrong, [{ documentId: '', fileName: 'proposal.pdf', text }])).toBeNull();
+    });
+  });
+
+  it('SPEC-3: a number in a model-written name that no library text supports costs target_in_name', () => {
+    for (const name of [
+      'Number of displaced households receiving food vouchers (target: 3,500)', '3,500 displaced households receiving food vouchers',
+      'Number of households with acceptable FCS (from 40 to 70)', 'At least 3,500 households receive food vouchers',
+      'Number of youth trained, 500 by end of project',
+    ]) {
+      const s = validate(customRaw({ name }));
+      expect(codes(s.warnings), name).toContain('target_in_name');
+      expect(s.qualityScore).toBeLessThanOrEqual(85);
+    }
+    const arabic = validate(customRaw({ nameAr: 'عدد عمليات نقل المياه بالصهاريج المنجزة (المطلوب ٣٥٠٠)' }));
+    expect(codes(arabic.warnings)).toContain('target_in_name');
+    // Definitional numbers pass: ages, units of measure, numbers of the library names and definitions, single digits.
+    for (const name of [
+      '% of pregnant women receiving at least 4 antenatal care visits', 'Number of children aged 6–59 months screened for acute malnutrition',
+      '% of households using at least 15 litres of water per person per day', '% of women aged 15–49 using a modern method',
+      'Number of households within 30 minutes of a water point', 'Number of water trucking deliveries completed',
+    ]) {
+      expect(codes(validate(customRaw({ name })).warnings), name).not.toContain('target_in_name');
+    }
+    expect(nameFiguresUnsupported('Number of youth trained, 500 by end of project', [])).toEqual(['500']);
+    expect(nameFiguresUnsupported('Average litres of water per person per day (Sphere minimum 15 litres)', [])).toEqual([]);
+  });
+
+  it('SPEC-3 (re-check): "over/above/between N" is a target unless it follows people or counts people; codes, amounts, ratios pass', () => {
+    for (const name of [
+      'Number of youth trained (over 500)', 'Number of displaced households receiving food vouchers (above 3,500)',
+      'Number of youth trained: over 500', 'Number of households receiving vouchers, between 3,000 and 3,500',
+    ]) {
+      const s = validate(customRaw({ name }));
+      expect(codes(s.warnings), name).toContain('target_in_name');
+      expect(s.qualityScore, name).toBeLessThanOrEqual(85);
+      expect(nameHasTargetIndependent(name), name).toBe(true);
+    }
+    for (const name of [
+      'Number of health facilities certified to ISO 9001', 'Number of schools meeting the 1:40 teacher-pupil ratio',
+      'Number of households receiving the USD 150 monthly transfer', 'Number of callers served by the 24/7 hotline',
+      'Number of shelters housing no more than 20 people', 'Number of children under 18 attending psychosocial sessions',
+      'Number of people over 60 receiving home visits', '% of women between 15 and 49 using a modern method',
+      'Number of people aged over 60 receiving home visits', 'Number of children aged under 5 screened',
+    ]) {
+      const s = validate(customRaw({ name }));
+      expect(codes(s.warnings), name).not.toContain('target_in_name');
+      expect(nameHasTargetIndependent(name), name).toBe(false);
+    }
+    expect(nameFiguresUnsupported('Number of youth trained (over 500)', [])).toEqual(['500']);
+    expect(nameFiguresUnsupported('Number of children under 18 reached', [])).toEqual([]);
+    expect(nameFiguresUnsupported('Number of people aged over 60 reached', [])).toEqual([]);
+  });
+
+  it('AI-5 side effect: rule 7 adds sex only when the counted noun is people', () => {
+    for (const name of ['Number of water points serving displaced communities', 'Number of family tents distributed',
+      'Number of IDP sites with functioning latrines', 'Number of mother-and-baby spaces established']) {
+      const s = validate(customRaw({ name, nameAr: 'عدد المرافق', disaggregation: ['location'] }));
+      expect(s.disaggregation, name).not.toContain('sex');
+      expect(codes(s.warnings), name).not.toContain('sex_added');
+      expect(peopleLevelIndependent(name), name).toBe(false);
+    }
+    const people = validate(customRaw({ name: 'Number of displaced families receiving hygiene kits', nameAr: 'عدد العائلات النازحة التي تلقت حقائب النظافة' }));
+    expect(people.disaggregation).toContain('sex');
+  });
+
+  it('SPEC-4: a custom suggestion never carries the model\'s standard code (no donor-standard badge)', () => {
+    const custom = validate(customRaw({ standardReferenceCode: 'EU GERF 2.99' }));
+    expect(custom).toMatchObject({ isCustom: true, standardReferenceCode: null });
+    expect(custom.draft.standardReferenceCode).toBeNull();
+    const unknownId = validate(customRaw({ libraryId: 'GERF-2.38', isCustom: false, customReason: '', standardReferenceCode: 'EU GERF 2.38' }));
+    expect(unknownId).toMatchObject({ libraryId: null, isCustom: true, standardReferenceCode: null });
+    expect(unknownId.draft.standardReferenceCode).toBeNull();
+    expect(codes(unknownId.warnings)).toEqual(expect.arrayContaining(['library_id_unknown', 'custom_reason_missing']));
+    // A linked entry's own reference is still used.
+    expect(validate(lib('WA-04', 'O1.1', { standardReferenceCode: 'GERF 9.99' })).standardReferenceCode).toBe('EU GERF 2.38');
+    // Re-check: a linked entry without a standard reference (FS-06, isStandard false) never takes the model's code.
+    expect(entry('FS-06').standardReference).toBeNull();
+    const fs06 = validate(lib('FS-06', 'O1', { standardReferenceCode: 'EU GERF 2.99' }));
+    expect(fs06).toMatchObject({ libraryId: 'FS-06', isCustom: false, standardReferenceCode: null });
+    expect(fs06.draft.standardReferenceCode).toBeNull();
+    expect(draftToCreateInput(fs06.draft).standardReferenceCode ?? null).toBeNull();
+  });
+
+  it('SPEC-6: a library entry of another level than its result is flagged and ranked below same-level suggestions', () => {
+    const outputOnOutcome = validate(lib('FS-04', 'O1'));
+    expect(find(outputOnOutcome.warnings, 'level_mismatch_library')).toMatchObject({
+      severity: 'warning', penalty: 0, params: { libraryId: 'FS-04', entryLevel: 'output', level: 'outcome', code: 'O1' },
+    });
+    expect(codes(validate(lib('FS-01', 'O1.1')).warnings)).toContain('level_mismatch_library');
+    expect(codes(validate(lib('FS-06', 'G')).warnings)).toContain('level_mismatch_library');
+    expect(codes(validate(lib('FS-01', 'O1')).warnings)).not.toContain('level_mismatch_library');
+    // Same confidence and score: the same-level entry wins the last place under the ECHO cap.
+    const ctx = echo({ existingIndicators: [indicator({ id: 'i1' }), indicator({ id: 'i2', name: 'Second existing indicator' })] });
+    const out = validateAndScore({ context: ctx, answer: { suggestions: [lib('FS-04', 'O1', { confidence: 'high' }), lib('FS-01', 'O1', { confidence: 'high' })], frameworkWarnings: [] }, deps: deps() });
+    expect(out.suggestions.filter(s => s.resultCode === 'O1').map(s => s.libraryId)).toEqual(['FS-01']);
+  });
+
+  it('SPEC-7: a routine feedback-form indicator does not stand in for accountability; AC-01 is still added', () => {
+    const feedbackForms = indicator({ id: 'i-ff', resultId: 'n-o1.1', level: 'output', libraryId: null,
+      name: 'Number of voucher distributions with post-distribution feedback forms completed' });
+    const out = validateAndScore({ context: humanitarian({ existingIndicators: [feedbackForms] }), answer: { suggestions: [raw()], frameworkWarnings: [] }, deps: deps() });
+    expect(out.suggestions.some(s => s.origin === 'appended_accountability' && s.libraryId === 'AC-01')).toBe(true);
+    expect(codes(out.frameworkWarnings)).toContain('accountability_added');
+    const classroom = indicator({ id: 'i-obs', libraryId: null, name: 'Number of classroom observations', nameAr: 'عدد الملاحظات الصفية' });
+    expect(isAccountabilityIndicator({ libraryId: classroom.libraryId, name: classroom.name, nameAr: classroom.nameAr })).toBe(false);
+  });
+
+  it('SPEC-9: standard names that start with a participle are not penalised on existing indicators', () => {
+    for (const indicatorText of ['Reduced Coping Strategies Index (rCSI) score of target households', 'Enhanced Vegetation Index (EVI) of rehabilitated rangeland',
+      'Improved drinking water sources: % of households using one']) {
+      const scored = scoreExistingIndicator({ indicatorText, indicatorTextAr: 'مؤشر', unit: 'score', calculation: null, meansOfVerification: 'Household survey (rCSI module)' });
+      expect(scored, indicatorText).toMatchObject({ qualityScore: 100, needsAlternatives: false });
+    }
+  });
+
+  it('SPEC-10: report and record nouns with qualifiers only are generic means of verification', () => {
+    for (const mov of ['Project progress reports', 'Quarterly project reports', 'Partner reports', 'Field reports', 'Monitoring data',
+      'Project M&E records', 'Distribution reports', "Partner's monthly reports"]) {
+      expect(isGenericMeansOfVerification(mov), mov).toBe(true);
+      const s = validate(customRaw({ meansOfVerification: mov }));
+      expect(codes(s.warnings)).toContain('generic_means_of_verification');
+      expect(s.meansOfVerification).toBe(TO_BE_CONFIRMED);
+    }
+    for (const mov of ['Distribution lists signed by recipients', 'Training attendance sheets and completion records', 'Household survey (KoboToolbox)',
+      'Signed delivery notes and the trucking log']) {
+      expect(isGenericMeansOfVerification(mov), mov).toBe(false);
+    }
+    expect(loadLibraryFile().entries.filter(e => isGenericMeansOfVerification(e.meansOfVerification)).map(e => e.id)).toEqual([]);
+  });
+
+  it('AI-1: a copy dropped by an earlier result\'s cap does not take the library id from a later result', () => {
+    const answer = {
+      suggestions: [
+        lib('WA-02', 'O1', { confidence: 'high' }), lib('WA-01', 'O1', { confidence: 'high' }), lib('AC-01', 'O1', { confidence: 'high' }),
+        lib('WA-05', 'O1', { confidence: 'low' }), lib('WA-05', 'O2', { confidence: 'high' }),
+      ],
+      frameworkWarnings: [],
+    };
+    const out = validateAndScore({ context: echo(), answer, deps: deps() });
+    expect(out.suggestions.filter(s => s.resultCode === 'O1').map(s => s.libraryId)).toEqual(['WA-02', 'WA-01', 'AC-01']);
+    expect(out.suggestions.filter(s => s.resultCode === 'O2').map(s => s.libraryId)).toEqual(['WA-05']);
+    expect(find(out.frameworkWarnings, 'result_cap')).toMatchObject({ params: { code: 'O1', cap: 3, dropped: 1 } });
+    expect(codes(out.frameworkWarnings)).not.toContain('duplicate_in_run');
+    // Both copies within their caps: the first in chain order keeps it (D12).
+    const both = validateAndScore({ context: context(), answer: { suggestions: [lib('WA-05', 'O2'), lib('WA-05', 'O1')], frameworkWarnings: [] }, deps: deps() });
+    expect(both.suggestions.map(s => [s.resultCode, s.libraryId])).toEqual([['O1', 'WA-05']]);
+    expect(find(both.frameworkWarnings, 'duplicate_in_run')).toMatchObject({ params: { code: 'O2' } });
+  });
+
+  it('AI-1 (re-check): the suggestion rule 19 replaces in a full outcome never takes its library id from a later result', () => {
+    const answer = {
+      suggestions: [
+        lib('WA-02', 'O1', { confidence: 'high' }), lib('WA-01', 'O1', { confidence: 'high' }), lib('WA-05', 'O1', { confidence: 'low' }),
+        lib('WA-05', 'O2', { confidence: 'high' }), lib('WA-03', 'O2', { confidence: 'high' }), lib('WA-04', 'O2', { confidence: 'high' }),
+        lib('WA-06', 'O2', { confidence: 'medium' }),
+      ],
+      frameworkWarnings: [],
+    };
+    const base = echo();
+    const ctx = { ...base, project: { ...base.project, humanitarian: true } };
+    const out = validateAndScore({ context: ctx, answer, deps: deps() });
+    const kept = out.suggestions.map(s => `${s.resultCode}:${s.libraryId}`);
+    expect(kept.filter(k => k.startsWith('O1:'))).toEqual(['O1:WA-02', 'O1:WA-01', 'O1:AC-01']);
+    // WA-05 stays measured: O2 keeps its own (high) copy instead of losing it to O1's replaced (low) copy.
+    expect(kept).toContain('O2:WA-05');
+    expect(codes(out.frameworkWarnings)).not.toContain('duplicate_in_run');
+    expect(find(out.frameworkWarnings, 'accountability_added')).toMatchObject({ params: { libraryId: 'AC-01', code: 'O1' } });
+    expect(out.frameworkWarnings.filter(w => w.code === 'result_cap').map(w => w.params)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'O1', cap: 3, dropped: 1 }),
+    ]));
+    // A non-humanitarian run is unchanged: O1 keeps its three, the low WA-05 copy wins by chain order (D12).
+    const plain = validateAndScore({ context: { ...ctx, project: { ...ctx.project, humanitarian: false } }, answer, deps: deps() });
+    expect(plain.suggestions.filter(s => s.resultCode === 'O1').map(s => s.libraryId)).toEqual(['WA-02', 'WA-01', 'WA-05']);
+  });
+
+  it('AI-5: families, adolescents, IDPs, returnees, mothers, infants and smallholders are people (sex added)', () => {
+    for (const name of ['Number of displaced families receiving hygiene kits', 'Number of adolescents attending hygiene sessions',
+      'Number of IDPs reached', 'Number of returnees supported', 'Number of mothers counselled', 'Number of infants vaccinated', '% of smallholders adopting drip irrigation']) {
+      expect(isPeopleLevelIndicator(name), name).toBe(true);
+    }
+    expect(isPeopleLevelIndicator('x', 'عدد العائلات النازحة التي تلقت حقائب النظافة')).toBe(true);
+    expect(isPeopleLevelIndicator('x', 'عدد المراهقين الذين حضروا جلسات النظافة')).toBe(true);
+    const families = validate(customRaw({ name: 'Number of displaced families receiving hygiene kits', nameAr: 'عدد العائلات النازحة التي تلقت حقائب النظافة' }));
+    expect(families.disaggregation).toContain('sex');
+    expect(codes(families.warnings)).toContain('sex_added');
   });
 });

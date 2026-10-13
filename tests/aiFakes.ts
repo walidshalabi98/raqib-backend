@@ -201,17 +201,21 @@ export function rawFromEntry(entry: KpiLibraryEntry, resultCode: string, overrid
 
 /**
  * The answer a well-behaved model gives to a KPI request, built from request.meta: per batch result its first
- * `perResult` candidates (at most the allowance), copied from the library, with the result's code.
+ * `perResult` candidates (at most the allowance) not used for an earlier result of the batch (the prompt: never the same
+ * candidate for two results), copied from the library, with the result's code.
  */
 export function kpiAnswerFromMeta(request: KpiModelRequest, perResult = 2): KpiModelAnswer {
   const byId = new Map(request.meta.candidates.map(c => [c.id, c]));
+  const used = new Set<string>();
   const suggestions = request.meta.batch.flatMap(result => {
     const max = Math.min(perResult, request.meta.allowances[result.id]?.max ?? perResult);
-    return (request.meta.candidateIdsByResult[result.id] ?? [])
+    const picked = (request.meta.candidateIdsByResult[result.id] ?? [])
+      .filter(id => !used.has(id))
       .map(id => byId.get(id))
       .filter((e): e is KpiLibraryEntry => e !== undefined)
-      .slice(0, max)
-      .map(entry => rawFromEntry(entry, result.code, { level: result.level }));
+      .slice(0, max);
+    for (const entry of picked) used.add(entry.id);
+    return picked.map(entry => rawFromEntry(entry, result.code, { level: result.level }));
   });
   return { suggestions, frameworkWarnings: [] };
 }

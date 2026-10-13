@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../middleware/errorHandler';
 import { redactPersonalData } from '../ai/redact';
-import { toSuggestionDto } from './runs';
+import { KPI_TRANSACTION_OPTIONS, lockProject, toSuggestionDto } from './runs';
 import type { KpiSuggestionDto } from './types';
 
 /** Longest reject note (characters, after trimming). */
@@ -37,22 +37,26 @@ export function parseRejectBody(body: unknown): { reason: SuggestionRejectReason
 }
 
 /**
- * Records the rejection (design 8.2): organisation-scoped load (404), then one conditional update from pending →
- * rejected with decidedAt, decidedBy, rejectReason and the redacted rejectNote; nothing changed (no longer pending) →
+ * Records the rejection (design 8.2): organisation-scoped load (404), then, under the project's KPI lock (lockProject), one
+ * conditional update from pending → rejected with decidedAt, decidedBy, rejectReason and the redacted rejectNote; nothing changed (no longer pending) →
  * 409 already_decided. The rejection then excludes the library id per REJECTION_SCOPE (preferences.ts, D9).
  */
 export async function rejectKpiSuggestion(input: { suggestionId: string; organizationId: string; userId: string; body: unknown }): Promise<{ suggestion: KpiSuggestionDto }> {
   const existing = await prisma.kpiSuggestion.findFirst({
     where: { id: input.suggestionId, project: { organizationId: input.organizationId } },
-    select: { id: true },
+    select: { id: true, projectId: true },
   });
   if (!existing) throw new AppError(404, 'Suggestion not found');
   const { reason, note } = parseRejectBody(input.body);
 
-  const { count } = await prisma.kpiSuggestion.updateMany({
-    where: { id: existing.id, status: 'pending' },
-    data: { status: 'rejected', decidedAt: new Date(), decidedBy: input.userId, rejectReason: reason, rejectNote: note },
-  });
+  // Under the project's KPI lock (CC-04, CC-05): a run saving its cards at the same time sees this rejection.
+  const count = await prisma.$transaction(async tx => {
+    await lockProject(tx, existing.projectId);
+    return (await tx.kpiSuggestion.updateMany({
+      where: { id: existing.id, status: 'pending' },
+      data: { status: 'rejected', decidedAt: new Date(), decidedBy: input.userId, rejectReason: reason, rejectNote: note },
+    })).count;
+  }, KPI_TRANSACTION_OPTIONS);
   if (count !== 1) throw new AppError(409, 'This suggestion was already accepted, rejected or expired.', 'already_decided');
   const row = await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: existing.id } });
   console.log(`[KpiReject] ${row.id} rejected (${reason})`);

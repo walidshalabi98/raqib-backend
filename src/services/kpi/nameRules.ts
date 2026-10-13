@@ -14,10 +14,29 @@ const DIGIT = '[0-9٠-٩۰-۹]';
 const NUMBER = `${DIGIT}(?:[0-9٠-٩۰-۹.,٫٬]*${DIGIT})?`;
 
 /**
- * Leading verbs of the Phase 3 hasDirectionalWording (EN): "Increase…", "Improved…", "Reduced…", "To achieve…".
- * A name starting with one states a change, not what is measured.
+ * Leading verbs of the Phase 3 hasDirectionalWording (EN): "Increase…", "Improved…", "Reduced…", "To achieve…"; also
+ * "Doubling…", "Halving…", "Tripling…" (a change by a factor). A name starting with one states a change, not what is measured.
  */
-const LEADING_VERB_EN = /^(?:to\s+)?(?:increas|decreas|reduc|improv|rais|achiev|reach|ensur|enhanc|strengthen|boost|expand|minimi[sz]|maximi[sz])\w*\b/i;
+const LEADING_VERB_EN = /^(?:to\s+)?(?:increas|decreas|reduc|improv|rais|achiev|reach|ensur|enhanc|strengthen|boost|expand|minimi[sz]|maximi[sz]|doubl|halv|tripl)\w*\b/i;
+
+/**
+ * Standard indicator names that start with a participle (not a change): WFP's "Reduced Coping Strategies Index (rCSI)",
+ * the "Enhanced Vegetation Index (EVI)" and JMP's "improved (drinking) water source(s)" / "improved sanitation". They are
+ * exempt from LEADING_VERB_EN only (a number with "%" in them is still flagged).
+ */
+const STANDARD_TERM_START = /^(?:reduced\s+coping\s+strateg(?:y|ies)\s+index|enhanced\s+vegetation\s+index|improved\s+(?:drinking[\s-]+)?water\s+sources?|improved\s+sanitation)\b/i;
+
+/** Leading comparatives state a direction: "Higher % of households …", "More households with …", "Fewer …". */
+const LEADING_COMPARATIVE_EN = /^(?:higher|more|fewer|greater|better|bigger|larger)\b/i;
+
+/** "target: 3,500", "(target 500)", "target of 3,500", "target = 80%": a target value in the name ("target households" is not). */
+const TARGET_VALUE_EN = /(?<![\p{L}])targets?\s*(?:[:=]|of\s+(?:at\s+least\s+)?[0-9٠-٩]|[0-9٠-٩])/iu;
+
+/** A name that starts with a count ("3,500 displaced households …", "At least 3,500 households …"): a target, not an indicator. */
+const LEADING_NUMBER_EN = /^(?:(?:at\s+least|no\s+(?:fewer|less)\s+than|more\s+than|over|up\s+to|a\s+minimum\s+of|minimum\s+of|≥|>)\s*)?[0-9٠-٩۰-۹]/i;
+
+/** "500 by (the) end (of …)", "1,200 by 2027": a number with its target date. */
+const NUMBER_BY_DATE_EN = new RegExp(`${NUMBER}%?\\s+by\\s+(?:the\\s+)?(?:end\\b|(?:19|20)\\d\\d\\b)`, 'iu');
 
 /** "increase(d) to/by", "reduce(d) to/by", … anywhere (spec "increase to", generalised; D13). */
 const CHANGE_TO_OR_BY = /\b(?:increase|reduce|decrease|raise|improve)d?\s+(?:to|by)\b/i;
@@ -41,11 +60,17 @@ function normaliseArabic(text: string): string {
     .replace(/ى/g, 'ي');
 }
 
-/** Leading Arabic verbal nouns of the Phase 3 hasDirectionalWording ("زيادة…", "تحسين…"), after normaliseArabic. */
-const LEADING_VERB_AR = /^(?:زيادة|تقليل|خفض|تحسين|رفع|تعزيز|الوصول\s+الي|ضمان|تقليص)/;
+/** Leading Arabic verbal nouns of the Phase 3 hasDirectionalWording ("زيادة…", "تحسين…"; also "مضاعفة…"), after normaliseArabic. */
+const LEADING_VERB_AR = /^(?:زيادة|تقليل|خفض|تحسين|رفع|تعزيز|الوصول\s+الي|ضمان|تقليص|مضاعفة)/;
 
 /** Arabic "بنسبة N%" / "إلى N%" (also with بالمئة, بالمائة, في المئة, في المائة), after normaliseArabic. */
 const ARABIC_RATE_TARGET = new RegExp(`(?<!\\p{L})و?(?:بنسبة|الي)\\s*${NUMBER}\\s*(?:[%٪]|بالمئة|بالمائة|في\\s+المئة|في\\s+المائة)`, 'u');
+
+/** Arabic "المستهدف: 3500", "(المستهدف 500)", "القيمة المستهدفة: 80%", after normaliseArabic ("الأسر المستهدفة" is not). */
+const ARABIC_TARGET_VALUE = new RegExp(`(?<!\\p{L})(?:ال)?مستهدف[ةه]?\\s*(?:[:=]\\s*)?${NUMBER}`, 'u');
+
+/** An Arabic name that starts with a count ("3500 أسرة نازحة …", "ما لا يقل عن 3500 أسرة …"), after normaliseArabic. */
+const ARABIC_LEADING_NUMBER = new RegExp(`^(?:(?:ما\\s+لا\\s+يقل\\s+عن|علي\\s+الاقل|اكثر\\s+من)\\s*)?${NUMBER}`, 'u');
 
 function hasReachWord(name: string): boolean {
   for (const match of name.matchAll(REACH_WORD)) {
@@ -58,7 +83,12 @@ function hasReachWord(name: string): boolean {
 function englishHasTargetOrDirection(raw: string): boolean {
   const name = raw.replace(DASHES, '-').replace(/\s+/g, ' ').trim();
   if (!name) return false;
-  return LEADING_VERB_EN.test(name)
+  const standardTerm = STANDARD_TERM_START.test(name);
+  return (!standardTerm && LEADING_VERB_EN.test(name))
+    || (!standardTerm && LEADING_COMPARATIVE_EN.test(name))
+    || TARGET_VALUE_EN.test(name)
+    || LEADING_NUMBER_EN.test(name)
+    || NUMBER_BY_DATE_EN.test(name)
     || CHANGE_TO_OR_BY.test(name)
     || NUMBER_PERCENT.test(name)
     || BY_NUMBER_PERCENT_WORDS.test(name)
@@ -68,19 +98,26 @@ function englishHasTargetOrDirection(raw: string): boolean {
 function arabicHasTargetOrDirection(raw: string): boolean {
   const name = normaliseArabic(raw).replace(/\s+/g, ' ').trim();
   if (!name) return false;
-  return LEADING_VERB_AR.test(name) || ARABIC_RATE_TARGET.test(name) || NUMBER_PERCENT.test(name);
+  return LEADING_VERB_AR.test(name) || ARABIC_RATE_TARGET.test(name) || NUMBER_PERCENT.test(name)
+    || ARABIC_TARGET_VALUE.test(name) || ARABIC_LEADING_NUMBER.test(name);
 }
 
 /**
  * Rule 3 (spec §A4 step 3 "name contains a target or direction"; me-foundations §2: the indicator never contains the
  * target): true when the English or the Arabic name holds
- * - a leading verb of change (EN "Increase…", "Improved…", "Reduced…", "To achieve…"; AR زيادة، تقليل، خفض، تحسين، رفع،
- *   تعزيز، الوصول إلى، ضمان، تقليص);
+ * - a leading verb of change (EN "Increase…", "Improved…", "Reduced…", "To achieve…", "Doubling…"; AR زيادة، تقليل، خفض،
+ *   تحسين، رفع، تعزيز، الوصول إلى، ضمان، تقليص، مضاعفة) or a leading comparative ("Higher % of …", "More households …", "Fewer …"), except
+ *   standard names that start with a participle ("Reduced Coping Strategies Index", "Enhanced Vegetation Index",
+ *   JMP "improved (drinking) water source", "improved sanitation");
+ * - a target value: "target: 3,500", "(target 500)", "target of 80%", Arabic "المستهدف: 3500";
+ * - a leading count: "3,500 displaced households …", "At least 3,500 households …", Arabic "3500 أسرة …";
+ * - a number with its target date: "500 by end of project", "1,200 by 2027";
  * - "(increase|reduce|decrease|raise|improve)d? to/by" anywhere;
  * - digits followed by "%" or "٪" anywhere (Latin or Arabic-Indic digits), "by N percent", Arabic "بنسبة N%" / "إلى N%";
  * - "reach" as a whole word (not "reached", "reaching", "hard-to-reach" or "hard to reach").
  * Definitional thresholds are not targets and are not flagged (D13): "at least 4 antenatal care visits", "at least 15
- * litres", "aged 6–59 months", "under 5", "up to 5 years", "from 15 to 49".
+ * litres", "aged 6–59 months", "under 5", "up to 5 years", "from 15 to 49". A number in a model-written name that no
+ * library text supports is flagged by validate.ts (nameFiguresUnsupported), not here.
  */
 export function nameHasTargetOrDirection(name: string, nameAr?: string | null): boolean {
   const texts = [name, nameAr ?? ''].filter(t => t.trim() !== '');

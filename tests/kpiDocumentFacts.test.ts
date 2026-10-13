@@ -75,7 +75,7 @@ describe('factKind and cue words', () => {
     // A verified target that is not in the sentence, a bare small number or a year is no pointer.
     expect(factKind('Distribution of 4,000 hygiene kits in Khan Younis.', ['75%'])).toBeNull();
     expect(factKind('The governorate has 12 municipalities and 3 hospitals.', ['3'])).toBeNull();
-    expect(factKind('The plan for 2027 has 12 municipalities.', ['2027'])).toBeNull();
+    expect(factKind('The map for 2027 shows 12 municipalities.', ['2027'])).toBeNull();
   });
 
   it('Arabic cues are tokens with proclitics and spelling variants', () => {
@@ -113,6 +113,95 @@ describe('factKind and cue words', () => {
     expect(fact.kind).toBe('mixed');
     expect(kindOfValue(fact, '45%')).toBe('baseline');
     expect(kindOfValue(fact, '75%')).toBe('target');
+  });
+});
+
+describe('the kind of each value comes from its own clause (SPEC-2)', () => {
+  const only = (text: string) => {
+    const facts = extractDocumentFacts([doc(text)]);
+    expect(facts).toHaveLength(1);
+    return facts[0];
+  };
+
+  it('"currently plans to train 600" is a plan: a target fact, 600 a target', () => {
+    const fact = only('The organisation currently plans to train 600 young women and men in Hebron.');
+    expect(fact.kind).toBe('target');
+    expect(kindOfValue(fact, '600')).toBe('target');
+    expect(FACT_CUES.target).toEqual(expect.arrayContaining(['plan', 'plans', 'planned']));
+    // "currently" alone still marks a baseline.
+    expect(kindOfValue(only('The project currently serves 1,200 households in the camp.'), '1,200')).toBe('baseline');
+  });
+
+  it('"As of the end of year two, 450 graduates will have found work": 450 is a target', () => {
+    const fact = only('As of the end of year two, 450 graduates will have found work.');
+    expect(kindOfValue(fact, '450')).toBe('target');
+  });
+
+  it('"75% …, up from 45% in the 2025 survey, will …": mixed, 75% target and 45% baseline', () => {
+    const fact = only('By the end of the project, 75% of households, up from 45% in the 2025 survey, will treat their drinking water.');
+    expect(fact.kind).toBe('mixed');
+    expect(kindOfValue(fact, '75%')).toBe('target');
+    expect(kindOfValue(fact, '45%')).toBe('baseline');
+  });
+
+  it('"from 30% at baseline to 60% by the end of 2027": 30% baseline, 60% target (EN and AR); ranges and years are no change', () => {
+    const fact = only('The target is to raise the share of households treating water from 30% at baseline to 60% by the end of 2027.');
+    expect(fact.kind).toBe('mixed');
+    expect(kindOfValue(fact, '30%')).toBe('baseline');
+    expect(kindOfValue(fact, '60%')).toBe('target');
+    const arabic = only('سيتم رفع نسبة الأسر التي تعالج المياه من ٣٠٪ إلى ٦٠٪ بحلول نهاية عام ٢٠٢٧.');
+    expect(kindOfValue(arabic, '30%')).toBe('baseline');
+    expect(kindOfValue(arabic, '60%')).toBe('target');
+    // An age range and a period are not baseline-to-target statements: the numbers keep the sentence's cue.
+    const range = only('The project will screen 500 children aged from 6 to 59 months in the camps.');
+    expect(kindOfValue(range, '59')).toBe('target');
+    expect(kindOfValue(only('The project will run from 2026 to 2028 in 12 villages of Hebron.'), '2026')).toBe('target');
+  });
+
+  it('a cue after the value labels it when its clause has none before it ("45% … currently treat water")', () => {
+    const fact = only('45% of households currently treat water and the project will raise this to 75%.');
+    expect(kindOfValue(fact, '45%')).toBe('baseline');
+    expect(kindOfValue(fact, '75%')).toBe('target');
+  });
+
+  it('a time cue before a value yields to the value\'s own plan verb, with or without a comma (re-check SPEC-2 a)', () => {
+    expect(kindOfValue(only('As of the end of year two 450 graduates will have found work.'), '450')).toBe('target');
+    expect(kindOfValue(only('Currently 600 young people are planned to be trained.'), '600')).toBe('target');
+    expect(kindOfValue(only('The organisation currently intends to train 600 young people.'), '600')).toBe('target');
+    expect(FACT_CUES.target).toEqual(expect.arrayContaining(['intend to', 'intends to', 'intended to']));
+    // The plan verb of another clause or another number does not take the value: these stay baselines.
+    expect(kindOfValue(only('Currently 45% of households have an acceptable FCS and the project will raise this to 70% by 2027.'), '45%')).toBe('baseline');
+    expect(kindOfValue(only('Currently 600 young people are trained each year and 900 will be trained by 2027.'), '600')).toBe('baseline');
+    expect(kindOfValue(only('Currently 45% of households treat water which will rise to 70% by 2027.'), '45%')).toBe('baseline');
+  });
+
+  it('a reference value inside a target sentence is a baseline, never a target (re-check SPEC-2 b)', () => {
+    for (const text of [
+      'By 2027, 75% of households will have acceptable FCS compared with 45% in 2025.',
+      'By 2027, 75% of households will have acceptable FCS against 45% in 2025.',
+      'The project will raise acceptable FCS to 75% (45% in 2025).',
+      'By 2027, 75% of households will have acceptable FCS, compared with 45% at baseline.',
+      'Acceptable FCS stood at 45% in 2025 and is expected to reach 75% by 2027.',
+      'Acceptable FCS was 45% in 2025 and is expected to reach 75% by 2027.',
+      'The project expects acceptable FCS to reach 75% by 2027 from 45% in 2025.',
+    ]) {
+      const fact = only(text);
+      expect(kindOfValue(fact, '45%'), text).toBe('baseline');
+      expect(kindOfValue(fact, '75%'), text).toBe('target');
+    }
+    // A comparison point that is not dated as the starting value is neither a baseline nor a target.
+    const national = only('The project will raise acceptable FCS to 75% by 2027, compared with 60% nationally.');
+    expect(kindOfValue(national, '60%')).toBeNull();
+    expect(kindOfValue(national, '75%')).toBe('target');
+    // A value dated in the planned year stays a target.
+    expect(kindOfValue(only('The project will reach 75% of households in 2027 and keep 3,500 enrolled by 2027.'), '75%')).toBe('target');
+  });
+
+  it('"stood at" labels a baseline and "at endline" a target', () => {
+    const fact = only('45% at baseline, 70% at endline.');
+    expect(fact.kind).toBe('mixed');
+    expect(kindOfValue(fact, '45%')).toBe('baseline');
+    expect(kindOfValue(fact, '70%')).toBe('target');
   });
 });
 
@@ -185,9 +274,32 @@ describe('extractDocumentFacts', () => {
       expect(f.excerpt.length).toBeLessThanOrEqual(MAX_EXCERPT_CHARS);
       expect(f.excerpt).not.toMatch(/\d$/);
     }
-    // The long sentence's number sits after the cut: the cut excerpt has no number left, so it is dropped.
+    // The long sentence's number sits after character 300: a window around it keeps "45 %" whole (AI-3).
     expect(facts.some(f => f.excerpt.startsWith('The baseline survey found that'))).toBe(false);
+    expect(facts.some(f => f.excerpt.includes('45 % of households treat water at home'))).toBe(true);
     expect(facts.map(f => f.excerpt)).toContain('Currently 30% of girls attend secondary school in the area.');
+  });
+
+  it('AI-3 (DB path): a target after character 300 of a long sentence still becomes a fact the validator can use', () => {
+    const lead = 'Under the second specific objective, and in close coordination with the WASH cluster, the municipality and the water authority, '
+      + 'and after the rehabilitation of the network in the informal displacement sites of the governorate, and once the community water '
+      + 'committees have agreed the distribution schedule with the site managers, ';
+    const sentence = `${lead}the action will ensure that by the end of 2027, 75% of displaced households have access to safe water.`;
+    expect(sentence.indexOf('75%')).toBeGreaterThan(MAX_EXCERPT_CHARS);
+    const text = `Introduction.\n${sentence}`;
+    const facts = extractDocumentFacts([doc(text)]);
+    const fact = facts.find(f => f.excerpt.includes('75%'));
+    expect(fact).toBeDefined();
+    expect(fact!.excerpt.length).toBeLessThanOrEqual(MAX_EXCERPT_CHARS);
+    expect(text.includes(fact!.excerpt)).toBe(true);
+    expect(fact!.kind).toBe('target');
+    expect(kindOfValue(fact!, '75%')).toBe('target');
+    // Two numbers far apart in one long sentence give one window each.
+    const two = `In 2025 the assessment found that 1,200 households had access, ${'and the partners agreed the schedule with the site managers '.repeat(5)}while the action will reach 3,500 households.`;
+    const windows = extractDocumentFacts([doc(two)]).map(f => f.excerpt);
+    expect(windows.some(e => e.includes('1,200'))).toBe(true);
+    expect(windows.some(e => e.includes('3,500'))).toBe(true);
+    for (const e of windows) expect(two.includes(e)).toBe(true);
   });
 
   it('ranks by cue words, the verified-target boost and "%", then document order; caps 15 per document and 40 in all', () => {
@@ -233,18 +345,28 @@ describe('factsFromVerifiedFigures (framework generation path)', () => {
     quote: 'The action will rehabilitate 18 community water points.', ...over,
   });
 
-  it('one fact per figure: excerpt = quote, fileName = source, documentId empty, kind kept', () => {
+  it('one fact per quote with its verified figures: excerpt = quote, fileName = source, documentId empty, kind of the figures', () => {
     expect(factsFromVerifiedFigures([figure({}), figure({ kind: 'baseline', value: '45%', quote: '45% of households treat water at home.' })])).toEqual([
-      { documentId: '', fileName: 'proposal.pdf', excerpt: 'The action will rehabilitate 18 community water points.', kind: 'target' },
-      { documentId: '', fileName: 'proposal.pdf', excerpt: '45% of households treat water at home.', kind: 'baseline' },
+      { documentId: '', fileName: 'proposal.pdf', excerpt: 'The action will rehabilitate 18 community water points.', kind: 'target',
+        figures: [{ value: '18', kind: 'target', resultCode: 'O1' }] },
+      { documentId: '', fileName: 'proposal.pdf', excerpt: '45% of households treat water at home.', kind: 'baseline',
+        figures: [{ value: '45%', kind: 'baseline', resultCode: 'O1' }] },
     ]);
   });
 
-  it('a quote whose cue words point the other way (or both ways) becomes mixed, so a baseline in it never becomes a target', () => {
-    const [fact] = factsFromVerifiedFigures([figure({ value: '75%', quote: 'The baseline survey found 45% of households treat water; the target is 75%.' })]);
-    expect(fact.kind).toBe('mixed');
-    expect(kindOfValue(fact, '45%')).toBe('baseline');
-    expect(kindOfValue(fact, '75%')).toBe('target');
-    expect(factsFromVerifiedFigures([figure({ quote: 'Currently 18 water points need repair.' })])[0].kind).toBe('mixed');
+  it('collapses figures of one quote into one fact (AI-3): a baseline and a target make it mixed', () => {
+    const quote = 'The target is to raise the share of households treating water from 30% at baseline to 60% by the end of 2027.';
+    const facts = factsFromVerifiedFigures([figure({ kind: 'baseline', value: '30%', quote }), figure({ kind: 'target', value: '60%', quote }),
+      figure({ kind: 'target', value: '60%', quote })]);
+    expect(facts).toEqual([{ documentId: '', fileName: 'proposal.pdf', excerpt: quote, kind: 'mixed', figures: [
+      { value: '30%', kind: 'baseline', resultCode: 'O1' }, { value: '60%', kind: 'target', resultCode: 'O1' },
+    ] }]);
+  });
+
+  it('leaves out a quote holding a redaction placeholder, as the request path does (PD-1)', () => {
+    const quote = redactPersonalData('Contact coordinator on 0599123456 to confirm the 1,200 households.').text; // fictitious number
+    expect(quote).toContain(REDACTION_PLACEHOLDERS.phone);
+    expect(factsFromVerifiedFigures([figure({ value: '1,200', quote })])).toEqual([]);
+    expect(factsFromVerifiedFigures([figure({ value: '1,200', quote }), figure({})])).toHaveLength(1);
   });
 });

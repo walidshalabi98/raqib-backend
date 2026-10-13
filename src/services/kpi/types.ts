@@ -55,11 +55,16 @@ export interface ContextIndicator {
 export interface ContextPendingSuggestion { id: string; resultId: string | null; libraryId: string | null; name: string }
 
 /**
- * A sentence of an uploaded document (redacted, own text only; fileName redacted). kind from cue words (factKind):
- * 'baseline' or 'target' = only that kind's cues; 'mixed' = both (each number takes the kind of the nearest cue before
- * it); null = no cue: context for the model, never evidence for a baseline or a target.
+ * A sentence of an uploaded document (redacted, own text only; fileName redacted). kind from cue words and explicit
+ * patterns (factKind): 'baseline' or 'target' = only that kind; 'mixed' = both; each number then takes its own kind
+ * (valueKindAt: "from X to Y", "up from X", the nearest cue in its clause); null = no cue: context for the model, never
+ * evidence for a baseline or a target. `figures` (framework generation only): the structure step's verified figures in
+ * this quote, the only values the fact can supply (design 1.3, 6.4).
  */
-export interface DocumentFact { documentId: string; fileName: string; excerpt: string; kind: 'baseline' | 'target' | 'mixed' | null }
+export interface DocumentFact {
+  documentId: string; fileName: string; excerpt: string; kind: 'baseline' | 'target' | 'mixed' | null;
+  figures?: Array<{ value: string; kind: 'baseline' | 'target'; resultCode: string | null }>;
+}
 
 /** A document's full own text (documentTextForAi: AI analysis cut, redacted) for rules 8–9. Never sent to the model. */
 export interface DocumentText { documentId: string; fileName: string; text: string }
@@ -124,10 +129,10 @@ export const KPI_WARNING_CODES = [
   'library_id_unknown', 'custom_reason_missing', 'target_in_name', 'double_barrelled', 'percent_without_calculation',
   'sex_keys_from_library', 'sex_added', 'baseline_not_found', 'target_not_found', 'standard_threshold_not_found',
   'target_method_default', 'output_survey_method', 'impact_not_secondary', 'arabic_name_missing',
-  'generic_means_of_verification', 'figures_unverified', 'level_adjusted', 'arabic_name_from_library',
+  'generic_means_of_verification', 'figures_unverified', 'level_adjusted', 'arabic_name_from_library', 'level_mismatch_library',
   // framework (run) level
   'model_note', 'unknown_result', 'rejected_library_dropped', 'duplicate_in_run', 'near_duplicate', 'result_cap',
-  'accountability_added', 'accountability_missing', 'result_failed', 'keyword_fallback',
+  'accountability_added', 'accountability_missing', 'result_failed', 'result_empty', 'keyword_fallback',
   // accept response (not stored on a suggestion)
   'donor_cap_exceeded',
 ] as const;
@@ -228,7 +233,7 @@ export type KpiRunStep = 'context' | 'retrieval' | 'model' | 'validation' | 'sav
 export type KpiErrorCode = 'ai_not_configured' | 'ai_refused' | 'ai_unavailable' | 'ai_invalid_output' | 'interrupted' | 'stale' | 'internal';
 /** Request-level error codes (AppError.code) of the KPI routes. */
 export type KpiRequestErrorCode = 'ai_not_configured' | 'run_in_progress' | 'no_framework' | 'not_suggestable' | 'already_decided' | 'stale'
-  | 'nothing_to_suggest' | 'too_many_results' | 'budget_reached' | 'project_archived' | 'duplicate';
+  | 'nothing_to_suggest' | 'too_many_results' | 'budget_reached' | 'project_archived' | 'duplicate' | 'source_has_data' | 'not_editable';
 
 export interface KpiCallInfo {
   feature: string; tier: ModelTier; model: string | null; promptVersion: string; resultCodes: string[];
@@ -329,6 +334,8 @@ export interface KpiRunDto {
   model: string | null;
   promptVersion: string | null;
   createdAt: string; updatedAt: string; finishedAt: string | null;
+  /** The server's clock when this DTO was built (ISO): the run's age is serverNow − createdAt (TQ-07). */
+  serverNow: string;
 }
 
 export interface KpiSuggestionDto {
@@ -345,5 +352,8 @@ export interface KpiSuggestionDto {
   draft: IndicatorDraft;
 }
 
-/** POST /api/kpi-suggestions/:id/accept response body (warnings: donor_cap_exceeded only, today). */
-export interface AcceptKpiSuggestionDto { indicator: unknown; suggestion: KpiSuggestionDto; warnings: KpiWarning[] }
+/**
+ * POST /api/kpi-suggestions/:id/accept response body (warnings: donor_cap_exceeded only, today). replacedIndicatorId:
+ * the indicator removed by `replaceSource: true` (SPEC-8), else null.
+ */
+export interface AcceptKpiSuggestionDto { indicator: unknown; suggestion: KpiSuggestionDto; warnings: KpiWarning[]; replacedIndicatorId: string | null }

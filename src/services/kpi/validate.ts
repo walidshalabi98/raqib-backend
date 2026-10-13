@@ -18,7 +18,7 @@ import { donorGuidance } from '../ai/prompts/donors';
 import { INDICATOR_UNITS } from '../ai/prompts/framework';
 import { redactPersonalData } from '../ai/redact';
 import { isAccountabilityIndicator, ACCOUNTABILITY_APPEND_ORDER } from './accountability';
-import { factCuePositions, type FactCue } from './documentFacts';
+import { hasKindEvidence, statedValueKindAt, valueKindAt } from './documentFacts';
 import { indicatorDraftFromPayload } from './draft';
 import { isDoubleBarrelled, nameHasTargetOrDirection, normalisedIndicatorName } from './nameRules';
 import { allowanceFor, exclusionsFor, scopedResults } from './scope';
@@ -64,6 +64,7 @@ const WARNING_TEXTS: Readonly<Record<KpiWarningCode, string>> = {
   generic_means_of_verification: 'The means of verification is too general; to be confirmed by the M&E officer.',
   figures_unverified: 'Text with numbers not found in the documents or the library was removed: {{figures}}.',
   level_adjusted: 'Level changed to {{level}} to match result {{code}}.',
+  level_mismatch_library: 'Library indicator {{libraryId}} is an {{entryLevel}} indicator; {{code}} is an {{level}}. Check that it measures this level.',
   arabic_name_from_library: 'The Arabic name was taken from the library entry.',
   model_note: 'AI note: {{message}}',
   unknown_result: 'A suggestion for an unknown result ({{code}}) was dropped.',
@@ -74,6 +75,7 @@ const WARNING_TEXTS: Readonly<Record<KpiWarningCode, string>> = {
   accountability_added: 'Humanitarian project without an accountability indicator: {{libraryId}} was added to {{code}}.',
   accountability_missing: 'Humanitarian project without an accountability indicator.',
   result_failed: 'No suggestions for {{code}}: the AI answer could not be used or came too late. Try this result again.',
+  result_empty: 'No suggestions were kept for {{code}}. Ask for suggestions for this result again or add an indicator yourself.',
   keyword_fallback: 'Semantic search is not available, so candidates were matched by keywords.',
   donor_cap_exceeded: '{{code}} now has {{count}} indicators; the donor allows {{cap}}.',
 };
@@ -147,21 +149,37 @@ function normaliseArabic(text: string): string {
 // ------------------------------------------------------------------ rules 8–9 (D14): document values
 
 /**
- * Cue positions in a normalised excerpt and the kind of the value at `start` (rules 8–9, D14; design M1): fact.kind
- * 'baseline'/'target' → that kind; 'mixed' → the kind of the nearest cue that ends before `start` (none → null); null →
- * null. Cue positions come from factCuePositions (documentFacts.ts), the same matcher factKind uses, so the fact kind
- * and the per-value kind always agree ("target households" is not a target cue). `start` is an offset in
- * normaliseForMatch(excerpt), as returned by standaloneValueOffsets.
+ * The kind of the value at [start, end) of a fact (rules 8–9, D14; design M1): null for a fact of kind null; otherwise
+ * valueKindAt (documentFacts.ts: "from X to Y" and "up from X" first, then the nearest cue in the value's clause, then in
+ * the sentence; "currently plans to" is a plan), so a baseline in a target sentence ("75%, up from 45%") is a baseline
+ * and a target in a baseline sentence a target. A fact without any cue or pattern (kinded by a verified-target pointer
+ * only) gives its own kind. `start`/`end` are offsets in normaliseForMatch(excerpt), as standaloneValueOffsets returns.
  */
-export function valueKindInFact(fact: DocumentFact, start: number): 'baseline' | 'target' | null {
-  if (fact.kind === 'baseline' || fact.kind === 'target') return fact.kind;
-  if (fact.kind !== 'mixed') return null;
-  let nearest: FactCue | null = null;
-  for (const cue of factCuePositions(fact.excerpt)) {
-    if (cue.end > start) continue;
-    if (!nearest || cue.end > nearest.end) nearest = cue;
+export function valueKindInFact(fact: DocumentFact, start: number, end: number = start): 'baseline' | 'target' | null {
+  if (fact.kind === null) return null;
+  if (!hasKindEvidence(fact.excerpt)) return fact.kind === 'mixed' ? null : fact.kind;
+  return valueKindAt(fact.excerpt, start, end);
+}
+
+/** Same number as written (normalised: digits, separators, case, spacing). */
+const sameValue = (a: string, b: string) => normaliseForMatch(a).trim() === normaliseForMatch(b).trim();
+
+/**
+ * True when the value at one of `occurrences` has the claimed kind in this fact (rules 8–9, D14): DB facts by
+ * valueKindInFact; generation facts (with `figures`) only for a verified figure of that value and kind, unless the
+ * excerpt itself states another kind for that value (statedValueKindAt: an explicit pattern, a label before it in its
+ * clause or right after it). A cue further after the value ("stood at 45% in 2025 and is expected to reach 75%") belongs
+ * to another value and never overrides the verified kind (Phase 3 parity, SPEC-2).
+ */
+function kindMatches(fact: DocumentFact, value: string, kind: 'baseline' | 'target', occurrences: ReadonlyArray<{ start: number; end: number }>): boolean {
+  if (fact.figures) {
+    if (!fact.figures.some(f => f.kind === kind && sameValue(f.value, value))) return false;
+    return occurrences.some(o => {
+      const stated = statedValueKindAt(fact.excerpt, o.start, o.end);
+      return stated === null || stated === kind;
+    });
   }
-  return nearest?.kind ?? null;
+  return occurrences.some(o => valueKindInFact(fact, o.start, o.end) === kind);
 }
 
 /** The documents an excerpt is checked in: its own document when known, else every document. */
@@ -172,20 +190,19 @@ function documentsForFact(fact: DocumentFact, documentTexts: readonly DocumentTe
 
 /**
  * The fact that supports `value` as `kind` (rules 8–9, D14; me-foundations §6: copy values found in uploaded documents,
- * citing the document): standalone + unit-consistent (excerptSupportsValue with unitIsPercent), valueKindInFact === kind
- * at that occurrence, and verifyDocumentFigures([{ value, quote: excerpt, kind }], documentTexts) non-empty (the excerpt
- * sits in the full text and the value stands alone there, so a cut excerpt never supplies a cut number). Null otherwise;
- * facts of kind null never count, and a target sentence never supplies a baseline.
+ * citing the document): standalone + unit-consistent (excerptSupportsValue with unitIsPercent), the value's own kind at
+ * that occurrence is `kind` (kindMatches), and verifyDocumentFigures([{ value, quote: excerpt, kind }], documentTexts)
+ * non-empty (the excerpt sits in the full text and the value stands alone there, so a cut excerpt never supplies a cut
+ * number). Null otherwise; facts of kind null never count, and a target never supplies a baseline.
  */
 export function documentValueSupported(value: string, kind: 'baseline' | 'target', unitIsPercent: boolean,
   facts: readonly DocumentFact[], documentTexts: readonly DocumentText[]): { fact: DocumentFact; source: string } | null {
   if (!value.trim() || documentTexts.length === 0) return null;
   for (const fact of facts) {
-    if (fact.kind === null || (fact.kind !== 'mixed' && fact.kind !== kind)) continue;
+    if (fact.kind === null) continue;
     if (!excerptSupportsValue(fact.excerpt, value, unitIsPercent)) continue;
-    const rightKind = standaloneValueOffsets(fact.excerpt, value)
-      .some(o => o.percent === unitIsPercent && valueKindInFact(fact, o.start) === kind);
-    if (!rightKind) continue;
+    const occurrences = standaloneValueOffsets(fact.excerpt, value).filter(o => o.percent === unitIsPercent);
+    if (!kindMatches(fact, value, kind, occurrences)) continue;
     const documents = documentsForFact(fact, documentTexts).map(d => ({ fileName: d.fileName, text: d.text }));
     const verified = verifyDocumentFigures([{ resultCode: null, kind, value: value.trim(), description: '', quote: fact.excerpt }], documents);
     if (verified.length > 0) return { fact, source: verified[0].source };
@@ -319,6 +336,75 @@ function allowedFor(ctx: ProjectContext, deps: ValidateDeps, entry: KpiLibraryEn
   return entry && !deps.candidateIds.has(entry.id) ? [...base, ...entryTexts(entry)] : base;
 }
 
+// ------------------------------------------------------------------ rule 3: numbers in a model-written name
+
+/** Library texts a number in a name may come from: candidates' names and definitions (built once per deps). */
+const nameAllowedCache = new WeakMap<ValidateDeps, string[]>();
+
+/**
+ * Texts that may supply a number of a model-written name (rule 3; me-foundations §2 rule 2: the name never holds the
+ * target): the names (EN, AR) and definitions of the candidates and of the linked entry, so "at least 4 antenatal care
+ * visits" or "children aged 6–59 months" copied from the library pass. Result statements, documents and the project
+ * are not allowed: they hold the targets.
+ */
+function nameAllowedTexts(deps: ValidateDeps, entry: KpiLibraryEntry | null): readonly string[] {
+  let base = nameAllowedCache.get(deps);
+  if (!base) {
+    base = Array.from(deps.candidateIds).flatMap(id => {
+      const e = deps.library.get(upperId(id));
+      return e ? [e.name, e.nameAr, e.definition] : [];
+    });
+    nameAllowedCache.set(deps, base);
+  }
+  return entry && !deps.candidateIds.has(entry.id) ? [...base, entry.name, entry.nameAr, entry.definition] : base;
+}
+
+/** A number (Latin or Arabic-Indic digits, separators inside), as written in a name. */
+const NAME_NUMBER = '[0-9٠-٩۰-۹](?:[0-9٠-٩۰-۹.,٫٬]*[0-9٠-٩۰-۹])?';
+/** A range after a number: "15–49", "15 to 49", "6 and 59", "15 و 49". */
+const NAME_RANGE = `(?:\\s*(?:-|to|and|و|إلى|الى)\\s*${NAME_NUMBER})?`;
+/** People a comparative age phrase follows ("children under 18", "people over 60", "women between 15 and 49"). */
+const NAME_AGE_PEOPLE = '(?:children|child|girls|boys|infants|babies|adolescents|youths?|young\\s+people|people|persons|individuals|adults|women|men|mothers'
+  + '|fathers|elderly|older\\s+(?:people|persons|adults)|students|pupils|learners|members|those|الأطفال|أطفال|اطفال|الطفل|طفل|النساء|نساء|الفتيات|فتيات'
+  + '|الشباب|شباب|الأشخاص|أشخاص|الاشخاص|اشخاص|البالغين|بالغين|الطلاب|طلاب|كبار\\s+السن)';
+/**
+ * Age phrases: "aged 15–49", "aged from 6 to 59", "aged over 60", "ages 15-24", Arabic "بعمر 15-49", "دون سن 18"; and a
+ * comparative only after a people word: "children under 18", "people over 60", "women between 15 and 49", "الأطفال دون 18".
+ * A bare "(over 500)", "(above 3,500)" or ", between 3,000 and 3,500" is a target, not an age (SPEC-3 re-check).
+ */
+const NAME_AGE_PHRASE = new RegExp(`(?<!\\p{L})(?:aged?|ages|بعمر|عمر|دون\\s+سن|فوق\\s+سن)\\s+(?:(?:from|over|under|above|below|between)\\s+)?${NAME_NUMBER}${NAME_RANGE}`
+  + `|(?<=(?<!\\p{L})${NAME_AGE_PEOPLE}\\s+)(?:under|over|below|above|between|اقل\\s+من|أقل\\s+من|بين|فوق|دون)\\s+${NAME_NUMBER}${NAME_RANGE}`, 'giu');
+/**
+ * A limit on a count of people inside the definition: "no more than 20 people per latrine", "fewer than 50 students per
+ * class", "more than 500 people" (the comparative and the number are followed by the counted people or "per").
+ */
+const NAME_COUNT_LIMIT = new RegExp(`(?<!\\p{L})(?:no\\s+more\\s+than|not\\s+more\\s+than|at\\s+most|fewer\\s+than|less\\s+than|more\\s+than|up\\s+to|maximum\\s+of|over|under|above|below|between)\\s+${NAME_NUMBER}${NAME_RANGE}`
+  + `(?=\\s+(?:people|persons|individuals|users|households|families|students|pupils|learners|children|members|participants|beneficiaries|per)(?!\\p{L}))`, 'giu');
+/**
+ * Codes, amounts and fixed expressions: a number right after an upper-case code or a currency sign ("ISO 9001",
+ * "SDG 6.1", "USD 150", "$150", "₪ 300"), a ratio or a schedule ("1:40 teacher-pupil ratio", "24/7 hotline").
+ */
+const NAME_CODE_OR_AMOUNT = new RegExp(`(?<![\\p{L}\\p{N}])(?:[A-Z]{2,6}|[$€£₪])\\s?${NAME_NUMBER}|${NAME_NUMBER}\\s*[:/]\\s*${NAME_NUMBER}`, 'gu');
+/** A number (or range) followed by a unit of measure: "15 litres", "30 minutes", "6–59 months", "4 visits", "3 meals". */
+const NAME_UNIT_PHRASE = new RegExp(`${NAME_NUMBER}(?:\\s*(?:-|to)\\s*${NAME_NUMBER})?\\s*(?:years?(?:\\s+old)?|yrs?|months?|weeks?|days?|hours?|minutes?|mins?|km|kilomet\\p{L}*|metres?|meters?|m2|m²|litres?|liters?|l\\/p\\/d|lpcd|kg|kilograms?|grams?|kcal|calories|visits?|doses?|meals?|times|sessions?|members?|cm|mm|ml|cfu|ha|hectares?|dunums?|سنة|سنوات|عام|أعوام|اعوام|شهر|شهرا|أشهر|اشهر|يوم|أيام|ايام|ساعة|ساعات|دقيقة|دقائق|كم|لتر|لترات|كغ|كيلوغرام|زيارة|زيارات|جرعة|جرعات|وجبة|وجبات|مرات|جلسة|جلسات|هكتار|دونم)(?![\\p{L}])`, 'giu');
+
+/**
+ * Numbers of a model-written name (EN or AR) that no library name or definition supports (rule 3 extension; x5 leaves
+ * the name to rule 3): "Number of youth trained, 500 by end of project" → ["500"]; "(over 500)" → ["500"]. Definitional
+ * numbers are not checked: ages ("aged 15–49", "children under 18"), a number followed by a unit of measure ("15 litres",
+ * "30 minutes", "4 visits"), a limit on the people counted ("no more than 20 people per latrine"), codes and amounts
+ * ("ISO 9001", "USD 150"), ratios and schedules ("1:40", "24/7"), and, as in unverifiedFigures, years and single digits.
+ */
+export function nameFiguresUnsupported(name: string, allowed: readonly string[]): string[] {
+  const definitional = name.replace(DASH_VARIANTS, '-')
+    .replace(NAME_CODE_OR_AMOUNT, ' ')
+    .replace(NAME_AGE_PHRASE, ' ')
+    .replace(NAME_COUNT_LIMIT, ' ')
+    .replace(NAME_UNIT_PHRASE, ' ');
+  return unverifiedFigures(definitional, allowed);
+}
+const DASH_VARIANTS = /[‐-―−]/g;
+
 // ------------------------------------------------------------------ one suggestion
 
 /** Exclusions for one result, split by why (rule 1 extension: rejected ids; D12/rule 18: already used on the result). */
@@ -384,7 +470,10 @@ export function validateSuggestion(raw: KpiRawSuggestion, ctx: ProjectContext, d
   const meansRaw = redact(raw.meansOfVerification);
   const meansOfVerification = clearIfUnverified(raw.meansOfVerification);
   const targetSuggestion = redact(raw.targetSuggestion);
-  const standardReferenceCode = redact(raw.standardReferenceCode);
+  // Rule 13 and §A1 ("which came from the library … which are donor-standard"): a standard code comes only from the
+  // linked library entry (normalizeIndicator puts the entry's label in); a custom suggestion never carries the model's
+  // code, so an AI-written indicator is never shown as donor-standard.
+  const standardReferenceCode = linked ? redact(raw.standardReferenceCode) : '';
 
   // Step 4: rules 8–9 (D14).
   const figures = factsFiguresFor(raw, ctx);
@@ -464,7 +553,12 @@ export function validateSuggestion(raw: KpiRawSuggestion, ctx: ProjectContext, d
   }
   payload.indicatorTextAr = finalNameAr || null;
 
-  if (nameHasTargetOrDirection(payload.indicatorText, finalNameAr)) warnings.push(warning('target_in_name'));
+  // Rule 3: the patterns of nameRules.ts, and numbers in the model's name (EN or AR) that no library name or definition
+  // supports ("…, 500 by end of project"; "(from 40 to 70)"); a name copied from the library is never flagged.
+  const nameAllowed = nameAllowedTexts(deps, entry);
+  if (nameHasTargetOrDirection(payload.indicatorText, finalNameAr)
+    || nameFiguresUnsupported(payload.indicatorText, nameAllowed).length > 0
+    || nameFiguresUnsupported(finalNameAr, nameAllowed).length > 0) warnings.push(warning('target_in_name'));
   if (isDoubleBarrelled(payload.indicatorText)) warnings.push(warning('double_barrelled'));
   if (percent && (!(raw.numerator ?? '').trim() || !(raw.denominator ?? '').trim())) warnings.push(warning('percent_without_calculation'));
 
@@ -498,6 +592,11 @@ export function validateSuggestion(raw: KpiRawSuggestion, ctx: ProjectContext, d
   if (level === 'output' && methodValue === 'hh_survey') warnings.push(warning('output_survey_method'));
   if (level === 'impact' && methodValue !== 'secondary_data') warnings.push(warning('impact_not_secondary'));
   if (raw.level !== result.level) warnings.push(warning('level_adjusted', { level: result.level, code: result.code }));
+  // me-foundations §2 rule 5 (the indicator fits its level): a library entry of another level (an output count on an
+  // outcome, an outcome survey on an output) is flagged; ranked below same-level suggestions by rule 17.
+  if (entry && entry.level !== result.level && entry.level !== 'activity') {
+    warnings.push(warning('level_mismatch_library', { libraryId: entry.id, entryLevel: entry.level, level: result.level, code: result.code }));
+  }
   if (meansRaw && isGenericMeansOfVerification(meansRaw)) warnings.push(warning('generic_means_of_verification'));
   if (removedFigures.length > 0) warnings.push(warning('figures_unverified', { figures: removedFigures.join(', ') }));
 
@@ -552,10 +651,17 @@ export function validateSuggestion(raw: KpiRawSuggestion, ctx: ProjectContext, d
 
 const CONFIDENCE_ORDER: Readonly<Record<ValidatedSuggestion['confidence'], number>> = { high: 0, medium: 1, low: 2 };
 
-/** Rule 17 order: confidence (high > medium > low), then quality score, then library before custom, then model order. */
+/** A library entry of another level than its result (level_mismatch_library). */
+const levelMismatch = (x: ValidatedSuggestion) => Number(x.warnings.some(w => w.code === 'level_mismatch_library'));
+
+/**
+ * Rule 17 order: confidence (high > medium > low), then quality score, then a library entry of the result's own level
+ * before one of another level (level_mismatch_library), then library before custom, then model order.
+ */
 function betterFirst(a: ValidatedSuggestion, b: ValidatedSuggestion): number {
   return CONFIDENCE_ORDER[a.confidence] - CONFIDENCE_ORDER[b.confidence]
     || b.qualityScore - a.qualityScore
+    || levelMismatch(a) - levelMismatch(b)
     || Number(a.libraryId === null) - Number(b.libraryId === null)
     || a.rank - b.rank;
 }
@@ -568,13 +674,14 @@ function chainIndex(ctx: ProjectContext): (resultId: string) => number {
 const sameLibrary = (a: string | null, b: string | null) => a !== null && b !== null && upperId(a) === upperId(b);
 
 /**
- * Rule 18 and D12 (spec §A4 step 3 "near-duplicate of an existing indicator"; me-foundations §2 rule 9 not duplicated):
+ * Rule 18 (spec §A4 step 3 "near-duplicate of an existing indicator"; me-foundations §2 rule 9 not duplicated):
  * - against existingIndicators of the whole framework: normalisedIndicatorName equal, same libraryId, or cosine of the
  *   English names ≥ 0.92 (when `similarity` knows both) → near_duplicate;
  * - alternatives runs: against pending suggestions of the same result (same libraryId or normalised name), which an
  *   alternatives run never expires (framework and result runs expire the pending cards of the results they refill);
- * - within the run: same result and same libraryId or normalised name → the better one is kept (duplicate_in_run); the
- *   same libraryId in two results → the first in chain order is kept (duplicate_in_run).
+ * - within the run: same result and same libraryId or normalised name → the better one is kept (duplicate_in_run).
+ * The same libraryId in two results (D12) is resolved by applyResultCaps, over the suggestions each result keeps, so a
+ * copy a result's cap drops never takes the library id from a later result (AI-1).
  * Kept suggestions stay in input order.
  */
 export function dropDuplicates(s: ValidatedSuggestion[], ctx: ProjectContext, similarity?: SimilarityFn): { kept: ValidatedSuggestion[]; warnings: KpiWarning[] } {
@@ -618,47 +725,42 @@ export function dropDuplicates(s: ValidatedSuggestion[], ctx: ProjectContext, si
     keptByResult.set(suggestion.resultId, group);
   }
 
-  // Across results: one library indicator measures one result (D12), the first in chain order.
-  const order = chainIndex(ctx);
-  const byChain = afterExisting
-    .filter(x => !dropped.has(x))
-    .map((x, i) => ({ x, i }))
-    .sort((a, b) => order(a.x.resultId) - order(b.x.resultId) || a.i - b.i);
-  const libraryOwner = new Map<string, string>();
-  for (const { x } of byChain) {
-    if (x.libraryId === null) continue;
-    const id = upperId(x.libraryId);
-    const owner = libraryOwner.get(id);
-    if (owner === undefined) {
-      libraryOwner.set(id, x.resultId);
-    } else if (owner !== x.resultId) {
-      dropped.add(x);
-      warnings.push(warning('duplicate_in_run', { code: x.resultCode }));
-    }
-  }
-
   return { kept: afterExisting.filter(x => !dropped.has(x)), warnings };
 }
 
 /**
- * Rule 17 (spec §A4 step 3 "more than maxIndicatorsPerResult"; D5, D10): per result keep allowanceFor(result, ctx).max
- * suggestions (the level maximum, minus existing indicators in framework scope and for donor caps), best first by
- * confidence (high > medium > low), quality score, library before custom, then model order; a result_cap warning names
- * the result, the cap and how many were dropped. Kept suggestions are grouped by result in chain order, best first.
+ * Rule 17 (spec §A4 step 3 "more than maxIndicatorsPerResult"; D5, D10) with D12 (one library indicator measures one
+ * result): results in chain order; per result its suggestions best first (betterFirst: confidence, quality score, same
+ * level, library before custom, model order); a suggestion whose library id a kept suggestion of an earlier result
+ * already uses is dropped (duplicate_in_run); then the first allowanceFor(result, ctx).max are kept (the level maximum,
+ * minus existing indicators in framework scope and for donor caps; minus `reserved` slots, which rule 19 keeps for the
+ * accountability indicator) and a result_cap warning names the result, the cap and how many more were dropped. A copy
+ * that a result's cap drops never claims its library id, so a later result keeps its own copy (AI-1). Kept suggestions
+ * are grouped by result in chain order, best first.
  */
-export function applyResultCaps(s: ValidatedSuggestion[], ctx: ProjectContext): { kept: ValidatedSuggestion[]; warnings: KpiWarning[] } {
+export function applyResultCaps(s: ValidatedSuggestion[], ctx: ProjectContext,
+  reserved: ReadonlyMap<string, number> = new Map()): { kept: ValidatedSuggestion[]; warnings: KpiWarning[] } {
   const warnings: KpiWarning[] = [];
   const kept: ValidatedSuggestion[] = [];
   const order = chainIndex(ctx);
   const groups = new Map<string, ValidatedSuggestion[]>();
   for (const suggestion of s) groups.set(suggestion.resultId, [...(groups.get(suggestion.resultId) ?? []), suggestion]);
   const resultIds = Array.from(groups.keys()).sort((a, b) => order(a) - order(b));
+  const usedLibraryIds = new Set<string>();
   for (const resultId of resultIds) {
-    const group = [...(groups.get(resultId) ?? [])].sort(betterFirst);
+    const group = [...(groups.get(resultId) ?? [])].sort(betterFirst).filter(x => {
+      if (x.libraryId === null || !usedLibraryIds.has(upperId(x.libraryId))) return true;
+      warnings.push(warning('duplicate_in_run', { code: x.resultCode }));
+      return false;
+    });
+    if (group.length === 0) continue;
     const result = ctx.resultsChain.find(r => r.id === resultId);
     const cap = result ? allowanceFor(result, ctx).max : group.length;
-    kept.push(...group.slice(0, cap));
-    if (group.length > cap) warnings.push(warning('result_cap', { code: group[0].resultCode, cap, dropped: group.length - cap }));
+    const room = Math.max(0, cap - (reserved.get(resultId) ?? 0));
+    const keptHere = group.slice(0, room);
+    for (const x of keptHere) if (x.libraryId !== null) usedLibraryIds.add(upperId(x.libraryId));
+    kept.push(...keptHere);
+    if (group.length > room) warnings.push(warning('result_cap', { code: group[0].resultCode, cap, dropped: group.length - room }));
   }
   return { kept, warnings };
 }
@@ -710,7 +812,8 @@ export function rawSuggestionFromLibrary(entry: KpiLibraryEntry, result: Context
  * scoped outcome with the most suggestions (result_cap notes the drop). No outcome in scope or every entry excluded →
  * accountability_missing only.
  */
-export function ensureAccountability(s: ValidatedSuggestion[], ctx: ProjectContext, deps: ValidateDeps): { suggestions: ValidatedSuggestion[]; warnings: KpiWarning[] } {
+export function ensureAccountability(s: ValidatedSuggestion[], ctx: ProjectContext, deps: ValidateDeps):
+  { suggestions: ValidatedSuggestion[]; warnings: KpiWarning[]; replacedIn?: string } {
   const unchanged = { suggestions: s, warnings: [] as KpiWarning[] };
   if (!ctx.project.humanitarian || ctx.scope.type === 'alternatives') return unchanged;
   const scoped = scopedResults(ctx);
@@ -727,12 +830,14 @@ export function ensureAccountability(s: ValidatedSuggestion[], ctx: ProjectConte
   let target = outcomes.find(r => count(r.id) < allowanceFor(r, ctx).max) ?? null;
   let list = s;
   const warnings: KpiWarning[] = [];
+  let replacedIn: string | undefined;
   if (!target) {
     target = outcomes.reduce((best, r) => (count(r.id) > count(best.id) ? r : best), outcomes[0]);
     const group = s.filter(x => x.resultId === target!.id).sort(betterFirst);
     const worst = group[group.length - 1];
     if (worst) {
       list = s.filter(x => x !== worst);
+      replacedIn = target.id;
       warnings.push(warning('result_cap', { code: target.code, cap: allowanceFor(target, ctx).max, dropped: 1 }));
     }
   }
@@ -751,7 +856,23 @@ export function ensureAccountability(s: ValidatedSuggestion[], ctx: ProjectConte
   return {
     suggestions: [...list, validated.suggestion],
     warnings: [...warnings, warning('accountability_added', { libraryId: entry.id, code: target.code })],
+    ...(replacedIn ? { replacedIn } : {}),
   };
+}
+
+/**
+ * Rules 17 and 19 together (AI-1): applyResultCaps, then ensureAccountability. When rule 19 had to replace a suggestion of
+ * a full outcome, the caps run again with one slot of that outcome reserved, so the replaced suggestion never claims its
+ * library id (D12) from a later result, and the accountability indicator takes the reserved slot. Returns the kept
+ * suggestions and the cap and accountability warnings.
+ */
+export function capWithAccountability(s: ValidatedSuggestion[], ctx: ProjectContext, deps: ValidateDeps): { suggestions: ValidatedSuggestion[]; warnings: KpiWarning[] } {
+  const capped = applyResultCaps(s, ctx);
+  const first = ensureAccountability(capped.kept, ctx, deps);
+  if (!first.replacedIn) return { suggestions: first.suggestions, warnings: [...capped.warnings, ...first.warnings] };
+  const recapped = applyResultCaps(s, ctx, new Map([[first.replacedIn, 1]]));
+  const second = ensureAccountability(recapped.kept, ctx, deps);
+  return { suggestions: second.suggestions, warnings: [...recapped.warnings, ...second.warnings] };
 }
 
 /** x6: the model's frameworkWarnings as model_note warnings (≤ 10, redacted, ≤ 300 characters, unverified sentences removed). */
@@ -765,7 +886,7 @@ function modelNotes(notes: readonly string[], allowed: readonly string[]): KpiWa
 
 /**
  * Composes everything (spec §A4 step 3; design 1.5): validateSuggestion for each model suggestion (model order = rank),
- * dropDuplicates (rule 18, D12), applyResultCaps (rule 17), ensureAccountability (rule 19), the model's notes (x6); then
+ * dropDuplicates (rule 18), capWithAccountability (rule 17 with D12, then rule 19), the model's notes (x6); then
  * re-ranks per result (rank 1..n, best first; an appended accountability indicator last). Suggestions come grouped by
  * result in chain order; frameworkWarnings hold the run-level warnings, then the AI notes.
  */
@@ -781,9 +902,8 @@ export function validateAndScore(input: { context: ProjectContext; answer: KpiMo
   });
 
   const deduped = dropDuplicates(validated, ctx, deps.similarity);
-  const capped = applyResultCaps(deduped.kept, ctx);
-  const withAccountability = ensureAccountability(capped.kept, ctx, deps);
-  frameworkWarnings.push(...deduped.warnings, ...capped.warnings, ...withAccountability.warnings);
+  const withAccountability = capWithAccountability(deduped.kept, ctx, deps);
+  frameworkWarnings.push(...deduped.warnings, ...withAccountability.warnings);
   frameworkWarnings.push(...modelNotes(answer.frameworkWarnings ?? [], allowedFigures(ctx, deps)));
 
   const order = chainIndex(ctx);

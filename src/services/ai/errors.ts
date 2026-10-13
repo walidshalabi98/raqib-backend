@@ -5,7 +5,25 @@
  * text or personal data); they name the feature and what went wrong.
  */
 
+/**
+ * What a failed call used and cost, as the client recorded it on the AiCall row (tokens of every attempt, the cost
+ * estimate, the row id and the served model). Counts and ids only.
+ */
+export interface AiFailedCallUsage {
+  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
+  /** Null only when nothing could be priced (an unknown model). */
+  estimatedCostUsd: number | null;
+  aiCallId: string | null;
+  model: string | null;
+}
+
 export class AiError extends Error {
+  /**
+   * Usage and cost of the failed call, set by generateStructured before it throws (a truncated answer is billed: the
+   * eval cost, its --max-usd cap and the run totals count it); null for errors raised elsewhere.
+   */
+  call: AiFailedCallUsage | null = null;
+
   constructor(
     message: string,
     /** Feature that made the call, e.g. "framework.indicators". */

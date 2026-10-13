@@ -7,6 +7,7 @@ import type { Request, Response } from 'express';
 import type { KpiSuggestion, Prisma, PrismaClient, Project } from '@prisma/client';
 import { z } from 'zod';
 import { env } from '../../config/env';
+import { budgetCostUsd, getModelInfo, MODELS } from '../ai/models';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../middleware/errorHandler';
 import { STAFF_ROLES } from '../../middleware/roles';
@@ -124,14 +125,31 @@ export async function resolveScope(db: Prisma.TransactionClient | PrismaClient, 
   return { type: 'alternatives', indicatorId: null, suggestionId: suggestion.id };
 }
 
-/** Organisation's AI spend over the last 24 h: SUM(AiCall.estimatedCostUsd) by organizationId (index exists; D20). */
+/**
+ * Organisation's AI spend over the last 24 h (index on organizationId, createdAt; D20): SUM(AiCall.estimatedCostUsd),
+ * failing closed for calls the price table cannot price (CC-07): a call with no estimate, or whose requested or served
+ * model has no price in models.ts (a new AI_MODEL_MAIN, a server-side fallback to an unlisted model), counts at the
+ * highest known rates for all its tokens (budgetCostUsd) when that is more than its stored estimate. So an unpriced model
+ * can never keep the organisation under its budget; the stored estimates themselves stay unchanged (no guess is stored).
+ */
 export async function organisationSpendUsd(db: Prisma.TransactionClient | PrismaClient, organizationId: string, now: Date): Promise<number> {
   const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const { _sum } = await db.aiCall.aggregate({
-    where: { organizationId, createdAt: { gte: since } },
-    _sum: { estimatedCostUsd: true },
+  const where = { organizationId, createdAt: { gte: since } };
+  const { _sum } = await db.aiCall.aggregate({ where, _sum: { estimatedCostUsd: true } });
+  const priced = Object.keys(MODELS);
+  const doubtful = await db.aiCall.findMany({
+    where: { ...where, OR: [{ estimatedCostUsd: null }, { model: { notIn: priced } }, { servedModel: { notIn: priced } }] },
+    select: { model: true, servedModel: true, estimatedCostUsd: true, inputTokens: true, outputTokens: true, cacheReadTokens: true, cacheWriteTokens: true },
   });
-  return _sum.estimatedCostUsd === null ? 0 : Number(_sum.estimatedCostUsd.toString());
+  let extra = 0;
+  for (const call of doubtful) {
+    const stored = call.estimatedCostUsd === null ? null : Number(call.estimatedCostUsd.toString());
+    const unpriced = stored === null || getModelInfo(call.model) === null || (call.servedModel !== null && getModelInfo(call.servedModel) === null);
+    if (!unpriced) continue; // a dated snapshot id of a priced model
+    extra += Math.max(0, budgetCostUsd(call) - (stored ?? 0));
+  }
+  const total = (_sum.estimatedCostUsd === null ? 0 : Number(_sum.estimatedCostUsd.toString())) + extra;
+  return Math.round(total * 1_000_000) / 1_000_000;
 }
 
 /** Why a scope has nothing to suggest (422 nothing_to_suggest `details.reason`; design 7.1, m4/SDA-12). */

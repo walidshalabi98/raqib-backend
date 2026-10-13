@@ -9,6 +9,13 @@ vi.unmock('../src/services/ai/qualitativeCoder');
 vi.unmock('../src/services/ai/reportNarrative');
 vi.unmock('../src/services/ai/assessmentGenerator');
 vi.unmock('../src/services/ai/riskAnalyzer');
+// TQ-08: the KPI pipeline too (tests/setup.ts mocks it since Phase 4), and the KPI Assistant counts as configured, so a
+// route that started a KPI run would reach the fake SDK instead of stopping at the placeholder-key 503.
+vi.unmock('../src/services/kpi/pipeline');
+vi.mock('../src/services/kpi/availability', async importOriginal => {
+  const original = await importOriginal<typeof import('../src/services/kpi/availability')>();
+  return { ...original, kpiAssistantStatus: () => ({ ...original.kpiAssistantStatus(), aiConfigured: true }) };
+});
 
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
@@ -110,6 +117,19 @@ describe.skipIf(!hasTestDatabase)('no donor request reaches an AI model', () => 
     const before = modelRequests.length;
     const res = await request(app).get(`/api/dashboard/projects/${f.project.id}/risks`).set('Authorization', f.officerAuth);
     expect(res.status).toBe(200);
+    expect(modelRequests.length).toBeGreaterThan(before);
+  });
+
+  it('would notice a KPI model call: a staff KPI request runs the real pipeline up to the model (TQ-08)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const before = modelRequests.length;
+    // Result scope waits for the run (up to 20 s); the fake SDK fails every call, so the run ends quickly as failed.
+    const res = await request(app).post(`/api/projects/${f.project.id}/kpi-suggestions`).set('Authorization', f.officerAuth)
+      .send({ scope: 'result', resultId: f.result.id });
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(500);
+    await vi.waitFor(async () => expect(await prisma.kpiSuggestionRun.count({ where: { projectId: f.project.id, status: 'running' } })).toBe(0), { timeout: 10_000 });
     expect(modelRequests.length).toBeGreaterThan(before);
   });
 });

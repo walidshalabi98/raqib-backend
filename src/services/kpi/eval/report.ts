@@ -133,6 +133,7 @@ export function formatSummaryTable(report: EvalReport): string {
     `library ${flag(s.passed.library)}`,
     `hallucinated ${flag(s.passed.hallucinated)}`,
     `baselines ${flag(s.passed.baselines)}`,
+    `thresholds ${s.thresholdsOutsideList} ${flag(s.passed.thresholds)}`,
     `quality ${flag(s.passed.quality)}`,
     `latency ${resultCheck ? flag(s.passed.latency) : 'not measured'}`,
   ].join(' · ');

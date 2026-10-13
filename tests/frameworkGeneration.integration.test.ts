@@ -414,7 +414,8 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
       definition: TO_BE_CONFIRMED, baselineMethod: `${TO_BE_CONFIRMED}. ${BASELINE_DATE_TO_BE_CONFIRMED}`,
       calculation: { numerator: TO_BE_CONFIRMED, denominator: TO_BE_CONFIRMED, formula: PERCENT, rounding: TO_BE_CONFIRMED },
     });
-    expect(kits).toMatchObject({ indicatorTextAr: null, meansOfVerification: TO_BE_CONFIRMED, disaggregation: ['sex'] });
+    // Kits are counted, not people: rule 7 adds sex only when the counted noun is people (AI-5 re-check).
+    expect(kits).toMatchObject({ indicatorTextAr: null, meansOfVerification: TO_BE_CONFIRMED, disaggregation: [] });
 
     // Document values are kept when they are verified figures of the same kind, and cited; the standard threshold comes from the linked entry.
     expect(water).toMatchObject({

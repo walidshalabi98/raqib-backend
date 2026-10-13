@@ -4,13 +4,16 @@
  * (latency), each case in its own try/catch, and no new case once the spend reaches maxUsd. Never touches a database:
  * the caller injects the library source, the embedding provider and the model caller. Logs carry ids and counts only.
  */
-import { AiError, AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, safeErrorSummary } from '../../ai/errors';
+import { AiError, safeErrorSummary } from '../../ai/errors';
+import { failedCallInfo } from '../callModel';
 import { KPI_PROMPT_VERSION } from '../../ai/prompts/kpi';
 import { runKpiPipeline } from '../pipeline';
 import type { KpiCallInfo, KpiLibraryEntry, KpiPipelineDeps, KpiPipelineResult, ModelCaller } from '../types';
 import { checkAssertions, failAllAssertions } from './assertions';
 import { caseToContext, firstOutcome, type EvalCase } from './cases';
-import { DEFAULT_EVAL_TARGETS, baselinesFromTargetSentences, hallucinatedTargets, summarise, type EvalCaseRun, type EvalTargets } from './metrics';
+import {
+  DEFAULT_EVAL_TARGETS, baselinesFromTargetSentences, hallucinatedTargets, summarise, thresholdsOutsideList, type EvalCaseRun, type EvalTargets,
+} from './metrics';
 import type { EvalReport } from './report';
 
 /** What the report says about the run that the runner cannot know itself (the CLI fills it; design 10.3). */
@@ -36,13 +39,6 @@ const DEFAULT_INFO: EvalRunInfo = {
   targets: DEFAULT_EVAL_TARGETS,
 };
 
-function outcomeOf(err: unknown): KpiCallInfo['outcome'] {
-  if (err instanceof AiOutputTruncatedError) return 'truncated';
-  if (err instanceof AiInvalidOutputError) return 'invalid';
-  if (err instanceof AiRefusalError) return 'refused';
-  return 'error';
-}
-
 /**
  * Wraps the model caller to record every attempt, so a run that throws still reports its calls (outcomes for the
  * summary, cost for the budget). A successful pipeline run reports its own KpiCallInfo list instead.
@@ -61,10 +57,8 @@ function recordingCaller(callModel: ModelCaller): { callModel: ModelCaller; call
       });
       return response;
     } catch (err) {
-      calls.push({
-        ...base, model: null, outcome: outcomeOf(err), inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
-        estimatedCostUsd: null, latencyMs: Math.max(0, Date.now() - started), aiCallId: null,
-      });
+      // The client attaches a failed call's usage and cost to the error (AI-4): it counts towards the cost and --max-usd.
+      calls.push(failedCallInfo(base, err, Math.max(0, Date.now() - started)));
       throw err;
     }
   };
@@ -81,7 +75,7 @@ async function runCase(c: EvalCase, deps: KpiPipelineDeps, library: ReadonlyMap<
   Promise<{ run: EvalCaseRun; retrieval: KpiPipelineResult['retrieval'] | null }> {
   const run: EvalCaseRun = {
     id: c.id, error: null, suggestions: [], frameworkWarnings: [], assertions: [], rawCount: 0, hallucinatedBefore: 0, hallucinatedAfter: 0,
-    baselinesFromTargetSentences: 0, candidateIdsByResult: {}, calls: [], resultCalls: [], resultRawCount: 0,
+    baselinesFromTargetSentences: 0, thresholdsOutsideList: 0, candidateIdsByResult: {}, calls: [], resultCalls: [], resultRawCount: 0,
   };
   let retrieval: KpiPipelineResult['retrieval'] | null = null;
 
@@ -95,6 +89,7 @@ async function runCase(c: EvalCase, deps: KpiPipelineDeps, library: ReadonlyMap<
     run.hallucinatedBefore = hallucinatedTargets(result.raw, c.documentFacts);
     run.hallucinatedAfter = hallucinatedTargets(result.suggestions, c.documentFacts);
     run.baselinesFromTargetSentences = baselinesFromTargetSentences(result.suggestions, c.documentFacts);
+    run.thresholdsOutsideList = thresholdsOutsideList(result.suggestions);
     run.candidateIdsByResult = result.candidateIdsByResult;
     run.calls = result.calls;
     run.assertions = checkAssertions(c, result.suggestions, library);

@@ -12,7 +12,7 @@ import { codeKey } from '../ai/frameworkNormalize';
 import {
   KPI_CALLS, KPI_FEATURES, KPI_PROMPT_VERSION, KPI_SUGGESTIONS_SCHEMA, KPI_SYSTEM, buildKpiUserMessage,
 } from '../ai/prompts/kpi';
-import { MAX_CANDIDATES_PER_CALL, type RetrievalResult } from './retrieve';
+import { MAX_CANDIDATES_PER_CALL, type RankedCandidate, type RetrievalResult } from './retrieve';
 import { allowanceFor, scopedResults } from './scope';
 import type {
   ContextResult, KpiCallInfo, KpiLibraryEntry, KpiModelRequest, KpiPipelineDeps, KpiRawSuggestion, KpiScopeType, ModelCaller,
@@ -203,6 +203,35 @@ export function candidatesForBatch(batch: readonly ContextResult[], retrieval: P
   return { candidates: Array.from(listed.values()), candidateIdsByResult };
 }
 
+/**
+ * Candidates offered per result when a run has more than one batch (AI-2; D12: one library indicator measures one
+ * result): batches run at the same time and each prompt shows only its own results, so the model cannot keep a candidate
+ * to one result across batches. An entry ranked for results of different batches therefore stays only in the batch where
+ * it scores best (ties: the earlier batch); within that batch it stays in every result's list (the prompt asks for one
+ * result per candidate). Accountability entries (rule 19) are added to every call by candidatesForBatch, as before.
+ * `exclude` (upper-case library ids) removes entries everywhere (a retry after the first answers: ids already kept).
+ */
+export function exclusiveCandidates(batches: readonly ContextResult[][], byResult: ReadonlyMap<string, RankedCandidate[]>,
+  exclude: ReadonlySet<string> = new Set()): Map<string, RankedCandidate[]> {
+  const owner = new Map<string, { batch: number; score: number }>();
+  batches.forEach((batch, index) => {
+    for (const result of batch) {
+      for (const ranked of byResult.get(result.id) ?? []) {
+        const known = owner.get(ranked.entry.id);
+        if (!known || ranked.score > known.score) owner.set(ranked.entry.id, { batch: index, score: ranked.score });
+      }
+    }
+  });
+  const out = new Map<string, RankedCandidate[]>();
+  for (const [resultId, list] of byResult) out.set(resultId, list.filter(c => !exclude.has(c.entry.id.toUpperCase())));
+  if (batches.length > 1) {
+    batches.forEach((batch, index) => {
+      for (const result of batch) out.set(result.id, (out.get(result.id) ?? []).filter(c => owner.get(c.entry.id)?.batch === index));
+    });
+  }
+  return out;
+}
+
 function dedupeById(entries: readonly KpiLibraryEntry[]): KpiLibraryEntry[] {
   const seen = new Set<string>();
   return entries.filter(e => (seen.has(e.id) ? false : (seen.add(e.id), true)));
@@ -224,6 +253,21 @@ function outcomeOf(err: AiError): KpiCallInfo['outcome'] {
   if (err instanceof AiInvalidOutputError) return 'invalid';
   if (err instanceof AiRefusalError) return 'refused';
   return 'error';
+}
+
+/**
+ * The KpiCallInfo of a failed call (AI-4): the usage, cost, AiCall id and served model the client attached to the error
+ * (a truncated batch is billed for every token it produced), else zero tokens and an unknown cost.
+ */
+export function failedCallInfo(base: Pick<KpiCallInfo, 'feature' | 'tier' | 'promptVersion' | 'resultCodes'>, err: unknown, latencyMs: number): KpiCallInfo {
+  const call = err instanceof AiError ? err.call : null;
+  const outcome: KpiCallInfo['outcome'] = err instanceof AiError ? outcomeOf(err) : 'error';
+  return {
+    ...base, model: call?.model ?? null, outcome,
+    inputTokens: call?.usage.inputTokens ?? 0, outputTokens: call?.usage.outputTokens ?? 0,
+    cacheReadTokens: call?.usage.cacheReadTokens ?? 0, cacheWriteTokens: call?.usage.cacheWriteTokens ?? 0,
+    estimatedCostUsd: call ? call.estimatedCostUsd : null, latencyMs, aiCallId: call?.aiCallId ?? null,
+  };
 }
 
 /** A failed result's reason when the call cannot be split (any request failure after the client's own retries: unavailable). */
@@ -291,11 +335,19 @@ function runQueue(initial: Task[], concurrency: number, worker: (task: Task, enq
  * has its own call); suggestions with a code outside the scope are passed on for validation (rule x1).
  */
 export async function callModelForResults(ctx: ProjectContext, retrieval: RetrievalResult, deps: Pick<KpiPipelineDeps, 'callModel' | 'now'>,
-  opts: { feature?: string; callContext?: AiCallContext; onBatchDone?: () => void | Promise<void>; deadlineAt: number; maxCalls: number }):
+  opts: { feature?: string; callContext?: AiCallContext; onBatchDone?: () => void | Promise<void>; deadlineAt: number; maxCalls: number;
+    /** The results to call for (default: every scoped result) and whether each gets its own call (a retry; AI-2). */
+    results?: ContextResult[]; oneResultPerCall?: boolean;
+    /** Upper-case library ids no call may offer (a retry: ids other results already keep). */
+    excludeLibraryIds?: ReadonlySet<string> }):
   Promise<{ suggestions: KpiRawSuggestion[]; modelWarnings: string[]; calls: KpiCallInfo[];
             failedResults: Array<{ resultId: string; reason: KpiFailedResultReason }>;
             lastError: AiError | null; model: string | null }> {
   const scoped = scopedResults(ctx);
+  const targets = opts.results ?? scoped;
+  const plan = opts.oneResultPerCall ? targets.map(r => [r]) : planBatches(targets);
+  // AI-2: an entry ranked in several batches is offered only in the batch where it ranks best.
+  const offered: RetrievalResult = { ...retrieval, byResult: exclusiveCandidates(plan, retrieval.byResult, opts.excludeLibraryIds) };
   const feature = opts.feature ?? (ctx.scope.type === 'alternatives' ? KPI_FEATURES.alternatives : KPI_FEATURES.suggest);
   const scopedKeys = new Set(scoped.map(r => codeKey(r.code)));
   const answers: Array<{ order: [number, number]; suggestions: KpiRawSuggestion[]; warnings: string[] }> = [];
@@ -311,7 +363,7 @@ export async function callModelForResults(ctx: ProjectContext, retrieval: Retrie
   };
 
   const buildRequest = (results: ContextResult[]): KpiModelRequest => {
-    const { candidates, candidateIdsByResult } = candidatesForBatch(results, retrieval);
+    const { candidates, candidateIdsByResult } = candidatesForBatch(results, offered);
     const allowances = Object.fromEntries(results.map(r => [r.id, allowanceFor(r, ctx)]));
     const config = callConfigFor(ctx.scope.type, results.length);
     return {
@@ -373,13 +425,7 @@ export async function callModelForResults(ctx: ProjectContext, retrieval: Retrie
         answers.push({ order: task.order, suggestions, warnings: response.data.frameworkWarnings ?? [] });
       } catch (err) {
         if (err instanceof AiError) {
-          calls.push({
-            index,
-            info: {
-              ...base, model: null, outcome: outcomeOf(err), inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
-              estimatedCostUsd: null, latencyMs: Math.max(0, deps.now().getTime() - started), aiCallId: null,
-            },
-          });
+          calls.push({ index, info: failedCallInfo(base, err, Math.max(0, deps.now().getTime() - started)) });
         }
         if (isAuthFailure(err) || !(err instanceof AiError)) throw err;
         lastError = err;
@@ -401,7 +447,7 @@ export async function callModelForResults(ctx: ProjectContext, retrieval: Retrie
     }
   };
 
-  const tasks = planBatches(scoped).map((results, i): Task => ({ results, order: [i, 0] }));
+  const tasks = plan.map((results, i): Task => ({ results, order: [i, 0] }));
   await runQueue(tasks, KPI_BATCH_CONCURRENCY, worker);
 
   if (dropped > 0) console.warn(`[KpiModel] ${feature}: ${dropped} suggestion(s) for a result of another batch dropped`);

@@ -27,7 +27,7 @@ import { seedLibrary } from '../src/services/library/seed';
 import { parseAcceptBody, repeatsIndicator, siblingGroup } from '../src/services/kpi/accept';
 import { emptyPipelineResult, runKpiPipeline } from '../src/services/kpi/pipeline';
 import { parseRejectBody } from '../src/services/kpi/reject';
-import { nothingToSuggestReason, parseKpiRequestBody, sortSuggestionRows } from '../src/services/kpi/requests';
+import { nothingToSuggestReason, organisationSpendUsd, parseKpiRequestBody, sortSuggestionRows } from '../src/services/kpi/requests';
 import { KPI_RUN_STALE_MS } from '../src/services/kpi/runs';
 import { scopedResults } from '../src/services/kpi/scope';
 import type { KpiPipelineResult, ProjectContext, ValidatedSuggestion } from '../src/services/kpi/types';
@@ -88,13 +88,21 @@ describe('request parsing (design 7.3)', () => {
   });
 
   it('accept body: no body or no edits means none; anything but an object is refused', () => {
-    expect(parseAcceptBody(undefined)).toEqual({ edits: {} });
-    expect(parseAcceptBody({})).toEqual({ edits: {} });
-    expect(parseAcceptBody({ edits: null })).toEqual({ edits: {} });
-    expect(parseAcceptBody({ edits: { indicatorText: 'x' }, other: 1 })).toEqual({ edits: { indicatorText: 'x' } });
+    expect(parseAcceptBody(undefined)).toEqual({ edits: {}, replaceSource: false });
+    expect(parseAcceptBody({})).toEqual({ edits: {}, replaceSource: false });
+    expect(parseAcceptBody({ edits: null })).toEqual({ edits: {}, replaceSource: false });
+    expect(parseAcceptBody({ edits: { indicatorText: 'x' }, other: 1 })).toEqual({ edits: { indicatorText: 'x' }, replaceSource: false });
+    expect(parseAcceptBody({ replaceSource: true })).toEqual({ edits: {}, replaceSource: true });
     expect(() => parseAcceptBody('x')).toThrow(/JSON object/);
     expect(() => parseAcceptBody({ edits: ['x'] })).toThrow(/edits must be an object/);
     expect(() => parseAcceptBody({ edits: 'x' })).toThrow(/edits must be an object/);
+    expect(() => parseAcceptBody({ replaceSource: 'yes' })).toThrow(/replaceSource must be true or false/);
+    // TQ-02: keys outside DRAFT_EDITABLE_KEYS are refused with their names.
+    for (const key of ['status', 'currentValue', 'actualStartDate', 'actualEndDate', 'milestones', 'bad key']) {
+      expect(() => parseAcceptBody({ edits: { indicatorText: 'x', [key]: 'y' } }), key).toThrow(expect.objectContaining({ statusCode: 400, code: 'not_editable', details: { keys: [key] } }));
+    }
+    // The server-set fields stay ignored (design 8.1).
+    expect(parseAcceptBody({ edits: { provenance: 'manual', aiModel: 'x', promptVersion: 'y', phases: [], sortOrder: 2 } }).edits).toMatchObject({ provenance: 'manual' });
   });
 
   it('reject body: a known reason; the note is trimmed, at most 1000 characters, empty → null and redacted', () => {
@@ -391,6 +399,35 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
         env.aiOrgDailyBudgetUsd = budget;
       }
     });
+
+    it('CC-07 (re-check): calls of an unpriced model count at the highest known rates, so the budget still stops KPI requests', async () => {
+      const call = (data: Partial<Prisma.AiCallCreateManyInput>): Prisma.AiCallCreateManyInput => ({
+        feature: 'kpi.suggest', model: 'claude-sonnet-5-5', promptVersion: 'kpi-v1', status: 'success', latencyMs: 1, organizationId: fx.org.id, ...data,
+      });
+      // 600k output tokens of a model missing from models.ts, stored without a cost: 15 USD at the highest output rate (25/M).
+      await prisma.aiCall.createMany({ data: [call({ model: 'claude-sonnet-9-9', estimatedCostUsd: null, outputTokens: 600_000 })] });
+      expect(await organisationSpendUsd(prisma, fx.org.id, new Date())).toBeCloseTo(15, 6);
+      pipelineMock.mockImplementation(async ctx => answerFor(ctx, 1));
+      expect((await post(suggestPath(), { scope: 'result', resultId: fx.result.id })).status).toBe(200);
+
+      // A server-side fallback to an unlisted model: the stored estimate (0.1) covers only the priced part; all 200k
+      // output tokens count at 25/M (5 USD) instead, which reaches the 20 USD budget.
+      await prisma.aiCall.createMany({ data: [call({ servedModel: 'claude-mystery-1', estimatedCostUsd: new Prisma.Decimal(0.1), outputTokens: 200_000 })] });
+      expect(await organisationSpendUsd(prisma, fx.org.id, new Date())).toBeCloseTo(20, 6);
+      const res = await post(suggestPath(), { scope: 'result', resultId: fx.result.id });
+      expect(res.status).toBe(429);
+      expect(res.body).toMatchObject({ code: 'budget_reached' });
+    });
+
+    it('CC-07: a priced model (also as a dated snapshot id) counts at its stored estimate only', async () => {
+      await prisma.aiCall.createMany({
+        data: [
+          { feature: 'kpi.suggest', model: 'claude-sonnet-5-5-20261001', promptVersion: 'kpi-v1', status: 'success', latencyMs: 1, organizationId: fx.org.id, estimatedCostUsd: new Prisma.Decimal(0.5), outputTokens: 1_000_000 },
+          { feature: 'kpi.suggest', model: 'claude-haiku-5-5', servedModel: 'claude-haiku-5-5', promptVersion: 'kpi-v1', status: 'success', latencyMs: 1, organizationId: fx.org.id, estimatedCostUsd: new Prisma.Decimal(0.25), outputTokens: 500_000 },
+        ],
+      });
+      expect(await organisationSpendUsd(prisma, fx.org.id, new Date())).toBeCloseTo(0.75, 6);
+    });
   });
 
   describe('GET /api/projects/:id/kpi-suggestions and GET /api/kpi-suggestion-runs/:id', () => {
@@ -435,8 +472,14 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
         projectId: fx.project.id, frameworkId: fx.framework.id,
         data: { status: 'running', finishedAt: null, updatedAt: new Date(Date.now() - KPI_RUN_STALE_MS - 60_000) },
       });
+      const before = Date.now();
       const res = await get(suggestPath());
       expect(res.body.activeRuns.map((r: any) => [r.id, r.status, r.step])).toEqual([[live.id, 'running', 'model']]);
+      // TQ-07: every run carries the server's clock, so a client measures the run's age without comparing clocks.
+      const serverNow = Date.parse(res.body.activeRuns[0].serverNow);
+      expect(serverNow).toBeGreaterThanOrEqual(before - 1000);
+      expect(serverNow).toBeLessThanOrEqual(Date.now() + 1000);
+      expect(Date.parse(res.body.latestFrameworkRun.serverNow)).toBe(serverNow);
       expect(res.body.latestFrameworkRun).toMatchObject({ id: stale.id, status: 'failed', errorCode: 'interrupted' });
       expect(await prisma.kpiSuggestionRun.findUniqueOrThrow({ where: { id: stale.id } })).toMatchObject({ status: 'failed', errorCode: 'interrupted' });
     });
@@ -445,7 +488,7 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
       await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 2, 'Rejected one'), status: 'rejected', decision: { rejectReason: 'duplicate' } });
       const res = await get(`/api/kpi-suggestion-runs/${fx.kpiRun.id}`);
       expect(res.status).toBe(200);
-      expect(res.body.run).toMatchObject({ id: fx.kpiRun.id, status: 'completed' });
+      expect(res.body.run).toMatchObject({ id: fx.kpiRun.id, status: 'completed', serverNow: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
       expect(res.body.suggestions.map((s: any) => s.status).sort()).toEqual(['pending', 'rejected']);
 
       const stale = await createKpiRunRow({ projectId: fx.project.id, frameworkId: fx.framework.id, data: { status: 'running', finishedAt: null, updatedAt: new Date(Date.now() - KPI_RUN_STALE_MS - 1000) } });
@@ -578,6 +621,103 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
       expect(statuses[unrelated.id]).toBe('pending');
     });
 
+    it('TQ-01/CC-03: two siblings accepted at the same time give one 201 and one 409 (never a 500), and one indicator', async () => {
+      for (let trial = 0; trial < 3; trial++) {
+        const first = await librarySuggestion(`Sibling A ${trial}`);
+        const second = await librarySuggestion(`Sibling B ${trial}`);
+        const answers = await Promise.all([accept(first.id), accept(second.id)]);
+        expect(answers.map(a => a.status).sort(), `trial ${trial}`).toEqual([201, 409]);
+        expect(['already_decided', 'stale', 'duplicate']).toContain(answers.find(a => a.status === 409)!.body.code);
+        expect(await prisma.indicator.count({ where: { frameworkId: fx.framework.id, libraryId: 'ED-02' } })).toBe(1);
+        await prisma.indicator.deleteMany({ where: { frameworkId: fx.framework.id, libraryId: 'ED-02' } });
+      }
+    });
+
+    it('CC-04: accept takes the project lock first, so it waits for a run that is saving its cards', async () => {
+      const release = deferred<void>();
+      const held = deferred<void>();
+      const holder = prisma.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`kpi-run:${fx.project.id}`}::text))`;
+        held.resolve();
+        await release.promise;
+      }, { timeout: 20_000 });
+      await held.promise;
+      const answer = accept(fx.kpiSuggestion.id).then(r => r);
+      await new Promise(resolve => setTimeout(resolve, 400));
+      expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: fx.kpiSuggestion.id } })).status).toBe('pending');
+      release.resolve();
+      await holder;
+      expect((await answer).status).toBe(201);
+    });
+
+    it('SPEC-8: replaceSource replaces the indicator an alternative was suggested for; never one with data', async () => {
+      const source = await prisma.indicator.create({
+        data: { frameworkId: fx.framework.id, resultId: fx.result.id, indicatorText: 'Increase literacy to 80%', level: 'outcome', dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: [] },
+      });
+      const alternative = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 2, 'Share of pupils reading at grade level'), data: { alternativeOfIndicatorId: source.id } });
+      const res = await accept(alternative.id, { replaceSource: true });
+      expect(res.status).toBe(201);
+      expect(res.body.replacedIndicatorId).toBe(source.id);
+      expect(await prisma.indicator.findUnique({ where: { id: source.id } })).toBeNull();
+      expect(await prisma.indicator.findUniqueOrThrow({ where: { id: res.body.indicator.id } })).toMatchObject({ indicatorText: 'Share of pupils reading at grade level' });
+
+      // The fixture indicator holds a data point: refused, nothing changes.
+      const withData = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 3, 'Another reading measure'), data: { alternativeOfIndicatorId: fx.indicator.id } });
+      const refused = await accept(withData.id, { replaceSource: true });
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe('source_has_data');
+      expect(await prisma.indicator.findUnique({ where: { id: fx.indicator.id } })).not.toBeNull();
+      expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: withData.id } })).status).toBe('pending');
+      // Without replaceSource both stay; a suggestion that is no alternative of an indicator cannot replace anything.
+      expect((await accept(withData.id)).body.replacedIndicatorId).toBeNull();
+      const plain = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 4, 'Plain card') });
+      expect((await accept(plain.id, { replaceSource: true })).status).toBe(400);
+    });
+
+    it('SPEC-8 (re-check): replacing the source expires its other alternatives first, so none becomes an extra indicator', async () => {
+      const source = await prisma.indicator.create({
+        data: { frameworkId: fx.framework.id, resultId: fx.result.id, indicatorText: 'Increase literacy to 80%', level: 'outcome', dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: [] },
+      });
+      const a1 = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 2, 'Share of pupils reading at grade level'), data: { alternativeOfIndicatorId: source.id } });
+      const a2 = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 3, 'Mean reading fluency score of pupils'), data: { alternativeOfIndicatorId: source.id } });
+      const res = await accept(a1.id, { replaceSource: true });
+      expect(res.status).toBe(201);
+      expect(res.body.replacedIndicatorId).toBe(source.id);
+      expect(await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: a2.id } })).toMatchObject({ status: 'expired' });
+      for (const body of [{}, { replaceSource: true }]) {
+        const again = await accept(a2.id, body);
+        expect(again.status).toBe(409);
+        expect(again.body.code).toBe('stale');
+      }
+      const onResult = await prisma.indicator.findMany({ where: { resultId: fx.result.id, indicatorText: { in: ['Share of pupils reading at grade level', 'Mean reading fluency score of pupils', 'Increase literacy to 80%'] } } });
+      expect(onResult.map(i => i.indicatorText)).toEqual(['Share of pupils reading at grade level']);
+    });
+
+    it('SPEC-8 (re-check): two alternatives of one indicator accepted at once with replaceSource: one 201, one 409, one indicator', async () => {
+      for (let t = 0; t < 4; t++) {
+        const source = await prisma.indicator.create({
+          data: { frameworkId: fx.framework.id, resultId: fx.result.id, indicatorText: `Weak ${t}`, level: 'outcome', dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: [] },
+        });
+        const a = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 1, `Alt X ${t}`), data: { alternativeOfIndicatorId: source.id } });
+        const b = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 2, `Alt Y ${t}`), data: { alternativeOfIndicatorId: source.id } });
+        const [r1, r2] = await Promise.all([
+          post(`/api/kpi-suggestions/${a.id}/accept`, { replaceSource: true }, fx.officerAuth),
+          post(`/api/kpi-suggestions/${b.id}/accept`, { replaceSource: true }, fx.adminAuth),
+        ]);
+        expect([r1.status, r2.status].sort()).toEqual([201, 409]);
+        const left = await prisma.indicator.findMany({ where: { resultId: fx.result.id, indicatorText: { in: [`Alt X ${t}`, `Alt Y ${t}`, `Weak ${t}`] } } });
+        expect(left).toHaveLength(1);
+        expect(left[0].indicatorText).toMatch(/^Alt [XY] /);
+      }
+    });
+
+    it('TQ-02: edits to fields the draft does not hold are refused (400 not_editable), never dropped silently', async () => {
+      const res = await accept(fx.kpiSuggestion.id, { edits: { indicatorText: 'Edited name', status: 'on_track', currentValue: '12', milestones: [] } });
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ code: 'not_editable', details: { keys: ['status', 'currentValue', 'milestones'] } });
+      expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: fx.kpiSuggestion.id } })).status).toBe('pending');
+    });
+
     it('warns donor_cap_exceeded when the result now has more indicators than the donor allows (never blocks)', async () => {
       await prisma.project.update({ where: { id: fx.project.id }, data: { donorType: 'echo' } });
       for (let i = 0; i < 2; i++) {
@@ -588,6 +728,17 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
       const res = await accept(fx.kpiSuggestion.id);
       expect(res.status).toBe(201);
       expect(res.body.warnings).toEqual([expect.objectContaining({ code: 'donor_cap_exceeded', params: { code: 'O1', cap: 3, count: 4 }, penalty: 0 })]);
+      expect(res.body.replacedIndicatorId).toBeNull();
+
+      // SPEC-8: an alternative that replaces its source does not add to the result's count.
+      const source = await prisma.indicator.create({
+        data: { frameworkId: fx.framework.id, resultId: fx.result.id, indicatorText: 'Weak indicator', level: 'outcome', dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: [] },
+      });
+      const before = await prisma.indicator.count({ where: { frameworkId: fx.framework.id, resultId: fx.result.id } });
+      const alternative = await createKpiSuggestionRow({ run: fx.kpiRun, suggestion: suggestion(fx.result, 2, 'Stronger replacement'), data: { alternativeOfIndicatorId: source.id } });
+      const replaced = await accept(alternative.id, { replaceSource: true });
+      expect(replaced.status).toBe(201);
+      expect(replaced.body.warnings).toEqual([expect.objectContaining({ code: 'donor_cap_exceeded', params: { code: 'O1', cap: 3, count: before } })]);
     });
   });
 
@@ -613,6 +764,25 @@ describe.skipIf(!hasTestDatabase)('KPI Assistant routes', () => {
       expect((await post(path, { reason: 'meh' })).status).toBe(400);
       expect((await post(path, { reason: 'other', note: 'x'.repeat(1001) })).status).toBe(400);
       expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: fx.kpiSuggestion.id } })).status).toBe('pending');
+    });
+
+    it('CC-05: reject takes the project lock, so a run saving its cards (which re-reads rejections) never misses it', async () => {
+      const release = deferred<void>();
+      const held = deferred<void>();
+      const holder = prisma.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`kpi-run:${fx.project.id}`}::text))`;
+        held.resolve();
+        await release.promise;
+      }, { timeout: 20_000 });
+      await held.promise;
+      const answer = post(`/api/kpi-suggestions/${fx.kpiSuggestion.id}/reject`, { reason: 'not_relevant' }).then(r => r);
+      await new Promise(resolve => setTimeout(resolve, 400));
+      // While a save holds the lock, the rejection waits: the save's reload of the organisation's decisions stays true.
+      expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: fx.kpiSuggestion.id } })).status).toBe('pending');
+      release.resolve();
+      await holder;
+      expect((await answer).status).toBe(200);
+      expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: fx.kpiSuggestion.id } })).status).toBe('rejected');
     });
   });
 

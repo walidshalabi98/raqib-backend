@@ -534,6 +534,22 @@ describe('frameworkNormalize: people-level disaggregation', () => {
     expect(isPeopleLevelIndicator('Megawatts installed', 'قدرة الطاقة المتجددة المركبة')).toBe(false);
   });
 
+  it('decides by the counted noun, not by a people word used as a modifier (AI-5 side effect)', () => {
+    for (const name of ['Number of water points serving displaced communities', 'Number of family tents distributed',
+      'Number of IDP sites with functioning latrines', 'Number of mother-and-baby spaces established', 'Number of youth-led initiatives funded',
+      "Number of teachers' guides distributed"]) {
+      expect(isPeopleLevelIndicator(name), name).toBe(false);
+    }
+    expect(isPeopleLevelIndicator('Number of family tents distributed', 'عدد الخيام العائلية الموزعة')).toBe(false);
+    expect(isPeopleLevelIndicator('Number of IDP sites with functioning latrines', 'عدد مواقع النازحين المزودة بمراحيض')).toBe(false);
+    for (const name of ['Number of displaced families receiving hygiene kits', 'Number of newly enrolled children', 'Number of children fully immunised',
+      'Number of heads of household trained', 'Number of boys and girls enrolled', 'Number of trained teachers',
+      'Average number of meals per day among children under five', 'Number of persons with disabilities accessing services',
+      'Number of young people trained']) {
+      expect(isPeopleLevelIndicator(name), name).toBe(true);
+    }
+  });
+
   it('recognises the wider list of people nouns in English and Arabic', () => {
     for (const name of [
       'Number of teachers trained', 'Number of health staff trained', 'Number of committee members trained', '% of residents satisfied',
@@ -793,7 +809,7 @@ describe('frameworkNormalize: baselines and targets (never invented)', () => {
     expect(resolveBaselineAndTarget({ ...base, baselineValue: '22%', baselineBasis: 'estimate' }, FIGURES).baselineValue).toBeNull();
   });
 
-  it('keeps a standard threshold only when the linked library entry\'s own text contains it', () => {
+  it('keeps a standard threshold only when it is a recognised threshold of the linked entry, in its unit and in its own text', () => {
     const wa01 = seedEntry('WA-01');
     const sphere = resolveBaselineAndTarget({
       ...base, targetValue: '15', targetBasis: 'standard_threshold', targetJustification: 'Sphere minimum of 15 l/p/d.',
@@ -804,23 +820,33 @@ describe('frameworkNormalize: baselines and targets (never invented)', () => {
       'Proposed standard threshold (Sphere Water supply standard — minimum 15 l/p/d (aim for 20)): Sphere minimum of 15 l/p/d — confirm it applies to this project.'
       + NO_INTERMEDIATE,
     );
+    const wa = (targetValue: string, unit?: string) => resolveBaselineAndTarget({
+      ...base, targetValue, targetBasis: 'standard_threshold', standardReferenceCode: null, libraryEntry: wa01, unit,
+    }, []).targetValue;
+    expect(wa('20')).toBe('20');
+    expect(wa('15 l/p/d', 'litres_per_person_per_day')).toBe('15 l/p/d');
+    // The unit must be the threshold's: a percentage, or "15%", is never the Sphere litres minimum.
+    expect(wa('15', 'percent')).toBeNull();
+    expect(wa('15%')).toBeNull();
 
-    // Notes, means of verification and calculation fields count too (case-insensitive, whole numbers only).
+    // SPEC-1: numbers in an entry's text are not thresholds: recall periods, cut-offs, durations, years, codes, notes.
     const entry = libEntry('ED-04', {
       notes: 'Define completed as AT LEAST 80% of sessions.', meansOfVerification: 'Attendance sheets for all 12 sessions',
       calculation: { numerator: 'Score of 42 or more', formula: 'numerator ÷ denominator × 100' },
     });
     const threshold = (targetValue: string, libraryEntry: LibraryEntryReference | null = entry, standardReferenceCode: string | null = null) =>
       resolveBaselineAndTarget({ ...base, targetValue, targetBasis: 'standard_threshold', standardReferenceCode, libraryEntry }, []);
-    expect(threshold('at least 80%').targetValue).toBe('at least 80%');
-    expect(threshold('12').targetValue).toBe('12');
-    expect(threshold('42').targetValue).toBe('42');
-    expect(threshold('42').targetJustification).toBe(`Proposed standard threshold (library entry ED-04) — confirm it applies to this project.${NO_INTERMEDIATE}`);
-    expect(threshold('4').targetValue).toBeNull(); // part of 42
+    for (const value of ['at least 80%', '12', '42', '4']) expect(threshold(value).targetValue, value).toBeNull();
     expect(libraryEntryTexts(entry)).toEqual([
       'Definition of ED-04', 'Define completed as AT LEAST 80% of sessions.', 'Attendance sheets for all 12 sessions',
       'Score of 42 or more', 'numerator ÷ denominator × 100',
     ]);
+    for (const [id, value] of [['FS-01', '35'], ['FS-01', '7'], ['FS-01', '42'], ['LV-01', '6'], ['AC-01', '2024'], ['AC-01', '5'],
+      ['WA-03', '0'], ['WA-02', '30'], ['HE-02', '4']] as const) {
+      const r = threshold(value, seedEntry(id));
+      expect(r.targetValue, `${id} ${value}`).toBeNull();
+      expect(r.targetJustification).toMatch(/^Proposed method: /);
+    }
 
     // A free-text standard reference is no longer enough, nor is a value missing from the linked entry.
     for (const r of [
@@ -913,7 +939,7 @@ describe('frameworkNormalize: indicators', () => {
     expect(p.calculation).toBeUndefined();
   });
 
-  it('keeps libraryId only when known, and takes the standard reference from the linked library entry', () => {
+  it('keeps libraryId only when known, and takes the standard reference (or none) from the linked library entry', () => {
     const [unknown, known, lower, overridden, custom, none] = normalizeIndicators([
       aiIndicator({ libraryId: 'IM-99', indicatorText: 'A', standardReferenceCode: 'IASC MHPSS O5.4' }),
       aiIndicator({ libraryId: 'LV-02', indicatorText: 'B' }),
@@ -927,8 +953,8 @@ describe('frameworkNormalize: indicators', () => {
     // The library's standard reference is authoritative over the model's code …
     expect(lower).toMatchObject({ libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)' });
     expect(overridden.standardReferenceCode).toBe('EU GERF 2.14');
-    // … and the model's code is kept only when the linked entry has no standard reference.
-    expect(custom).toMatchObject({ libraryId: 'LV-01', standardReferenceCode: 'SDG 8.5.2' });
+    // … and a linked entry without a standard reference carries no code, whatever the model wrote (SPEC-4 re-check).
+    expect(custom).toMatchObject({ libraryId: 'LV-01', standardReferenceCode: null });
     expect(none.standardReferenceCode).toBeNull();
   });
 
@@ -1504,6 +1530,8 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
         libraryEntry('AC-03', 'other', 'outcome', '% of assisted people who feel treated with respect', { framework: 'Core Humanitarian Standard (2024)', code: 'Commitment 4 (aligned)' }, { unit: 'percent', disaggregation: ['sex', 'age', 'disability'] }),
         libraryEntry('HE-03', 'health', 'output', 'Number of consultations provided', null, { notes: 'Facilities aim for at least 1,500 consultations per quarter.', isStandard: true }),
         libraryEntry('FS-01', 'food_security', 'outcome', '% of households with an acceptable FCS', { framework: 'WFP', code: 'Food Consumption Score' }, { disaggregation: ['sex_of_household_head', 'location'], unit: 'percent' }),
+        libraryEntry('WA-01', 'wash', 'outcome', 'Average volume of water available per person per day', { framework: 'Sphere', code: 'Water supply standard — minimum 15 l/p/d (aim for 20)' },
+          { unit: 'litres_per_person_per_day', disaggregation: ['location'] }),
       ],
     });
   });
@@ -1587,8 +1615,9 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(indicatorPrompt).toContain('AC-01 [outcome]');
     expect(indicatorPrompt).not.toContain('HE-03');
     expect(indicatorPrompt).toContain('max indicators per result (existing and new together): 3');
-    expect(indicatorPrompt).toMatch(/\[F\d+ target\] proposal\.pdf: "60% of graduates are expected to be employed"/);
-    expect(indicatorPrompt).toMatch(/\[F\d+ baseline\] proposal\.pdf: "found a youth employment rate of 22% in the three governorates"/);
+    // Generation facts name their verified figure and result code (AI-3).
+    expect(indicatorPrompt).toMatch(/\[F\d+ target O1\] proposal\.pdf: target "60%" — "60% of graduates are expected to be employed"/);
+    expect(indicatorPrompt).toMatch(/\[F\d+ baseline G\] proposal\.pdf: baseline "22%" — "found a youth employment rate of 22% in the three governorates"/);
     expect(indicatorPrompt).not.toContain('31%');
     expect(indicatorPrompt).not.toContain('A1.1.1');
 
@@ -1800,9 +1829,12 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     mockAi({
       indicators: {
         suggestions: [
-          // HE-03 (health) is not a candidate for a livelihoods project; its notes hold the threshold.
+          // HE-03 (health) is not a candidate for a livelihoods project; a number in its notes is no recognised threshold (SPEC-1).
           kpiSuggestion({ resultCode: 'O1.1', level: 'output', name: 'Number of consultations provided', nameAr: 'عدد الاستشارات المقدمة', libraryId: 'he-03', unit: 'number',
             numerator: '', denominator: '', disaggregation: [], targetSuggestion: '1,500', targetBasis: 'standard_threshold', method: 'document_review' }),
+          // WA-01 (wash) is not a candidate either; its Sphere minimum is a recognised threshold, checked against the linked entry.
+          kpiSuggestion({ name: 'Average litres of water per person per day', nameAr: 'متوسط لترات المياه للفرد يومياً', libraryId: 'WA-01', unit: 'litres_per_person_per_day',
+            numerator: '', denominator: '', disaggregation: ['location'], targetSuggestion: '15', targetBasis: 'standard_threshold', method: 'hh_survey' }),
           // A free-text standard reference does not make an invented threshold acceptable; the library's reference replaces it.
           kpiSuggestion({ resultCode: 'O1.1', level: 'output', name: 'Number of people benefiting from vocational training', nameAr: 'عدد المستفيدين من التدريب المهني',
             libraryId: 'LV-02', unit: 'number', numerator: '', denominator: '', targetSuggestion: '900', targetBasis: 'standard_threshold',
@@ -1820,8 +1852,10 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
 
     const indicators = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
     const byLibrary = Object.fromEntries(indicators.map(i => [i.libraryId, i]));
-    expect(byLibrary['HE-03']).toMatchObject({ targetValue: '1,500', disaggregation: ['sex'] });
-    expect(byLibrary['HE-03'].targetJustification).toMatch(/^Proposed standard threshold/);
+    expect(byLibrary['HE-03']).toMatchObject({ targetValue: null, disaggregation: ['sex'] });
+    expect(byLibrary['HE-03'].targetJustification).toMatch(/^Proposed method: .* The standard threshold proposed by the AI was not found in the linked library entry/);
+    expect(byLibrary['WA-01']).toMatchObject({ targetValue: '15', standardReferenceCode: 'Sphere Water supply standard — minimum 15 l/p/d (aim for 20)' });
+    expect(byLibrary['WA-01'].targetJustification).toMatch(/^Proposed standard threshold \(Sphere Water supply standard/);
     expect(byLibrary['LV-02']).toMatchObject({ targetValue: null, standardReferenceCode: 'EU GERF 2.14' });
     expect(byLibrary['LV-02'].targetJustification).toMatch(/^Proposed method: .* The standard threshold proposed by the AI was not found in the linked library entry/);
     expect(byLibrary['FS-01']).toMatchObject({ standardReferenceCode: 'WFP Food Consumption Score', disaggregation: ['sex_of_household_head', 'location'] });
@@ -1843,11 +1877,14 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
-    // Six results: a batch of four (the goal, then O1 with its outputs) and a batch of two (O2 with its output).
+    // Six results: a batch of four (the goal, then O1 with its outputs) and a batch of two (O2 with its output); then one
+    // call each for the results the answers left without an indicator (AI-2).
     expect(featureSteps()).toEqual(['framework.indicators']);
     const batches = allCalls().map(p => suggestForCodes(p.messages[0].content));
-    expect(batches).toEqual([['G', 'O1', 'O1.1', 'O1.2'], ['O2', 'O2.1']]);
-    expect(allCalls().every(p => p.effort === 'low' && p.maxTokens === KPI_CALLS.batch.maxTokens && p.promptVersion === KPI_PROMPT_VERSION)).toBe(true);
+    expect(batches.slice(0, 2)).toEqual([['G', 'O1', 'O1.1', 'O1.2'], ['O2', 'O2.1']]);
+    expect(batches.slice(2).map(b => b.join()).sort()).toEqual(['O1', 'O1.2', 'O2', 'O2.1']);
+    expect(allCalls().slice(0, 2).every(p => p.effort === 'low' && p.maxTokens === KPI_CALLS.batch.maxTokens && p.promptVersion === KPI_PROMPT_VERSION)).toBe(true);
+    expect(allCalls().slice(2).every(p => p.maxTokens === KPI_CALLS.result.maxTokens)).toBe(true);
     expect(indicatorPrompts()).toContain('none: no document values are available');
     expect(indicatorPrompts()).toContain('HE-03 [output]');
 
@@ -1860,6 +1897,13 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(indicators).toHaveLength(2);
     expect(indicators[0]).toMatchObject({ baselineValue: null, targetValue: null, resultId: nodes.find(n => n.code === 'G')!.id });
     expect(indicators[1]).toMatchObject({ libraryId: 'HE-03', resultId: nodes.find(n => n.code === 'O1.1')!.id });
+    // The admins' notification names the results left without an indicator (AI-2).
+    const notes = await prisma.notification.findMany({ where: { type: 'framework_approved', link: `/projects/${project.id}/framework` } });
+    expect(notes.length).toBeGreaterThan(0);
+    for (const note of notes) {
+      const named = /No indicator could be generated for ([^;]+);/.exec(note.message)?.[1].split(', ').sort();
+      expect(named).toEqual(['O1', 'O1.2', 'O2', 'O2.1']);
+    }
   });
 
   it.each([

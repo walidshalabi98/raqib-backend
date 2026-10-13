@@ -38,14 +38,16 @@ import { KPI_PROMPT_VERSION, KPI_SUGGESTIONS_SCHEMA, KPI_SYSTEM } from '../src/s
 import { defaultModelCaller } from '../src/services/kpi/callModel';
 import { runKpiPipeline } from '../src/services/kpi/pipeline';
 import { fileLibrarySource } from '../src/services/kpi/librarySource';
+import { loadLibraryFile } from '../src/services/library/load';
 import type { KpiCallInfo, KpiPipelineDeps, ModelCaller, ValidatedSuggestion } from '../src/services/kpi/types';
 import { checkAssertions, failAllAssertions } from '../src/services/kpi/eval/assertions';
 import { caseToContext, firstOutcome, loadEvalCases, type EvalCase } from '../src/services/kpi/eval/cases';
 import {
-  FAKE_HALLUCINATED_VALUE, FAKE_KPI_MODEL, FAKE_UNKNOWN_LIBRARY_ID, fakeKpiModelCaller, firstTargetFactNumber,
+  FAKE_HALLUCINATED_VALUE, FAKE_KPI_MODEL, FAKE_UNKNOWN_LIBRARY_ID, accountabilityRequests, fakeKpiModelCaller, firstTargetFactNumber,
 } from '../src/services/kpi/eval/fakeModel';
 import {
-  DEFAULT_EVAL_TARGETS, baselinesFromTargetSentences, evalPassed, hallucinatedTargets, summarise, valueInFactsIndependent, type EvalCaseRun,
+  DEFAULT_EVAL_TARGETS, baselinesFromTargetSentences, evalPassed, hallucinatedTargets, summarise, thresholdsOutsideList, valueInFactsIndependent,
+  type EvalCaseRun,
 } from '../src/services/kpi/eval/metrics';
 import { formatSummaryTable, formatTable, reportFileName, writeReport } from '../src/services/kpi/eval/report';
 import { runEval } from '../src/services/kpi/eval/runner';
@@ -53,7 +55,7 @@ import {
   EVAL_DATABASE_PLACEHOLDER, EXIT_FAILED, EXIT_PASSED, EXIT_REFUSED, FAKE_EVAL_API_KEY, evalRefusal, parseEvalArgs, prepareEvalEnvironment, selectCases,
   systemPromptVersionOf,
 } from '../scripts/eval-kpi';
-import { fakeSdk, libraryEntry, rawFromEntry, rawMessage, suggestForLines } from './aiFakes';
+import { fakeSdk, libraryEntry, rawFromEntry, rawMessage, suggestForLines, truncatedMessage } from './aiFakes';
 import { kpiValidatedSuggestionFixture } from './helpers';
 
 const { cases: CASES, version: CASES_VERSION } = loadEvalCases();
@@ -82,7 +84,7 @@ function caseRun(overrides: Partial<EvalCaseRun> = {}): EvalCaseRun {
   return {
     id: 'CASE-X', error: null, suggestions: [vs('O1', { libraryId: 'WA-01', isCustom: false })], frameworkWarnings: [],
     assertions: [{ type: 'maxPerResult', key: null, passed: true, detail: '' }], rawCount: 1, hallucinatedBefore: 0, hallucinatedAfter: 0,
-    baselinesFromTargetSentences: 0, candidateIdsByResult: { O1: ['WA-01'] }, calls: [call({ resultCodes: ['O1', 'O1.1'], latencyMs: 20_000 })],
+    baselinesFromTargetSentences: 0, thresholdsOutsideList: 0, candidateIdsByResult: { O1: ['WA-01'] }, calls: [call({ resultCodes: ['O1', 'O1.1'], latencyMs: 20_000 })],
     resultCalls: [call()], resultRawCount: 3,
     ...overrides,
   };
@@ -194,6 +196,49 @@ describe('valueInFactsIndependent, hallucinatedTargets and baselinesFromTargetSe
     expect(baselinesFromTargetSentences([vs('O1', { baselineBasis: 'document', baselineSuggestion: '٣٠' })], facts('سيتم تدريب ٣٠ معلمًا'))).toBe(1);
     expect(baselinesFromTargetSentences([vs('O1', { baselineBasis: 'none', baselineSuggestion: '' })], f)).toBe(0);
   });
+
+  it('SPEC-2: counts the target of "from X to Y" and plans after "currently"; not the X of "from X to Y" or "up from X"', () => {
+    const base = (value: string, ...excerpts: string[]) => baselinesFromTargetSentences([vs('O1', { baselineBasis: 'document', baselineSuggestion: value })], facts(...excerpts));
+    const logframe = 'The target is to raise the share of households treating water from 30% at baseline to 60% by the end of 2027.';
+    expect(base('60%', logframe)).toBe(1);
+    expect(base('30%', logframe)).toBe(0);
+    const upFrom = 'By the end of the project, 75% of households, up from 45% in the 2025 survey, will treat their drinking water.';
+    expect(base('75%', upFrom)).toBe(1);
+    expect(base('45%', upFrom)).toBe(0);
+    expect(base('600', 'The organisation currently plans to train 600 young women and men in Hebron.')).toBe(1);
+    expect(base('450', 'As of the end of year two, 450 graduates will have found work.')).toBe(1);
+  });
+
+  it('re-check SPEC-2: counts plans after a time cue without a comma; never a dated comparison point', () => {
+    const base = (value: string, ...excerpts: string[]) => baselinesFromTargetSentences([vs('O1', { baselineBasis: 'document', baselineSuggestion: value })], facts(...excerpts));
+    expect(base('450', 'As of the end of year two 450 graduates will have found work.')).toBe(1);
+    expect(base('600', 'Currently 600 young people are planned to be trained.')).toBe(1);
+    expect(base('600', 'The organisation currently intends to train 600 young people.')).toBe(1);
+    expect(base('45%', 'Currently 45% of households have an acceptable FCS and the project will raise this to 70% by 2027.')).toBe(0);
+    for (const text of [
+      'By 2027, 75% of households will have acceptable FCS compared with 45% in 2025.',
+      'By 2027, 75% of households will have acceptable FCS against 45% in 2025.',
+      'The project will raise acceptable FCS to 75% (45% in 2025).',
+      'Acceptable FCS was 45% in 2025 and the project will raise it to 75% by 2027.',
+    ]) {
+      expect(base('45%', text), text).toBe(0);
+      expect(base('75%', text), text).toBe(1);
+    }
+  });
+
+  it('SPEC-1: counts standard-threshold targets that are not a recognised threshold of their library entry', () => {
+    expect(thresholdsOutsideList([
+      vs('O1', { libraryId: 'WA-01', targetBasis: 'standard_threshold', targetSuggestion: '15' }),
+      vs('O1', { libraryId: 'WA-01', targetBasis: 'standard_threshold', targetSuggestion: '20 l/p/d' }),
+      vs('O1', { libraryId: 'FS-01', targetBasis: 'standard_threshold', targetSuggestion: '35' }),
+      vs('O1', { libraryId: 'AC-01', targetBasis: 'standard_threshold', targetSuggestion: '2024' }),
+      vs('O1', { libraryId: null, targetBasis: 'standard_threshold', targetSuggestion: '15' }),
+      vs('O1', { libraryId: 'FS-01', targetBasis: 'method_only', targetSuggestion: '35' }),
+    ])).toBe(3);
+    const summary = summarise([caseRun({ thresholdsOutsideList: 2 })]);
+    expect(summary).toMatchObject({ thresholdsOutsideList: 2, passed: { thresholds: false } });
+    expect(evalPassed(summary)).toBe(false);
+  });
 });
 
 describe('summarise and the target flags', () => {
@@ -265,6 +310,8 @@ describe('summarise and the target flags', () => {
     expect(budget.incompleteReasons).toEqual(['budget reached after 1 case(s)']);
     expect(evalPassed(budget)).toBe(false);
 
+    const emptyResult = summarise([caseRun({ frameworkWarnings: [{ code: 'result_empty', severity: 'warning', message: '', params: { code: 'O2.1' }, penalty: 0 }] })]);
+    expect(emptyResult).toMatchObject({ status: 'incomplete', incompleteReasons: ['1 result(s) without suggestions'] });
     const failedResult = summarise([caseRun({ frameworkWarnings: [{ code: 'result_failed', severity: 'warning', message: '', params: { code: 'O2', reason: 'truncated' }, penalty: 0 }] })]);
     expect(failedResult.incompleteReasons).toEqual(['1 result(s) failed']);
     expect(summarise([]).incompleteReasons).toEqual(['no case ran']);
@@ -312,6 +359,29 @@ describe('checkAssertions', () => {
     expect(failing[0]).toMatchObject({ passed: false, detail: '1 people-level suggestion(s) without sex: O1#1 (custom)' });
   });
 
+  it('AI-5: peopleIndicatorsHaveSex uses its own people words, so families and adolescents without sex fail', () => {
+    const c = withAssertions({ peopleIndicatorsHaveSex: true });
+    for (const [name, nameAr] of [
+      ['Number of displaced families receiving hygiene kits', 'عدد العائلات النازحة التي تلقت حقائب النظافة'],
+      ['Number of adolescents attending hygiene sessions', 'عدد المراهقين الذين حضروا جلسات النظافة'],
+      ['Number of IDPs reached', 'عدد النازحين الذين تم الوصول إليهم'],
+    ]) {
+      expect(only(c, [vs('O1', { name, nameAr, disaggregation: ['location'] })])[0].passed, name).toBe(false);
+    }
+  });
+
+  it('SPEC-3: noTargetInName uses its own check, so names with a target value or a leading count fail', () => {
+    const c = withAssertions({ noTargetInName: true });
+    for (const name of ['Number of displaced households receiving food vouchers (target: 3,500)', '3,500 displaced households receiving food vouchers',
+      'At least 3,500 households receive food vouchers', 'Number of youth trained, 500 by end of project',
+      'Doubling the number of households with acceptable FCS']) {
+      expect(only(c, [vs('O1', { name })])[0].passed, name).toBe(false);
+    }
+    expect(only(c, [vs('O1', { name: 'Number of households with acceptable FCS', nameAr: 'مضاعفة عدد الأسر ذات الاستهلاك الغذائي المقبول' })])[0].passed).toBe(false);
+    expect(only(c, [vs('O1', { name: 'Reduced Coping Strategies Index (rCSI) score of target households' })])[0].passed).toBe(true);
+    for (const e of loadLibraryFile().entries) expect(only(c, [vs('O1', { name: e.name, nameAr: e.nameAr })])[0].passed, e.id).toBe(true);
+  });
+
   it('noTargetsWithoutBasis uses the independent match on the case facts (targets and baselines)', () => {
     const c = withAssertions({ noTargetsWithoutBasis: true });
     expect(only(c, [vs('O1.1', { targetBasis: 'document', targetSuggestion: '18' }), vs('O1', { targetBasis: 'method_only', targetSuggestion: '75' })])[0].passed).toBe(true);
@@ -336,6 +406,15 @@ describe('checkAssertions', () => {
     // Accountability wording on a library-linked sector indicator does not count.
     expect(only(c, [vs('O1', { libraryId: 'HE-04', name: '% of patients satisfied with feedback handling' })])[0].passed).toBe(false);
     expect(only(c, [])[0].passed).toBe(false);
+  });
+
+  it('AI-5: the validator\'s appended accountability indicator never passes hasAccountabilityIndicator or lifts the quality average', () => {
+    const c = withAssertions({ hasAccountabilityIndicator: true, minQualityScoreAverage: 80 });
+    const appendedOnly = only(c, [vs('O1', { libraryId: 'WA-02', qualityScore: 70 }), vs('O1', { libraryId: 'AC-01', origin: 'appended_accountability', qualityScore: 100 })]);
+    expect(appendedOnly.map(r => [r.type, r.passed])).toEqual([['hasAccountabilityIndicator', false], ['minQualityScoreAverage', false]]);
+    expect(appendedOnly[0].detail).toBe('the model suggested none; the validator appended AC-01');
+    expect(appendedOnly[1].detail).toBe('average 70.0 (min 80)');
+    expect(only(c, [vs('O1', { libraryId: 'AC-03', qualityScore: 90 })]).map(r => r.passed)).toEqual([true, true]);
   });
 
   it('arabicNamesPresent and minQualityScoreAverage', () => {
@@ -382,7 +461,9 @@ describe('fakeKpiModelCaller', () => {
       for (const result of request.meta.batch) {
         const own = response.data.suggestions.filter(s => s.resultCode === result.code);
         expect(own.length).toBeLessThanOrEqual(Math.min(3, request.meta.allowances[result.id].max));
-        for (const s of own) expect(request.meta.candidateIdsByResult[result.id]).toContain(s.libraryId);
+        // A candidate of the result, or the accountability id the prompt asks this result for (rule 19).
+        const allowed = [...(request.meta.candidateIdsByResult[result.id] ?? []), ...(accountabilityRequests(request.user).get(result.code) ?? [])];
+        for (const s of own) expect(allowed).toContain(s.libraryId);
       }
       expect(response).toMatchObject({ model: FAKE_KPI_MODEL, estimatedCostUsd: 0, aiCallId: null, usage: { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } });
       expect(response.usage.outputTokens).toBe(Math.ceil(JSON.stringify(response.data).length / 4));
@@ -446,6 +527,8 @@ describe('runEval', () => {
     // CASE-01 (DG ECHO, humanitarian): at most 3 per result and an accountability indicator.
     const case01 = report.cases[0];
     expect(case01.assertions.filter(a => ['maxPerResult', 'hasAccountabilityIndicator'].includes(a.type)).every(a => a.passed)).toBe(true);
+    // The fake follows the prompt's accountability request, so the model's own suggestion passes (not the appended one).
+    expect(case01.suggestions.some(s => s.origin === 'model' && (s.libraryId ?? '').startsWith('AC-'))).toBe(true);
     // The report keeps no drafts (no reference-sheet text beyond the suggestion fields).
     expect(report.cases.every(c => c.suggestions.every(s => !('draft' in s)))).toBe(true);
     expect(lines).toHaveLength(8);
@@ -517,6 +600,37 @@ describe('the real client path', () => {
     resetAiClientForTests();
   });
 
+  it('AI-4: a truncated batch counts its tokens and cost in the report and in the --max-usd budget', async () => {
+    quiet();
+    const records: AiCallRecord[] = [];
+    // Multi-result calls are cut off (twice: the client retries at 2×); one-result calls answer with the first candidate.
+    const sdk = fakeSdk(body => {
+      const lines = suggestForLines(body.messages[0].content as string);
+      if (lines.length > 1) return truncatedMessage(body.model);
+      const answer = { suggestions: lines.flatMap(l => l.candidates.slice(0, 1).map(id => rawFromEntry(libraryEntry(id), l.code, { level: l.level as 'outcome' }))), frameworkWarnings: [] };
+      return rawMessage(body.model, answer, { output: 200 });
+    });
+    configureAiClientForTests({ anthropic: sdk.client });
+    setAiCallLogger(async record => { records.push(record); return null; });
+
+    const report = await runEval({ cases: [CASE_01], deps: fakeDeps(defaultModelCaller), maxUsd: 3, resultCheck: false, now: () => new Date(), log: () => {} });
+    const truncated = report.cases[0].calls.filter(c => c.outcome === 'truncated');
+    expect(truncated.length).toBeGreaterThan(0);
+    for (const call of truncated) {
+      expect(call.outputTokens).toBe(12_000);
+      expect(call.estimatedCostUsd).toBeGreaterThan(0);
+    }
+    const billed = records.reduce((n, r) => n + (r.estimatedCostUsd ?? 0), 0);
+    expect(report.summary.costUsd).toBeCloseTo(billed, 6);
+    expect(report.summary.costUsd).toBeGreaterThan(truncated.length * 0.1);
+
+    // The budget check sees the truncated calls: a cap below their cost stops the next case.
+    records.length = 0;
+    const capped = await runEval({ cases: [CASE_01, CASE_02], deps: fakeDeps(defaultModelCaller), maxUsd: 0.1, resultCheck: false, now: () => new Date(), log: () => {} });
+    expect(capped.budgetReachedAfter).toBe(1);
+    expect(capped.cases).toHaveLength(1);
+  });
+
   it('a kpi.suggest call goes through client.ts with output_config.format from KPI_SUGGESTIONS_SCHEMA; setAiCallLogger keeps it off the database', async () => {
     quiet();
     const records: AiCallRecord[] = [];
@@ -566,7 +680,7 @@ describe('report', () => {
     expect(table).toMatch(/^CASE-X\s+1 \(\+0 AC\)\s+1\/1\s+100%\s+100\s+0→0\s+0\s+0\.04\s+8\.0\s+20\.0\s+300$/m);
     expect(table).toMatch(/^total\s+1 \(\+0 AC\)\s+1\/1 100%\s+100%\s+100\s+0→0\s+0\s+0\.04\s+p50 8\.0 \/ max 8\.0/m);
     expect(table).toMatch(/^target\s+≥ 90%\s+≥ 70%\s+≥ 80\s+final 0\s+0\s+—\s+p50 < 15, max < 30$/m);
-    expect(table).toContain('result complete · schema validity 100% PASS · assertions PASS · library PASS · hallucinated PASS · baselines PASS · quality PASS · latency PASS');
+    expect(table).toContain('result complete · schema validity 100% PASS · assertions PASS · library PASS · hallucinated PASS · baselines PASS · thresholds 0 PASS · quality PASS · latency PASS');
     expect(formatTable(['a', 'bb'], [['1', '2'], ['333', '4']])).toBe('a    bb\n---  --\n1    2\n333  4');
   });
 });

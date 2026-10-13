@@ -105,6 +105,13 @@ export function errorHandler(err: Error, _req: Request, res: Response, _next: Ne
     }
   }
 
+  // A write conflict or deadlock with a simultaneous request (Prisma P2034, PostgreSQL 40001/40P01): the request changed
+  // nothing and can be repeated; 409, never 500 (CC-03).
+  if (isWriteConflict(err)) {
+    res.status(409).json({ message: 'This change conflicted with another change made at the same time. Reload and try again.', code: 'conflict' });
+    return;
+  }
+
   // Prisma validation errors (bad enum values, etc.)
   if (err.constructor?.name === 'PrismaClientValidationError') {
     res.status(400).json({ message: 'Invalid data provided. Check field values.' });
@@ -112,4 +119,23 @@ export function errorHandler(err: Error, _req: Request, res: Response, _next: Ne
   }
 
   res.status(500).json({ message: 'Internal server error' });
+}
+
+/**
+ * True for a transaction that PostgreSQL aborted because of a simultaneous one: Prisma P2034 ("write conflict or a
+ * deadlock"), or an unknown request error that carries SQLSTATE 40P01 (deadlock detected) or 40001 (serialization
+ * failure). Only the codes are read, never the message text of the query.
+ */
+export function isWriteConflict(err: unknown): boolean {
+  const e = err as { constructor?: { name?: string }; code?: unknown; message?: unknown; meta?: { code?: unknown } } | null;
+  if (!e || typeof e !== 'object') return false;
+  const name = e.constructor?.name;
+  if (name === 'PrismaClientKnownRequestError') {
+    return e.code === 'P2034' || e.meta?.code === '40P01' || e.meta?.code === '40001';
+  }
+  if (name === 'PrismaClientUnknownRequestError') {
+    const message = typeof e.message === 'string' ? e.message : '';
+    return /\b40P01\b|\b40001\b|deadlock detected|could not serialize access/.test(message);
+  }
+  return false;
 }

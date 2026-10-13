@@ -19,6 +19,7 @@ import { buildProjectContext, KpiContextError } from './context';
 import { productionPipelineDeps } from './deps';
 import { normalisedIndicatorName } from './nameRules';
 import { KpiPipelineError, runKpiPipeline } from './pipeline';
+import { loadOrgPreferences } from './preferences';
 import { qualityBand, warning } from './validate';
 import type {
   KpiErrorCode, KpiPipelineDeps, KpiPipelineResult, KpiRunDto, KpiRunStep, KpiScope, KpiSuggestionDto, KpiWarning,
@@ -59,10 +60,11 @@ class RunNoLongerRunning extends Error {
 }
 
 /**
- * pg_advisory_xact_lock(hashtext('kpi-run:' || projectId)): serialises run creation and persistence per project until
- * the transaction ends (design 7.2 step 8, SDA-04). Two simultaneous POSTs can no longer both pass the conflict check.
+ * pg_advisory_xact_lock(hashtext('kpi-run:' || projectId)): serialises run creation, persistence, accept and reject per
+ * project until the transaction ends (design 7.2 step 8, SDA-04; CC-03, CC-04). Two simultaneous POSTs can no longer both
+ * pass the conflict check, two accepts of related cards queue instead of deadlocking, and persistence sees every decision.
  */
-async function lockProject(tx: Prisma.TransactionClient, projectId: string): Promise<void> {
+export async function lockProject(tx: Prisma.TransactionClient, projectId: string): Promise<void> {
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`kpi-run:${projectId}`}::text))`;
 }
 
@@ -163,12 +165,16 @@ const payloadName = (payload: unknown): string => {
   return typeof name === 'string' ? name : '';
 };
 
-/** A suggestion dropped while saving: its result was deleted meanwhile, or it repeats an indicator or a pending card. */
-export interface PersistenceDrop { resultCode: string; name: string; reason: 'result_deleted' | 'duplicate' }
+/**
+ * A suggestion dropped while saving: its result was deleted meanwhile, it repeats an indicator or a pending card, or its
+ * library id was rejected while the run was preparing (CC-05).
+ */
+export interface PersistenceDrop { resultCode: string; name: string; reason: 'result_deleted' | 'duplicate' | 'rejected'; libraryId?: string | null }
 
 /**
  * The persistence plan of a finished pipeline (design 4.5; pure, exported for tests):
- * - suggestions whose result no longer exists are dropped;
+ * - suggestions whose result no longer exists are dropped, and so are those whose library id the organisation's decisions
+ *   exclude at save time (rejectedLibraryIds: a rejection made while the run was preparing; CC-05);
  * - pending suggestions this run expires: created before the run started, never alternatives (alternativeOf* set), only
  *   for result/framework runs (alternatives runs expire nothing), and only on results that keep at least one new
  *   suggestion (results the run skipped or that failed keep their cards; SDA-11);
@@ -184,12 +190,22 @@ export function planPersistence(input: {
   indicators: ReadonlyArray<{ resultId: string | null; libraryId: string | null; indicatorText: string }>;
   pending: ReadonlyArray<{ id: string; resultId: string | null; libraryId: string | null; payload: unknown; createdAt: Date;
     alternativeOfIndicatorId: string | null; alternativeOfSuggestionId: string | null }>;
+  /** Library ids the organisation's decisions exclude now (loadOrgPreferences at save time; CC-05). */
+  rejectedLibraryIds?: readonly string[];
 }): { kept: ValidatedSuggestion[]; expireIds: string[]; dropped: PersistenceDrop[] } {
   const dropped: PersistenceDrop[] = [];
+  const rejected = new Set((input.rejectedLibraryIds ?? []).map(id => id.trim().toUpperCase()));
   const live = input.suggestions.filter(s => {
-    if (input.liveResultIds.has(s.resultId)) return true;
-    dropped.push({ resultCode: s.resultCode, name: s.name, reason: 'result_deleted' });
-    return false;
+    if (!input.liveResultIds.has(s.resultId)) {
+      dropped.push({ resultCode: s.resultCode, name: s.name, reason: 'result_deleted' });
+      return false;
+    }
+    // A library id rejected while this run was preparing (its context predates the decision; BUILD_GUIDE Phase 4 criterion 4).
+    if (s.libraryId && rejected.has(s.libraryId.trim().toUpperCase())) {
+      dropped.push({ resultCode: s.resultCode, name: s.name, reason: 'rejected', libraryId: s.libraryId.trim().toUpperCase() });
+      return false;
+    }
+    return true;
   });
 
   const expirable = input.scopeType === 'alternatives' ? [] : input.pending.filter(p => p.resultId !== null
@@ -225,16 +241,17 @@ export function planPersistence(input: {
 const MAX_WARNING_NAME_CHARS = 60;
 
 /**
- * near_duplicate framework warnings for suggestions dropped while saving because they repeat an indicator or a pending
- * card created meanwhile (rule 18 at save time). Names are the validated (redacted) suggestion names, clipped.
+ * Framework warnings for suggestions dropped while saving: near_duplicate when they repeat an indicator or a pending card
+ * created meanwhile (rule 18 at save time), rejected_library_dropped when their library id was rejected meanwhile
+ * (CC-05). Names are the validated (redacted) suggestion names, clipped.
  */
 export function persistenceWarnings(dropped: readonly PersistenceDrop[]): KpiWarning[] {
-  return dropped
-    .filter(d => d.reason === 'duplicate')
-    .map(d => {
-      const name = d.name.trim();
-      return warning('near_duplicate', { name: name.length > MAX_WARNING_NAME_CHARS ? `${name.slice(0, MAX_WARNING_NAME_CHARS - 1)}…` : name });
-    });
+  return dropped.flatMap(d => {
+    if (d.reason === 'rejected') return [warning('rejected_library_dropped', { libraryId: d.libraryId ?? '' })];
+    if (d.reason !== 'duplicate') return [];
+    const name = d.name.trim();
+    return [warning('near_duplicate', { name: name.length > MAX_WARNING_NAME_CHARS ? `${name.slice(0, MAX_WARNING_NAME_CHARS - 1)}…` : name })];
+  });
 }
 
 /**
@@ -242,7 +259,8 @@ export function persistenceWarnings(dropped: readonly PersistenceDrop[]): KpiWar
  * touches updatedAt (so a live run is never reported stale however long one model call takes); step 'context' →
  * buildProjectContext → runKpiPipeline (onStep stores the step, onProgress touches updatedAt) → step 'saving' → one
  * interactive transaction under the project's advisory lock: conditional claim (a run marked interrupted meanwhile is
- * rolled back and its results discarded), current-framework re-check (else failed 'stale'), planPersistence, createMany,
+ * rolled back and its results discarded), current-framework re-check (else failed 'stale'), the organisation's decisions
+ * reloaded (loadOrgPreferences: a library id rejected meanwhile is dropped; CC-05), planPersistence, createMany,
  * expiry, conditional completion with counts, token and cost sums. Any error → failed with errorCodeFor(err)
  * (conditional on running). Never throws.
  */
@@ -263,7 +281,7 @@ export async function executeKpiRun(runId: string, deps: KpiRunDeps): Promise<vo
   };
 
   try {
-    const run = await db.kpiSuggestionRun.findUnique({ where: { id: runId }, include: { project: { select: { organizationId: true } } } });
+    const run = await db.kpiSuggestionRun.findUnique({ where: { id: runId }, include: { project: { select: { organizationId: true, donorType: true } } } });
     if (!run || run.status !== 'running') return;
     const { projectId, frameworkId } = run;
     const organizationId = run.project.organizationId;
@@ -287,13 +305,15 @@ export async function executeKpiRun(runId: string, deps: KpiRunDeps): Promise<vo
       }
 
       const resultIds = Array.from(new Set(result.suggestions.map(s => s.resultId)));
-      const [liveResults, indicators, pending] = await Promise.all([
+      const [liveResults, indicators, pending, preferences] = await Promise.all([
         tx.resultNode.findMany({ where: { id: { in: resultIds }, frameworkId, level: { not: 'activity' } }, select: { id: true } }),
         tx.indicator.findMany({ where: { frameworkId, resultId: { in: resultIds } }, select: { resultId: true, libraryId: true, indicatorText: true } }),
         tx.kpiSuggestion.findMany({
           where: { frameworkId, status: 'pending', resultId: { in: resultIds } },
           select: { id: true, resultId: true, libraryId: true, payload: true, createdAt: true, alternativeOfIndicatorId: true, alternativeOfSuggestionId: true },
         }),
+        // The decisions as they are now (reject takes the same lock): a rejection made while the run was preparing counts.
+        loadOrgPreferences(tx, { organizationId, projectId, donorType: run.project.donorType, now: deps.now() }),
       ]);
       const plan = planPersistence({
         suggestions: result.suggestions,
@@ -302,6 +322,7 @@ export async function executeKpiRun(runId: string, deps: KpiRunDeps): Promise<vo
         liveResultIds: new Set(liveResults.map(r => r.id)),
         indicators,
         pending,
+        rejectedLibraryIds: preferences.rejectedLibraryIds,
       });
 
       const model = result.model ?? 'unknown';
@@ -495,7 +516,9 @@ const iso = (date: Date | null): string | null => (date ? date.toISOString() : n
 
 /**
  * The run as the API returns it (KpiRunDto, design 4.1 and 7.3): a run still marked running without a heartbeat for
- * KPI_RUN_STALE_MS is reported failed/interrupted (runFailure). No cost or token columns (server-side only).
+ * KPI_RUN_STALE_MS is reported failed/interrupted (runFailure). No cost or token columns (server-side only). serverNow
+ * is the server's clock when the DTO was built, so a client can measure the run's age (serverNow − createdAt) on its
+ * own clock without comparing the two clocks (TQ-07).
  */
 export function toRunDto(run: KpiSuggestionRun, now: Date): KpiRunDto {
   const failure = runFailure(run, now);
@@ -519,6 +542,7 @@ export function toRunDto(run: KpiSuggestionRun, now: Date): KpiRunDto {
     createdAt: run.createdAt.toISOString(),
     updatedAt: run.updatedAt.toISOString(),
     finishedAt: iso(run.finishedAt),
+    serverNow: now.toISOString(),
   };
 }
 

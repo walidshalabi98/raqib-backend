@@ -1,14 +1,13 @@
 /**
  * Assertion checkers of the KPI evaluation, one per type of kpi-eval-cases.json (knowledge/kpi-assistant-spec.md §A8;
- * design section 10.2). Checks run on the validated suggestions; noTargetsWithoutBasis uses the independent match of
- * metrics.ts, not the validator, so a validator bug shows up. Details carry ids, codes and counts only (no model text).
+ * design section 10.2). Checks run on the validated suggestions; noTargetsWithoutBasis, peopleIndicatorsHaveSex and
+ * noTargetInName use the independent checks of metrics.ts, not the validator's own predicates, so a validator bug (or a
+ * gap in its word lists) shows up. Details carry ids, codes and counts only (no model text).
  */
-import { isPeopleLevelIndicator } from '../../ai/frameworkNormalize';
 import { isAccountabilityText } from '../accountability';
-import { nameHasTargetOrDirection } from '../nameRules';
 import type { KpiLibraryEntry, SuggestableLevel, ValidatedSuggestion } from '../types';
 import { EVAL_ASSERTION_TYPES, type EvalCase } from './cases';
-import { valueInFactsIndependent } from './metrics';
+import { nameHasTargetIndependent, peopleLevelIndependent, valueInFactsIndependent } from './metrics';
 
 /** The outcome of one assertion of a case (spec §A8 assertion types; design 10.2). */
 export interface AssertionResult {
@@ -50,13 +49,14 @@ const upper = (id: string | null) => (id ?? '').trim().toUpperCase();
  * - mustIncludeAnyLibraryIds: some suggestion's libraryId is in the list;
  * - mustIncludeLibraryIdForResult: one result per key; some suggestion of that result code has a listed libraryId;
  * - levelsPresent: every listed level appears; maxPerResult: no result code has more suggestions;
- * - peopleIndicatorsHaveSex: isPeopleLevelIndicator(name, nameAr) ⇒ sex or sex_of_household_head (me-foundations §2.7);
+ * - peopleIndicatorsHaveSex: peopleLevelIndependent(name, nameAr) ⇒ sex or sex_of_household_head (me-foundations §2.7);
  * - noTargetsWithoutBasis: a document target or baseline must be found by valueInFactsIndependent in the case facts;
- * - noTargetInName: !nameHasTargetOrDirection (rule 3 without the definitional thresholds, D13);
- * - hasAccountabilityIndicator (spec wording): some libraryId starting with "AC-", or a custom indicator (libraryId
- *   null) with accountability wording (isAccountabilityText);
- * - arabicNamesPresent: every nameAr non-empty with an Arabic letter; minQualityScoreAverage: mean qualityScore ≥ n
- *   (no suggestions → failed).
+ * - noTargetInName: !nameHasTargetIndependent (the eval's own rule 3 check, without the definitional thresholds, D13);
+ * - hasAccountabilityIndicator (spec wording): some model suggestion (origin 'model') with a libraryId starting with
+ *   "AC-", or a custom one (libraryId null) with accountability wording (isAccountabilityText); the validator's appended
+ *   indicator (rule 19) does not count (AI-5);
+ * - arabicNamesPresent: every nameAr non-empty with an Arabic letter; minQualityScoreAverage: mean qualityScore of the
+ *   model suggestions ≥ n (none → failed).
  * `library` is the whole library (unknown ids in a case's lists are reported in the detail).
  */
 export function checkAssertions(c: EvalCase, suggestions: readonly ValidatedSuggestion[], library: ReadonlyMap<string, KpiLibraryEntry>): AssertionResult[] {
@@ -112,7 +112,7 @@ export function checkAssertions(c: EvalCase, suggestions: readonly ValidatedSugg
       }
       case 'peopleIndicatorsHaveSex':
         if (a.peopleIndicatorsHaveSex) {
-          out.push(everySuggestion(type, suggestions, s => isPeopleLevelIndicator(s.name, s.nameAr)
+          out.push(everySuggestion(type, suggestions, s => peopleLevelIndependent(s.name, s.nameAr)
             && !s.disaggregation.includes('sex') && !s.disaggregation.includes('sex_of_household_head'), 'people-level suggestion(s) without sex'));
         }
         break;
@@ -126,19 +126,25 @@ export function checkAssertions(c: EvalCase, suggestions: readonly ValidatedSugg
         break;
       case 'noTargetInName':
         if (a.noTargetInName) {
-          out.push(everySuggestion(type, suggestions, s => nameHasTargetOrDirection(s.name, s.nameAr), 'name(s) with a target or direction'));
+          out.push(everySuggestion(type, suggestions, s => nameHasTargetIndependent(s.name, s.nameAr), 'name(s) with a target or direction'));
         }
         break;
       case 'hasAccountabilityIndicator': {
         if (!a.hasAccountabilityIndicator) break;
-        const byId = suggestions.filter(s => upper(s.libraryId).startsWith('AC-')).map(s => upper(s.libraryId));
-        const custom = suggestions.filter(s => s.libraryId === null && isAccountabilityText(s.name, s.nameAr));
+        // The model's own suggestions (AI-5): the validator's appended AC indicator (rule 19) is the safety net, so it
+        // never makes the assertion pass; the detail names it.
+        const model = suggestions.filter(s => s.origin === 'model');
+        const byId = model.filter(s => upper(s.libraryId).startsWith('AC-')).map(s => upper(s.libraryId));
+        const custom = model.filter(s => s.libraryId === null && isAccountabilityText(s.name, s.nameAr));
+        const appended = suggestions.filter(s => s.origin === 'appended_accountability').map(s => upper(s.libraryId));
         const passed = byId.length > 0 || custom.length > 0;
         out.push({
           type, key: null, passed,
           detail: passed
             ? [byId.length > 0 ? `library ${Array.from(new Set(byId)).join(', ')}` : '', custom.length > 0 ? `${custom.length} custom` : ''].filter(Boolean).join('; ')
-            : 'no AC-* library id and no custom accountability indicator',
+            : appended.length > 0
+              ? `the model suggested none; the validator appended ${appended.join(', ')}`
+              : 'no AC-* library id and no custom accountability indicator',
         });
         break;
       }
@@ -149,7 +155,9 @@ export function checkAssertions(c: EvalCase, suggestions: readonly ValidatedSugg
         break;
       case 'minQualityScoreAverage': {
         if (a.minQualityScoreAverage === undefined) break;
-        const average = suggestions.length === 0 ? null : suggestions.reduce((n, s) => n + s.qualityScore, 0) / suggestions.length;
+        // The model's own suggestions (AI-5; as the summary's avgQuality): an appended accountability indicator scores 100.
+        const model = suggestions.filter(s => s.origin === 'model');
+        const average = model.length === 0 ? null : model.reduce((n, s) => n + s.qualityScore, 0) / model.length;
         out.push({
           type, key: null, passed: average !== null && average >= a.minQualityScoreAverage,
           detail: average === null ? 'no suggestions' : `average ${average.toFixed(1)} (min ${a.minQualityScoreAverage})`,

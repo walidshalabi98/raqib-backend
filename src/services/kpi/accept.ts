@@ -12,27 +12,50 @@ import { redactPersonalData } from '../ai/redact';
 import { findCurrentFramework } from '../frameworks/current';
 import { createIndicatorInFramework } from '../indicators/create';
 import type { INDICATOR_INCLUDE } from '../indicators/selects';
-import { draftToCreateInput, editedFields } from './draft';
+import { DRAFT_EDITABLE_KEYS, draftToCreateInput, editedFields } from './draft';
 import { normalisedIndicatorName } from './nameRules';
-import { KPI_TRANSACTION_OPTIONS, toSuggestionDto } from './runs';
+import { KPI_TRANSACTION_OPTIONS, lockProject, toSuggestionDto } from './runs';
 import { warning } from './validate';
 import type { IndicatorDraft, KpiSuggestionDto, KpiWarning } from './types';
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 
+/** Fields the server sets on accept (design 8.1): sent in edits they are ignored, never an error. */
+const SERVER_SET_KEYS: ReadonlySet<string> = new Set(['provenance', 'aiModel', 'promptVersion', 'phases', 'sortOrder']);
+
 /**
- * `{ edits?: object }` (design 7.3: `{ "edits": { "indicatorText": "…", "targetValue": null } }` or `{}`). A missing body
- * or missing/null edits mean no edits; a body or edits value that is not a JSON object → 400. Unknown top-level keys
- * are ignored; edit keys are checked by draftToCreateInput (only DRAFT_EDITABLE_KEYS are used).
+ * `{ edits?: object, replaceSource?: boolean }` (design 7.3: `{ "edits": { "indicatorText": "…", "targetValue": null } }`
+ * or `{}`). A missing body or missing/null edits mean no edits; a body or edits value that is not a JSON object → 400.
+ * `replaceSource: true` (SPEC-8; an alternative to an existing indicator only) removes that indicator in the same
+ * transaction; anything but a boolean → 400. Unknown top-level keys are ignored. An edit key outside DRAFT_EDITABLE_KEYS
+ * and the server-set fields (status, currentValue, actualStartDate, actualEndDate, milestones, any unknown key) → 400
+ * not_editable with details.keys (TQ-02: such edits used to be dropped silently while the accept answered 201); the
+ * server-set provenance, aiModel, promptVersion, phases and sortOrder stay ignored.
  */
-export function parseAcceptBody(body: unknown): { edits: Record<string, unknown> } {
-  if (body === undefined || body === null) return { edits: {} };
+export function parseAcceptBody(body: unknown): { edits: Record<string, unknown>; replaceSource: boolean } {
+  if (body === undefined || body === null) return { edits: {}, replaceSource: false };
   if (!isObject(body)) throw new AppError(400, 'Invalid request: the request body must be a JSON object');
-  const { edits } = body;
-  if (edits === undefined || edits === null) return { edits: {} };
+  const { edits, replaceSource } = body;
+  if (replaceSource !== undefined && replaceSource !== null && typeof replaceSource !== 'boolean') {
+    throw new AppError(400, 'Invalid request: replaceSource must be true or false');
+  }
+  const replace = replaceSource === true;
+  if (edits === undefined || edits === null) return { edits: {}, replaceSource: replace };
   if (!isObject(edits)) throw new AppError(400, 'Invalid request: edits must be an object of indicator fields');
-  return { edits };
+  // TQ-02: a field the draft does not hold (status, currentValue, actual dates, milestones, an unknown key) would be
+  // dropped although the client meant to set it: refused. The server-set fields (provenance, aiModel, promptVersion,
+  // phases, sortOrder; design 8.1) stay ignored, as before.
+  const notEditable = Object.keys(edits)
+    .filter(key => !(DRAFT_EDITABLE_KEYS as readonly string[]).includes(key) && !SERVER_SET_KEYS.has(key));
+  if (notEditable.length > 0) {
+    throw new AppError(400, `Invalid request: these fields cannot be changed when accepting a suggestion: ${notEditable.join(', ')}. `
+      + 'Edit them on the indicator after accepting.', 'not_editable', { keys: notEditable });
+  }
+  return { edits, replaceSource: replace };
 }
+
+const SOURCE_HAS_DATA_MESSAGE = 'The indicator this alternative would replace already has data or linked services, so it cannot be removed. '
+  + 'Accept the alternative without replacing it, then decide what to do with the old indicator.';
 
 const STALE_MESSAGE = 'This suggestion is out of date: the framework or its result changed. Ask for new suggestions.';
 const DECIDED_MESSAGE = 'This suggestion was already accepted or rejected.';
@@ -103,15 +126,23 @@ const nameOf = (payload: unknown): string => (isObject(payload) && typeof payloa
  * 1. load (organisation-scoped; 404); 2. not pending → 409 already_decided (expired → 409 stale);
  * 3. stale (framework no longer current, result deleted or its level changed) → expired + 409 stale;
  * 4. edits merged over the stored draft and parsed once (400 naming every failing field);
- * 5. one interactive transaction: conditional decision (409 already_decided), staleness re-check with tx (409 stale and
- *    expired), duplicate check on the target result (409 duplicate), createIndicatorInFramework with provenance
- *    ai_suggested, the suggestion's model and prompt version (server-set even after edits), link, sibling group expired;
+ * 5. one interactive transaction: the project's KPI lock first (lockProject; CC-03, CC-04), conditional decision (409
+ *    already_decided), staleness re-check with tx (409 stale and expired), sibling group expired (before any source
+ *    indicator is deleted, so the group is still linked), duplicate check on the target result (409 duplicate),
+ *    createIndicatorInFramework with provenance ai_suggested, the suggestion's model and prompt version (server-set even
+ *    after edits), link;
  * 6. edited_accepted when editedFields is not empty, else accepted;
  * 7. donor cap (D5): the response warns donor_cap_exceeded when the result now has more indicators than the donor allows;
- *    accept is never blocked by the cap.
+ *    accept is never blocked by the cap;
+ * 8. `replaceSource: true` (SPEC-8; an alternative to an existing indicator): the source indicator is deleted in the same
+ *    transaction (409 source_has_data when it holds data points or linked services; 409 stale and expired when another
+ *    alternative already replaced it); the response names it (replacedIndicatorId), and the donor cap counts the result
+ *    without it. The other alternatives of that indicator are expired first (sibling group), so they can never be
+ *    accepted as extra indicators afterwards.
  */
 export async function acceptKpiSuggestion(input: { suggestionId: string; organizationId: string; userId: string; body: unknown }):
-  Promise<{ indicator: Prisma.IndicatorGetPayload<{ include: typeof INDICATOR_INCLUDE }>; suggestion: KpiSuggestionDto; warnings: KpiWarning[] }> {
+  Promise<{ indicator: Prisma.IndicatorGetPayload<{ include: typeof INDICATOR_INCLUDE }>; suggestion: KpiSuggestionDto; warnings: KpiWarning[];
+    replacedIndicatorId: string | null }> {
   const s = await prisma.kpiSuggestion.findFirst({
     where: { id: input.suggestionId, project: { organizationId: input.organizationId } },
     include: { project: { select: { id: true, donorType: true } }, result: { select: { id: true, level: true } } },
@@ -126,7 +157,10 @@ export async function acceptKpiSuggestion(input: { suggestionId: string; organiz
     throw new AppError(409, STALE_MESSAGE, 'stale');
   }
 
-  const { edits } = parseAcceptBody(input.body);
+  const { edits, replaceSource } = parseAcceptBody(input.body);
+  if (replaceSource && !s.alternativeOfIndicatorId) {
+    throw new AppError(400, 'Invalid request: only an alternative to an existing indicator can replace it (replaceSource)');
+  }
   const draft = storedDraft(s.payload);
   const createInput = draftToCreateInput(draft, edits);
   const status = editedFields(draft, edits).length > 0 ? 'edited_accepted' as const : 'accepted' as const;
@@ -136,6 +170,9 @@ export async function acceptKpiSuggestion(input: { suggestionId: string; organiz
   let out;
   try {
     out = await prisma.$transaction(async tx => {
+      // First, the project's KPI lock (CC-03, CC-04): an accept of a related card, a reject, or a run saving its cards
+      // waits for this transaction, so related accepts never deadlock and a run never re-adds what was just accepted.
+      await lockProject(tx, s.projectId);
       const now = new Date();
       const claimed = await tx.kpiSuggestion.updateMany({
         where: { id: s.id, status: 'pending' },
@@ -149,21 +186,10 @@ export async function acceptKpiSuggestion(input: { suggestionId: string; organiz
       ]);
       if (currentNow?.id !== s.frameworkId || !resultNow || resultNow.level !== s.level) throw new StaleSuggestion();
 
-      if (targetResultId) {
-        const onResult = await tx.indicator.findMany({
-          where: { frameworkId: s.frameworkId, resultId: targetResultId },
-          select: { libraryId: true, indicatorText: true },
-        });
-        if (repeatsIndicator(onResult, createInput)) {
-          throw new AppError(409, 'This result already has an indicator with the same library id or the same name.', 'duplicate');
-        }
-      }
-
-      const indicator = await createIndicatorInFramework(tx, s.frameworkId, createInput, {
-        provenance: 'ai_suggested', aiModel: s.model, promptVersion: s.promptVersion,
-      });
-      const suggestion = await tx.kpiSuggestion.update({ where: { id: s.id }, data: { indicatorId: indicator.id } });
-
+      // The sibling group is expired first, while the alternatives still point at their source indicator: deleting the
+      // source (replaceSource) sets alternativeOfIndicatorId to null on them (ON DELETE SET NULL), and an unlinked sibling
+      // could then be accepted as one more indicator (SPEC-8 re-check). A sibling accept waiting on the project lock then
+      // finds its card expired (409).
       const resultIds = Array.from(new Set([sourceResultId, targetResultId].filter((r): r is string => !!r)));
       const groupLinks = [
         { alternativeOfSuggestionId: s.id },
@@ -185,8 +211,39 @@ export async function acceptKpiSuggestion(input: { suggestionId: string; organiz
         await tx.kpiSuggestion.updateMany({ where: { id: { in: expireIds }, status: 'pending' }, data: { status: 'expired' } });
       }
 
+      // SPEC-8: the alternative replaces its source indicator (asked for by the officer), unless that indicator already
+      // holds data or linked services. A source deleted meanwhile (another alternative replaced it) leaves this card stale.
+      let replacedIndicatorId: string | null = null;
+      if (replaceSource && s.alternativeOfIndicatorId) {
+        const source = await tx.indicator.findFirst({
+          where: { id: s.alternativeOfIndicatorId, frameworkId: s.frameworkId },
+          select: { id: true, _count: { select: { dataPoints: true, beneficiaryServices: true } } },
+        });
+        if (!source) throw new StaleSuggestion();
+        if (source._count.dataPoints > 0 || source._count.beneficiaryServices > 0) {
+          throw new AppError(409, SOURCE_HAS_DATA_MESSAGE, 'source_has_data');
+        }
+        await tx.indicator.delete({ where: { id: source.id } });
+        replacedIndicatorId = source.id;
+      }
+
+      if (targetResultId) {
+        const onResult = await tx.indicator.findMany({
+          where: { frameworkId: s.frameworkId, resultId: targetResultId },
+          select: { libraryId: true, indicatorText: true },
+        });
+        if (repeatsIndicator(onResult, createInput)) {
+          throw new AppError(409, 'This result already has an indicator with the same library id or the same name.', 'duplicate');
+        }
+      }
+
+      const indicator = await createIndicatorInFramework(tx, s.frameworkId, createInput, {
+        provenance: 'ai_suggested', aiModel: s.model, promptVersion: s.promptVersion,
+      });
+      const suggestion = await tx.kpiSuggestion.update({ where: { id: s.id }, data: { indicatorId: indicator.id } });
+
       const count = targetResultId ? await tx.indicator.count({ where: { frameworkId: s.frameworkId, resultId: targetResultId } }) : 0;
-      return { indicator, suggestion, count, expired: expireIds.length };
+      return { indicator, suggestion, count, expired: expireIds.length, replacedIndicatorId };
     }, KPI_TRANSACTION_OPTIONS);
   } catch (err) {
     if (err instanceof StaleSuggestion) {
@@ -202,6 +259,7 @@ export async function acceptKpiSuggestion(input: { suggestionId: string; organiz
     const code = redactPersonalData(out.indicator.result?.code ?? '').text;
     warnings.push(warning('donor_cap_exceeded', { code, cap, count: out.count }));
   }
-  console.log(`[KpiAccept] ${s.id} ${status} → indicator ${out.indicator.id}; ${out.expired} related suggestions expired`);
-  return { indicator: out.indicator, suggestion: toSuggestionDto(out.suggestion), warnings };
+  console.log(`[KpiAccept] ${s.id} ${status} → indicator ${out.indicator.id}; ${out.expired} related suggestions expired`
+    + (out.replacedIndicatorId ? `; indicator ${out.replacedIndicatorId} replaced` : ''));
+  return { indicator: out.indicator, suggestion: toSuggestionDto(out.suggestion), warnings, replacedIndicatorId: out.replacedIndicatorId };
 }

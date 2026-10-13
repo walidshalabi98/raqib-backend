@@ -1,7 +1,9 @@
 import type { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { prisma } from '../src/config/prisma';
-import { AI_ANALYSIS_MARKER } from '../src/services/ai/frameworkNormalize';
+import { AI_ANALYSIS_MARKER, verifyDocumentFigures } from '../src/services/ai/frameworkNormalize';
+import { redactPersonalData } from '../src/services/ai/redact';
+import { extractDocumentFacts } from '../src/services/kpi/documentFacts';
 import type { ResultNodePlan, VerifiedFigure } from '../src/services/ai/frameworkNormalize';
 import { seedLibrary } from '../src/services/library/seed';
 import { KpiContextError, buildProjectContext, contextFromGeneration, uniqueResultCodes } from '../src/services/kpi/context';
@@ -78,13 +80,40 @@ describe('contextFromGeneration (framework generation path)', () => {
     expect(ctx.scope).toEqual({ type: 'framework' });
     expect(ctx).toMatchObject({ existingIndicators: [], pendingSuggestions: [], alternativesFor: null });
     expect(ctx.documentFacts).toEqual([
-      { documentId: '', fileName: `proposal ${PLACEHOLDER}.pdf`, excerpt: 'The action will rehabilitate 18 community water points.', kind: 'target' },
+      { documentId: '', fileName: `proposal ${PLACEHOLDER}.pdf`, excerpt: 'The action will rehabilitate 18 community water points.', kind: 'target',
+        figures: [{ value: '18', kind: 'target', resultCode: 'O1.1' }] },
     ]);
     expect(ctx.documentTexts).toEqual([{ documentId: '', fileName: `proposal ${PLACEHOLDER}.pdf`, text: 'The action will rehabilitate 18 community water points.' }]);
     expect(ctx.donorRules).toMatchObject({ donorType: 'echo', maxIndicatorsPerResult: 3 });
     expect(ctx.orgPreferences).toEqual({ rejectedLibraryIds: ['AC-01'], preferredMethods: ['observation'] });
     expect(ctx.project.geographicScope).toBe(`Khan Younis (${PLACEHOLDER})`);
     expect(leaks(ctx)).toBe(false);
+  });
+
+  it('PD-1: a verified figure whose quote held personal data is no fact (as on the request path)', () => {
+    // Fictitious name and number; the structure step quotes the redacted document text, so the quote verifies.
+    const raw = `Contact coordinator Rasha Odeh on ${PHONE} to confirm the 1,200 households. The action will rehabilitate 18 community water points.`;
+    const redacted = redactPersonalData(raw).text;
+    const quote = 'Contact coordinator Rasha Odeh on [phone removed] to confirm the 1,200 households.';
+    expect(redacted).toContain(quote);
+    const verified = verifyDocumentFigures([
+      { resultCode: 'O1.1', kind: 'target', value: '1,200', description: 'households', quote },
+      { resultCode: 'O1.1', kind: 'target', value: '18', description: 'water points', quote: 'The action will rehabilitate 18 community water points.' },
+    ], [{ fileName: 'proposal.pdf', text: redacted }]);
+    expect(verified).toHaveLength(2);
+    const ctx = contextFromGeneration({
+      project: {
+        id: 'p1', name: 'Water project', sectors: ['wash'], donor: 'DG ECHO', donorType: 'echo', startDate: '2026-11-01', endDate: '2027-10-31',
+        geographicScope: null, targetBeneficiaries: null, humanitarian: false, description: null,
+      },
+      plan,
+      verifiedFigures: verified,
+      documents: [{ fileName: 'proposal.pdf', text: redacted }],
+      orgPreferences: { rejectedLibraryIds: [], preferredMethods: [] },
+    });
+    expect(ctx.documentFacts.map(f => f.excerpt)).toEqual(['The action will rehabilitate 18 community water points.']);
+    expect(JSON.stringify(ctx.documentFacts)).not.toContain('Rasha');
+    expect(extractDocumentFacts([{ id: 'd', fileName: 'proposal.pdf', text: redacted }]).map(f => f.excerpt)).not.toContain(quote);
   });
 });
 

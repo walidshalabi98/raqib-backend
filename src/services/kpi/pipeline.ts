@@ -10,7 +10,7 @@ import type { EmbeddingInputType, EmbeddingProvider } from '../ai/embeddingProvi
 import { KPI_MAX_CALLS_PER_RUN, KPI_RUN_DEADLINE_MS, callModelForResults, candidatesForBatch, planBatches } from './callModel';
 import { normalisedIndicatorName } from './nameRules';
 import { cosine, retrieveCandidates } from './retrieve';
-import { scopedResults } from './scope';
+import { allowanceFor, scopedResults } from './scope';
 import { validateAndScore, warning, type SimilarityFn } from './validate';
 import type {
   KpiErrorCode, KpiPipelineDeps, KpiPipelineOptions, KpiPipelineResult, KpiRawSuggestion, KpiWarning, ProjectContext,
@@ -112,7 +112,10 @@ async function nameSimilarity(ctx: ProjectContext, raw: readonly KpiRawSuggestio
  *    result failed, the last original AiError is rethrown unchanged (an AiRefusalError keeps its message), or, when no
  *    call was made at all, KpiPipelineError('ai_unavailable');
  * 4. onStep('validation') → near-duplicate similarity (embeddings when enabled, else text only) → validateAndScore;
- *    result_failed warnings (params code, reason) for failed results, then the retrieval warnings.
+ * 5. framework scope (AI-2): scoped results that did not fail but kept no suggestion get one more call each (within the
+ *    call budget and deadline, without the library ids other results keep), then validation runs again over every answer;
+ *    result_failed warnings (params code, reason) for failed results, result_empty for scoped results still without a
+ *    suggestion, then the retrieval warnings.
  * Feature: opts.feature, else kpi.alternatives for alternatives scope and kpi.suggest otherwise.
  */
 export async function runKpiPipeline(ctx: ProjectContext, deps: KpiPipelineDeps, opts: KpiPipelineOptions = {}): Promise<KpiPipelineResult> {
@@ -149,35 +152,70 @@ export async function runKpiPipeline(ctx: ProjectContext, deps: KpiPipelineDeps,
   }
 
   await opts.onStep?.('validation');
-  const similarity = await nameSimilarity(ctx, answer.suggestions, embeddings.provider);
   const candidateIds = new Set<string>();
   for (const batch of planBatches(scoped)) {
     for (const entry of candidatesForBatch(batch, retrieval).candidates) candidateIds.add(entry.id);
   }
-  const validated = validateAndScore({
+  let suggestions = answer.suggestions;
+  let modelWarnings = answer.modelWarnings;
+  let similarity = await nameSimilarity(ctx, suggestions, embeddings.provider);
+  const validate = () => validateAndScore({
     context: ctx,
-    answer: { suggestions: answer.suggestions, frameworkWarnings: answer.modelWarnings },
+    answer: { suggestions, frameworkWarnings: modelWarnings },
     deps: { library: retrieval.library, candidateIds, ...(similarity ? { similarity } : {}) },
   });
+  let validated = validate();
+
+  // AI-2: a framework result that the model skipped, or whose suggestions validation dropped (repeats of other results),
+  // gets one more call of its own, without the library ids other results already keep; then validation runs again.
+  const failedResults = [...answer.failedResults];
+  const calls = [...answer.calls];
+  const keptFor = (resultId: string) => validated.suggestions.some(x => x.resultId === resultId);
+  const empty = () => scoped.filter(r => !failedIds.has(r.id) && allowanceFor(r, ctx).min > 0 && !keptFor(r.id));
+  const retryFor = ctx.scope.type === 'framework' ? empty() : [];
+  const callsLeft = (opts.maxCalls ?? KPI_MAX_CALLS_PER_RUN) - answer.calls.length;
+  if (retryFor.length > 0 && callsLeft > 0) {
+    const used = new Set(validated.suggestions.flatMap(x => (x.libraryId ? [x.libraryId.toUpperCase()] : [])));
+    const retry = await callModelForResults(ctx, retrieval, deps, {
+      feature,
+      callContext: opts.callContext,
+      deadlineAt: started + (opts.deadlineMs ?? KPI_RUN_DEADLINE_MS),
+      maxCalls: callsLeft,
+      results: retryFor,
+      oneResultPerCall: true,
+      excludeLibraryIds: used,
+    });
+    calls.push(...retry.calls);
+    // A retry that fails leaves the first answers as they were (no result_failed for a result that had its call).
+    if (retry.suggestions.length > 0) {
+      suggestions = [...suggestions, ...retry.suggestions];
+      modelWarnings = [...modelWarnings, ...retry.modelWarnings];
+      similarity = await nameSimilarity(ctx, suggestions, embeddings.provider);
+      validated = validate();
+    }
+    console.info(`[KpiPipeline] project ${ctx.project.id}: ${retryFor.length} result(s) without suggestions retried (${retry.calls.length} calls, ${retry.suggestions.length} raw)`);
+  }
 
   const codeOf = new Map(ctx.resultsChain.map(r => [r.id, r.code]));
-  const failedWarnings: KpiWarning[] = answer.failedResults.map(f =>
+  const failedWarnings: KpiWarning[] = failedResults.map(f =>
     warning('result_failed', { code: codeOf.get(f.resultId) ?? f.resultId, reason: f.reason }));
+  // A scoped result that should have suggestions and has none (and did not fail): say so (AI-2).
+  const emptyWarnings: KpiWarning[] = empty().map(r => warning('result_empty', { code: r.code }));
   const candidateIdsByResult: Record<string, string[]> = {};
   for (const result of scoped) candidateIdsByResult[result.id] = (retrieval.byResult.get(result.id) ?? []).map(c => c.entry.id);
 
   console.info(
     `[KpiPipeline] project ${ctx.project.id} scope=${ctx.scope.type} results=${scoped.length} retrieval=${retrieval.method}`
-      + ` calls=${answer.calls.length} failed=${answer.failedResults.length} raw=${answer.suggestions.length}`
+      + ` calls=${calls.length} failed=${failedResults.length} empty=${emptyWarnings.length} raw=${suggestions.length}`
       + ` suggestions=${validated.suggestions.length} embeddingCalls=${embeddings.calls()}`,
   );
   return {
     suggestions: validated.suggestions,
-    frameworkWarnings: [...validated.frameworkWarnings, ...failedWarnings, ...retrieval.warnings],
+    frameworkWarnings: [...validated.frameworkWarnings, ...failedWarnings, ...emptyWarnings, ...retrieval.warnings],
     retrieval: retrieval.method,
     candidateIdsByResult,
-    raw: answer.suggestions,
-    calls: answer.calls,
+    raw: suggestions,
+    calls,
     model: answer.model,
     promptVersion: KPI_PROMPT_VERSION,
     embeddingCalls: embeddings.calls(),

@@ -14,6 +14,7 @@ import { BASELINE_BASES, FRAMEWORK_DIRECTIONS, FRAMEWORK_FREQUENCIES, FRAMEWORK_
   INDICATOR_UNITS, TARGET_BASES } from './framework';
 import { donorGuidance } from './donors';
 import { standardReferenceLabel } from '../frameworkNormalize';
+import { thresholdsForPrompt } from '../standardThresholds';
 import { redactPersonalData } from '../redact';
 import { isAccountabilityEntry, isAccountabilityIndicator } from '../../kpi/accountability';
 import { scopedResults } from '../../kpi/scope';
@@ -41,7 +42,7 @@ export const KPI_SUGGESTION_SCHEMA = z.object({
   meansOfVerification: z.string().describe('The specific source and tool, in a few words. Never a generic answer such as "project reports".'),
   baselineSuggestion: z.string().describe('Only a value copied exactly from a DOCUMENT FACTS excerpt marked baseline or mixed; otherwise "".'),
   baselineBasis: z.enum(BASELINE_BASES),
-  targetSuggestion: z.string().describe('A value copied exactly from a DOCUMENT FACTS excerpt marked target or mixed, a threshold number copied from the linked candidate (e.g. "15"), or a target-setting method relative to the baseline (e.g. "baseline + 10 percentage points"); "" if none.'),
+  targetSuggestion: z.string().describe('A value copied exactly from a DOCUMENT FACTS excerpt marked target or mixed, a value listed under "thresholds" of the linked candidate (e.g. "15"), or a target-setting method relative to the baseline (e.g. "baseline + 10 percentage points"); "" if none.'),
   targetBasis: z.enum(TARGET_BASES),
   standardReferenceCode: z.string().nullable().describe('e.g. "EU GERF 2.38", or null.'),
   rationale: z.string().describe('2 short sentences (at most 45 words): why this indicator fits this result and this donor.'),
@@ -83,7 +84,7 @@ Baselines and targets: never invent numbers. Every value is checked against the 
 - baselineSuggestion with baselineBasis "document" only when the value is copied exactly from a DOCUMENT FACTS line marked [baseline], or from the baseline part of a line marked [mixed]. Otherwise baselineSuggestion is "" and baselineBasis "none".
 - targetSuggestion with targetBasis "document" only when the value is copied exactly from a line marked [target], or from the target part of a line marked [mixed]. A [context] line is never a baseline or a target.
 - A value with a percent sign only for a percent indicator; a count only for an indicator that is not a percentage.
-- targetBasis "standard_threshold" only with a number copied from the linked candidate's own text (its standard or definition, such as a Sphere minimum).
+- targetBasis "standard_threshold" only with a value listed under "thresholds" on the linked candidate's line (such as the Sphere minimum of 15 litres per person per day). Other numbers in a candidate (recall periods, score cut-offs, durations, years, codes) are never thresholds.
 - Otherwise targetBasis "method_only": targetSuggestion says how the target will be set relative to the baseline (for example "baseline + 10 percentage points, confirmed after the baseline survey"), with no absolute number.
 - rationale, qualityNotes and frameworkWarnings contain no number that is not in PROJECT, DONOR RULES, RESULTS CHAIN, DOCUMENT FACTS or CANDIDATES.
 
@@ -138,7 +139,10 @@ export const PROMPT_TEXT_MAX_CHARS = 300;
 export const PROMPT_DEFINITION_MAX_CHARS = 300;
 /** Characters of a standard candidate's notes (notes of other entries are not sent). */
 export const PROMPT_NOTES_MAX_CHARS = 200;
-/** Characters of a document fact excerpt (documentFacts.ts already keeps them to 300). */
+/**
+ * Characters of a document fact excerpt (documentFacts.ts keeps request-path excerpts to 300; a framework-generation quote
+ * may be longer and is shown around its verified figures, clipAroundValues).
+ */
 export const PROMPT_FACT_MAX_CHARS = 300;
 /** Characters of a file name in DOCUMENT FACTS (the context builder clips them to 200). */
 export const PROMPT_FILE_NAME_MAX_CHARS = 200;
@@ -178,14 +182,16 @@ const quoted = (value: string) => `"${value.replace(/"/g, "'")}"`;
 /**
  * One CANDIDATES line (design 6.2; spec §A4 step 2 "the candidate list (id, name, definition, unit, level, methods,
  * frequency, disaggregation, standardReference)"): id, level, name, Arabic name, unit, methods, frequency,
- * disaggregation, standard ("<framework> <code>" or "none (common practice)"), definition (≤ 300 characters) and, for
- * standard entries only, notes (≤ 200 characters). Library text is reference text (no personal data); it is put on one
- * line and clipped, never rewritten, so a threshold the model copies matches the entry (rule 11).
+ * disaggregation, standard ("<framework> <code>" or "none (common practice)"), the recognised thresholds (rule 11,
+ * STANDARD_THRESHOLDS; entries without one have no thresholds part), definition (≤ 300 characters) and, for standard
+ * entries only, notes (≤ 200 characters). Library text is reference text (no personal data); it is put on one line and
+ * clipped, never rewritten.
  */
 export function kpiCandidateLine(entry: KpiLibraryEntry): string {
   const oneLine = (value: string | null | undefined) => (value ?? '').replace(/\s+/g, ' ').trim();
   const standard = standardReferenceLabel(entry.standardReference);
   const notes = entry.isStandard ? oneLine(entry.notes) : '';
+  const thresholds = thresholdsForPrompt(entry.id);
   return [
     `${entry.id} [${entry.level}] ${oneLine(entry.name)}`,
     `ar: ${oneLine(entry.nameAr) || 'none'}`,
@@ -194,6 +200,7 @@ export function kpiCandidateLine(entry: KpiLibraryEntry): string {
     `frequency: ${entry.frequency}`,
     `disaggregation: ${entry.disaggregation.join(', ') || 'none'}`,
     `standard: ${standard ? oneLine(standard) : 'none (common practice)'}`,
+    ...(thresholds ? [`thresholds: ${thresholds}`] : []),
     `definition: ${clipText(oneLine(entry.definition), PROMPT_DEFINITION_MAX_CHARS)}`,
     ...(notes ? [`notes: ${clipText(notes, PROMPT_NOTES_MAX_CHARS)}`] : []),
   ].join(' | ');
@@ -269,6 +276,9 @@ function accountabilityOutcomeId(ctx: ProjectContext): string | null {
 /** "2–4", or "3" when both bounds are equal. */
 const range = (a: { min: number; max: number }) => (a.min === a.max ? String(a.max) : `${a.min}–${a.max}`);
 
+/** "1 alternative", "2–3 alternatives" (the range of an allowance and the noun in the right number). */
+const alternativesCount = (a: { min: number; max: number }) => `${range(a)} ${a.max === 1 ? 'alternative' : 'alternatives'}`;
+
 /**
  * SUGGEST FOR (design 6.2): per batch result its range (allowanceFor: level counts, existing indicators, donor cap),
  * its existing indicators ("name" (unit, library id)), its candidate ids best first, the accountability request on the
@@ -287,7 +297,7 @@ function suggestForSection(input: KpiPromptInput): string {
     });
     const candidates = input.candidateIdsByResult[result.id] ?? [];
     const parts = [
-      `${clean(result.code)} [${result.level}]: suggest ${range(allowance)}${ctx.scope.type === 'alternatives' ? ' alternatives' : ''}`,
+      `${clean(result.code)} [${result.level}]: suggest ${ctx.scope.type === 'alternatives' ? alternativesCount(allowance) : range(allowance)}`,
       `existing indicators: ${existing.join('; ') || 'none'}`,
       `candidates: ${candidates.join(', ') || 'none (write custom indicators)'}`,
     ];
@@ -306,18 +316,77 @@ function suggestForSection(input: KpiPromptInput): string {
 /** The label of a fact in DOCUMENT FACTS: its kind, or "context" for a fact without baseline or target cues. */
 const factLabel = (fact: DocumentFact) => fact.kind ?? 'context';
 
+/** Text as positions are compared in it: ASCII digits and "%", "." for the Arabic signs, lower case (same length). */
+function digitsAscii(text: string): string {
+  return text
+    .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/٪/g, '%')
+    .replace(/[٫]/g, '.')
+    .replace(/[٬]/g, ',')
+    .toLowerCase();
+}
+
 /**
- * DOCUMENT FACTS (design 6.2, 6.4): every fact of the context as `[F<n> <kind>] <file>: "<excerpt>"`; the only document
- * text a prompt carries. Without facts the model is told that no baseline or target may come from a document.
+ * At most `max` characters of `text` around the first of `values` it holds (AI-3: a verified figure after character 300 of
+ * a long quote must stay visible): the whole text when it fits; otherwise a window that starts near the value, cut at
+ * spaces, with "…" where text was left out. Without a value found, the head of the text (clipText).
+ */
+export function clipAroundValues(text: string, values: readonly string[], max: number): string {
+  if (text.length <= max) return text;
+  const hay = digitsAscii(text);
+  const positions = values
+    .map(v => digitsAscii(v.trim()))
+    .filter(Boolean)
+    .map(v => ({ at: hay.indexOf(v), length: v.length }))
+    .filter(p => p.at >= 0)
+    .sort((a, b) => a.at - b.at);
+  if (positions.length === 0) return clipText(text, max);
+  const budget = max - 2; // room for an ellipsis on each side
+  const first = positions[0];
+  let spanEnd = first.at + first.length;
+  for (const p of positions) if (p.at + p.length - first.at <= budget) spanEnd = Math.max(spanEnd, p.at + p.length);
+  let start = Math.max(0, first.at - Math.floor((budget - (spanEnd - first.at)) / 2));
+  let end = Math.min(text.length, start + budget);
+  start = Math.max(0, end - budget);
+  // Cut at spaces, never inside the values.
+  if (start > 0) {
+    const space = text.indexOf(' ', start);
+    if (space >= 0 && space < first.at) start = space + 1;
+  }
+  if (end < text.length) {
+    const space = text.lastIndexOf(' ', end);
+    if (space >= spanEnd) end = space;
+  }
+  return `${start > 0 ? '…' : ''}${text.slice(start, end).trim()}${end < text.length ? '…' : ''}`;
+}
+
+/**
+ * One DOCUMENT FACTS line: `[F<n> <kind>] <file>: "<excerpt>"`. A framework-generation fact (with the structure step's
+ * verified figures) names its figures and result codes first and shows the excerpt around them (AI-3):
+ * `[F<n> <kind> <codes>] <file>: baseline "30%", target "60%" — "…excerpt…"`.
+ */
+function factLine(fact: DocumentFact, i: number): string {
+  const file = cleanClip(fact.fileName, PROMPT_FILE_NAME_MAX_CHARS) || 'document';
+  if (!fact.figures || fact.figures.length === 0) {
+    return `[F${i + 1} ${factLabel(fact)}] ${file}: ${quoted(cleanClip(fact.excerpt, PROMPT_FACT_MAX_CHARS))}`;
+  }
+  const codes = Array.from(new Set(fact.figures.map(f => clean(f.resultCode)).filter(Boolean)));
+  const values = fact.figures.map(f => `${f.kind} ${quoted(clean(f.value))}`).join(', ');
+  const excerpt = clipAroundValues(clean(fact.excerpt), fact.figures.map(f => clean(f.value)), PROMPT_FACT_MAX_CHARS);
+  return `[F${i + 1} ${factLabel(fact)}${codes.length > 0 ? ` ${codes.join(',')}` : ''}] ${file}: ${values} — ${quoted(excerpt)}`;
+}
+
+/**
+ * DOCUMENT FACTS (design 6.2, 6.4): every fact of the context as one factLine; the only document text a prompt carries.
+ * Without facts the model is told that no baseline or target may come from a document.
  */
 function documentFactsSection(ctx: ProjectContext): string {
-  const heading = 'DOCUMENT FACTS (copy values exactly; baseline values only from [baseline] or [mixed] lines, targets only from [target] or [mixed] lines; [context] lines are never a baseline or a target)';
+  const heading = 'DOCUMENT FACTS (copy values exactly; baseline values only from [baseline] or [mixed] lines, targets only from [target] or [mixed] lines; [context] lines are never a baseline or a target; where a line lists values, only those values, with their kind and result codes, may be used)';
   if (ctx.documentFacts.length === 0) {
     return `${heading}\nnone: no document values are available, so every baselineBasis is "none" and no targetBasis is "document".`;
   }
-  const lines = ctx.documentFacts.map((fact, i) =>
-    `[F${i + 1} ${factLabel(fact)}] ${cleanClip(fact.fileName, PROMPT_FILE_NAME_MAX_CHARS) || 'document'}: ${quoted(cleanClip(fact.excerpt, PROMPT_FACT_MAX_CHARS))}`);
-  return `${heading}\n${lines.join('\n')}`;
+  return `${heading}\n${ctx.documentFacts.map(factLine).join('\n')}`;
 }
 
 /** CANDIDATES: one kpiCandidateLine per candidate of the call. */
@@ -331,11 +400,16 @@ function preferencesSection(ctx: ProjectContext): string | null {
   return methods.length > 0 ? `ORGANISATION PREFERENCES\nmethods this organisation usually accepts: ${methods.join(', ')}` : null;
 }
 
-/** The alternatives source description of SCOPE (design 6.2). */
-function alternativesScope(source: AlternativesSource | null, ctx: ProjectContext, batch: readonly ContextResult[]): string {
+/**
+ * The alternatives source description of SCOPE (design 6.2). The number of alternatives asked for is the result's
+ * allowance, the same as SUGGEST FOR (AI-7: a donor cap can lower it to 1).
+ */
+function alternativesScope(source: AlternativesSource | null, ctx: ProjectContext, batch: readonly ContextResult[],
+  allowances: KpiPromptInput['allowances']): string {
   const result = batch[0] ?? ctx.resultsChain.find(r => r.id === source?.resultId);
   const code = result ? clean(result.code) : 'the result';
-  if (!source) return `alternatives: suggest 2–3 alternative indicators for ${code}.`;
+  const count = alternativesCount((result ? allowances[result.id] : undefined) ?? { min: 2, max: 3 });
+  if (!source) return `alternatives: suggest ${count} for ${code}.`;
   const details = [
     `unit: ${source.unit ?? 'not set'}`,
     `method: ${source.method ?? 'not set'}`,
@@ -355,7 +429,7 @@ function alternativesScope(source: AlternativesSource | null, ctx: ProjectContex
   if (source.nameAr && clean(source.nameAr)) lines.push(`source Arabic name: ${quoted(cleanClip(source.nameAr, PROMPT_TEXT_MAX_CHARS))}`);
   if (source.definition && clean(source.definition)) lines.push(`source definition: ${quoted(cleanClip(source.definition, PROMPT_TEXT_MAX_CHARS))}`);
   lines.push(`reason: ${reason}`);
-  lines.push(`Suggest 2–3 alternatives for the same result (${code}) that measure the same change and fix these problems; do not repeat the source indicator${source.libraryId ? ` and do not reuse library id ${source.libraryId}` : ''}.`);
+  lines.push(`Suggest ${count} for the same result (${code}) that measure the same change and fix these problems; do not repeat the source indicator${source.libraryId ? ` and do not reuse library id ${source.libraryId}` : ''}.`);
   return lines.join('\n');
 }
 
@@ -368,7 +442,7 @@ function scopeSection(input: KpiPromptInput): string {
   } else if (ctx.scope.type === 'result') {
     body = `result: suggest indicators for ${batch.map(r => clean(r.code)).join(', ') || 'the result under SUGGEST FOR'} only.`;
   } else {
-    body = alternativesScope(ctx.alternativesFor, ctx, batch);
+    body = alternativesScope(ctx.alternativesFor, ctx, batch, input.allowances);
   }
   return `SCOPE\n${body}`;
 }

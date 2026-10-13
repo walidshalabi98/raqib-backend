@@ -142,3 +142,50 @@ describe('normalisedIndicatorName', () => {
     expect(normalisedIndicatorName('...')).toBe('');
   });
 });
+
+describe('rule 3 after the Phase 4 review (SPEC-3, SPEC-9)', () => {
+  it.each([
+    ['a target value', 'Number of displaced households receiving food vouchers (target: 3,500)'],
+    ['"target of N"', 'Number of youth trained (target of 500)'],
+    ['a leading count', '3,500 displaced households receiving food vouchers'],
+    ['"at least N" at the start', 'At least 3,500 households receive food vouchers'],
+    ['a count with its target date', 'Number of youth trained, 500 by end of project'],
+    ['a count by a year', 'Number of teachers trained, 1,200 by 2027'],
+    ['a leading comparative', 'Higher % of households with acceptable FCS'],
+    ['a leading "More"', 'More households with acceptable FCS'],
+    ['a change by a factor', 'Doubling the number of households with acceptable FCS'],
+    ['a change by a factor (halving)', 'Halving the share of households using crisis coping strategies'],
+  ])('flags %s: %s', (_label, name) => {
+    expect(nameHasTargetOrDirection(name)).toBe(true);
+  });
+
+  it.each([
+    ['المستهدف with a value', 'عدد الأسر النازحة التي تتلقى قسائم غذائية (المستهدف: 3500)'],
+    ['a leading count', '3500 أسرة نازحة تتلقى قسائم غذائية'],
+    ['a leading count in Arabic-Indic digits', '٣٥٠٠ أسرة نازحة تتلقى قسائم غذائية'],
+    ['a change by a factor', 'مضاعفة عدد الأسر ذات الاستهلاك الغذائي المقبول'],
+  ])('flags the Arabic %s: %s', (_label, nameAr) => {
+    expect(nameHasTargetOrDirection('Number of displaced households receiving food vouchers', nameAr)).toBe(true);
+  });
+
+  it.each([
+    'Reduced Coping Strategies Index (rCSI) score of target households',
+    'Enhanced Vegetation Index (EVI) of rehabilitated rangeland',
+    'Improved drinking water sources: % of households using one',
+    'Improved sanitation facilities per 100 people',
+    '% of target households with an acceptable FCS',
+    '% of pregnant women receiving at least 4 antenatal care visits',
+    'Number of children aged 6–59 months screened for acute malnutrition',
+    'Number of households with acceptable FCS (from 40 to 70)', // D13: "from N to M" is not rule 3's; validate.ts checks the numbers
+  ])('does not flag the standard name or definitional wording: %s', name => {
+    expect(nameHasTargetOrDirection(name, 'نسبة الأسر المستهدفة التي لديها استهلاك غذائي مقبول')).toBe(false);
+  });
+
+  it('still flags a standard name that holds a percentage target', () => {
+    expect(nameHasTargetOrDirection('Reduced Coping Strategies Index below 10 for 80% of households')).toBe(true);
+  });
+
+  it('flags none of the 63 library names (EN and AR) with the new patterns', () => {
+    expect(library.filter(e => nameHasTargetOrDirection(e.name, e.nameAr)).map(e => e.id)).toEqual([]);
+  });
+});

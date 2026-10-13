@@ -4,6 +4,12 @@ import { env } from '../config/env';
 
 const skipInTests = () => env.nodeEnv === 'test';
 const message = (text: string) => ({ message: text });
+/**
+ * A 429 body with a code and who is limited (UX-08 b): `rate_limited` with details.scope 'user' (aiLimiter: this
+ * person's hourly AI requests) or 'organisation' (kpiOrgLimiter: everyone in the organisation together), so the web app
+ * can say which one, and that waiting (not retrying now) helps.
+ */
+const limited = (text: string, scope: 'user' | 'organisation') => ({ message: text, code: 'rate_limited', details: { scope } });
 
 /**
  * True for a poll of a KPI suggestion run (GET /api/kpi-suggestion-runs/:id; the query string is ignored). Those polls
@@ -57,7 +63,7 @@ export const aiLimiter = rateLimit({
   legacyHeaders: false,
   skip: skipInTests,
   keyGenerator: userKey,
-  message: message('AI request limit reached for this hour. Please try again later.'),
+  message: limited('AI request limit reached for this hour. Please try again later.', 'user'),
 });
 
 /**
@@ -71,7 +77,7 @@ export const kpiOrgLimiter = rateLimit({
   legacyHeaders: false,
   skip: skipInTests,
   keyGenerator: organisationKey,
-  message: message('Your organisation reached the hourly limit for KPI suggestions. Please try again later.'),
+  message: limited('Your organisation reached the hourly limit for KPI suggestions. Please try again later.', 'organisation'),
 });
 
 /**

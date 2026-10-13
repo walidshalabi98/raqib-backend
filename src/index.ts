@@ -2,6 +2,8 @@ import { env } from './config/env';
 import { prisma } from './config/prisma';
 import { loadSharedSystemPrompt } from './services/ai/prompts/system';
 import { safeErrorSummary } from './services/ai/errors';
+import { resolveModel } from './services/ai/client';
+import { budgetPricingWarning } from './services/kpi/availability';
 import { interruptActiveRuns } from './services/kpi/runs';
 import app from './app';
 
@@ -15,6 +17,10 @@ function loadSystemPromptVersion(): string {
   }
 }
 const systemPromptVersion = loadSystemPromptVersion();
+
+// CC-07: a model without a price makes the organisation's daily AI budget count 0 for its calls; say so loudly.
+const budgetWarning = budgetPricingWarning(env.aiOrgDailyBudgetUsd, [resolveModel('main'), resolveModel('fast')]);
+if (budgetWarning) console.warn(budgetWarning);
 
 // Start server
 const server = app.listen(env.port, () => {

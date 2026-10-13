@@ -105,8 +105,12 @@ async function captureConsole(fn: () => Promise<unknown>): Promise<string> {
   return lines.join('\n');
 }
 
-/** Whether a text still holds anything from the fixture's personal data. */
-function personalDataIn(text: string): string[] {
+/** Record ids (UUIDs) that logs carry by design; about 0.25% of random ones look like a phone number to the redactor. */
+const RECORD_ID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+/** Whether a text still holds anything from the fixture's personal data (record ids are not personal data: TEST-1). */
+function personalDataIn(rawText: string): string[] {
+  const text = rawText.replace(RECORD_ID, '<id>');
   const found: string[] = [];
   if (/@/.test(text)) found.push('email');
   if (/(?<!\d)40\d{7}(?!\d)/.test(text) || text.includes('٤٠١٢٣٤٥٦٧')) found.push('ID number');
@@ -115,6 +119,15 @@ function personalDataIn(text: string): string[] {
   if (leftover.phone || leftover.idNumber || leftover.email) found.push(`redactable ${JSON.stringify(leftover)}`);
   return found;
 }
+
+describe('personalDataIn (test helper)', () => {
+  it('ignores record ids in log lines (TEST-1: a random UUID made the log checks fail now and then)', () => {
+    // This UUID reads as a phone number to the redactor; logs carry document ids by design.
+    expect(redactPersonalData('document 2ed09008-1613-4941-b99a-71c23a85745f').counts.phone).toBe(1);
+    expect(personalDataIn('[DocumentParser] AI analysis failed for document 2ed09008-1613-4941-b99a-71c23a85745f: Error')).toEqual([]);
+    expect(personalDataIn('call 0599123456 about document 2ed09008-1613-4941-b99a-71c23a85745f')).not.toEqual([]);
+  });
+});
 
 // ---------------------------------------------------------------------------
 

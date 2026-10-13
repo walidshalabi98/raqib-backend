@@ -118,3 +118,25 @@ export function estimateCostUsd(model: string | null | undefined, usage: TokenUs
 export function roundUsd(usd: number): number {
   return Math.round(usd * 1_000_000) / 1_000_000;
 }
+
+/** The highest known rate of each token kind across MODELS (both price tiers): the budget's price for an unpriced call. */
+export const HIGHEST_KNOWN_PRICE: Readonly<ModelPrice> = (() => {
+  const prices = Object.values(MODELS).flatMap(m => (m.longPrompt ? [m.price, m.longPrompt.price] : [m.price]));
+  return {
+    input: Math.max(...prices.map(p => p.input)),
+    output: Math.max(...prices.map(p => p.output)),
+    cacheWrite: Math.max(...prices.map(p => p.cacheWrite)),
+    cacheRead: Math.max(...prices.map(p => p.cacheRead)),
+  };
+})();
+
+/**
+ * A fail-closed cost for the daily budget (CC-07; D20): `usage` priced at HIGHEST_KNOWN_PRICE. Used only to count calls
+ * whose model (or server-side fallback model) has no price, so an unpriced model can never keep an organisation under
+ * its budget. Never stored as an AiCall estimate (models.ts stores no guess).
+ */
+export function budgetCostUsd(usage: TokenUsage): number {
+  const p = HIGHEST_KNOWN_PRICE;
+  return roundUsd((usage.inputTokens * p.input + usage.outputTokens * p.output + usage.cacheWriteTokens * p.cacheWrite
+    + usage.cacheReadTokens * p.cacheRead) / 1_000_000);
+}
