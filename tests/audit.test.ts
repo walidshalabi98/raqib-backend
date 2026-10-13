@@ -32,7 +32,7 @@ describe('bodyFieldNames', () => {
 });
 
 describe('audit values (allow-listed fields of M&E records)', () => {
-  it('are kept only for writes to projects, frameworks, results, indicators and data points, and every key is a staff route', () => {
+  it('are kept only for writes to projects, frameworks, results, indicators, data points and report publishing, and every key is a staff route', () => {
     const registered = new Set(routeLayers(app).map(r => r.key));
     for (const key of Object.keys(AUDIT_VALUE_ROUTES)) {
       const [method, path] = key.split(' ');
@@ -43,7 +43,7 @@ describe('audit values (allow-listed fields of M&E records)', () => {
     }
     const fields = Object.values(AUDIT_VALUE_ROUTES).flat();
     // Free text that can name people, places finer than a governorate, or files: never kept.
-    for (const field of ['notes', 'geographicArea', 'attachments', 'dataSource', 'fullName', 'phoneNumber', 'nationalId', 'content', 'location', 'description', 'aiRationale', 'token']) {
+    for (const field of ['notes', 'geographicArea', 'attachments', 'dataSource', 'fullName', 'phoneNumber', 'nationalId', 'content', 'location', 'description', 'aiRationale', 'token', 'aiNarrative', 'fileUrl', 'title']) {
       expect(fields, field).not.toContain(field);
     }
   });
@@ -159,6 +159,30 @@ describe.skipIf(!hasTestDatabase)('audit log', () => {
       values: { id: res.body.id, indicatorId: a.indicator.id, assessmentId: null, value: '42', collectionDate: '2026-05-31T00:00:00.000Z', collectionMethod: 'document_review' },
     });
     expect(JSON.stringify(row)).not.toMatch(/Testname|31\.53/);
+  });
+
+  it('records who published a report to donors and who took it back, never the narrative or the title', async () => {
+    const report = await prisma.report.create({
+      data: { projectId: a.project.id, type: 'quarterly_summary', title: 'Audit Testtitle', aiNarrative: '<p>Narrative Testtext</p>', periodStart: new Date('2026-04-01'), periodEnd: new Date('2026-06-30') },
+    });
+    const published = await request(app).patch(`/api/reports/${report.id}/publish`).set('Authorization', a.adminAuth);
+    expect(published.status).toBe(200);
+    const withdrawn = await request(app).patch(`/api/reports/${report.id}/unpublish`).set('Authorization', a.adminAuth);
+    expect(withdrawn.status).toBe(200);
+    const refused = await request(app).patch(`/api/reports/${report.id}/publish`).set('Authorization', a.officerAuth);
+    expect(refused.status).toBe(403);
+
+    const values = (status: string) => ({
+      id: report.id, projectId: a.project.id, type: 'quarterly_summary', status,
+      generatedAt: report.generatedAt.toISOString(), periodStart: '2026-04-01T00:00:00.000Z', periodEnd: '2026-06-30T00:00:00.000Z',
+    });
+    const [publishRow, refusedRow] = await waitForRows({ action: `PATCH /api/reports/${report.id}/publish` }, 2);
+    expect(publishRow).toMatchObject({ userId: a.admin.id, entity: 'reports', entityId: report.id, newValue: { status: 200, fields: [], values: values('published') } });
+    expect(refusedRow).toMatchObject({ userId: a.officer.id, newValue: { status: 403, fields: [] } });
+    expect(refusedRow.newValue).not.toHaveProperty('values');
+    const [unpublishRow] = await waitForRows({ action: `PATCH /api/reports/${report.id}/unpublish` });
+    expect(unpublishRow).toMatchObject({ userId: a.admin.id, entity: 'reports', entityId: report.id, newValue: { status: 200, fields: [], values: values('draft') } });
+    expect(JSON.stringify(await prisma.auditLog.findMany())).not.toMatch(/Testtext|Testtitle|Project a/);
   });
 
   it('keeps no values when a write is refused or fails', async () => {

@@ -51,14 +51,20 @@ const PROJECT_VALUES = [
 const FRAMEWORK_VALUES = ['id', 'version', 'status', 'name', 'approvedAt', 'approvedBy'] as const;
 /** A result staff entered: never notes, area, attachments or source text. */
 const DATA_POINT_VALUES = ['id', 'indicatorId', 'assessmentId', 'value', 'collectionDate', 'collectionMethod'] as const;
+/**
+ * Publishing to donors: which report (id, type, period and the generation it was published from), and its new
+ * status. Never the narrative, the file location or the free-text title. The audit row is the record of who
+ * published or withdrew a report, and when.
+ */
+const REPORT_VALUES = ['id', 'projectId', 'type', 'status', 'generatedAt', 'periodStart', 'periodEnd'] as const;
 
 /**
  * Writes whose audit row also keeps values (`newValue.values`), so the history of an M&E record (who set a
  * baseline, target or current value, when, and to what) can be read back. Keyed by "METHOD route path" as the
  * route is registered; the values are the listed fields of the record the route answered with, after it was
- * saved. Every field listed is about the project's results, never about a person. Every other write
- * (beneficiaries, services, qualitative entries, documents, users, organisations, webhook tokens) keeps field
- * names only. tests/audit.test.ts checks that every key names a registered route.
+ * saved. Every field listed is about the project's results or reports, never about a person. Every other
+ * write (beneficiaries, services, qualitative entries, documents, users, organisations, webhook tokens) keeps
+ * field names only. tests/audit.test.ts checks that every key names a registered route.
  */
 export const AUDIT_VALUE_ROUTES: Readonly<Record<string, readonly string[]>> = {
   'POST /api/projects/': PROJECT_VALUES,
@@ -71,6 +77,8 @@ export const AUDIT_VALUE_ROUTES: Readonly<Record<string, readonly string[]>> = {
   'PATCH /api/indicators/:id': INDICATOR_VALUES,
   'PATCH /api/indicators/:id/approve': INDICATOR_VALUES,
   'POST /api/indicators/:id/data': DATA_POINT_VALUES,
+  'PATCH /api/reports/:id/publish': REPORT_VALUES,
+  'PATCH /api/reports/:id/unpublish': REPORT_VALUES,
   // Accepting a KPI suggestion creates an indicator with its target (and possibly a baseline), with the officer's edits.
   'POST /api/kpi-suggestions/:id/accept': INDICATOR_VALUES,
 };
@@ -117,10 +125,11 @@ export function auditValues(fields: readonly string[], body: unknown): Record<st
  * One AuditLog row per write request by a signed-in user, with who, what (method and path), when, the HTTP
  * status and the names of the fields the body sent (`newValue = { status, fields }`), so refused requests (403)
  * are told apart from successes and a change of, say, an indicator's target can be traced to who and when.
- * Successful writes to project, framework, result, indicator and data point records, and KPI suggestion acceptances
- * (which create indicators), also keep the allow-listed values of the saved record (`values`, AUDIT_VALUE_ROUTES and
- * AUDIT_NESTED_VALUES), so the history of a baseline or target can be
- * read back. Never any other value from the request or response body: bodies hold beneficiaries' personal
+ * Successful writes to project, framework, result, indicator and data point records, publishing or withdrawing a
+ * report, and KPI suggestion acceptances (which create indicators), also keep the allow-listed values of the saved
+ * record (`values`, AUDIT_VALUE_ROUTES and AUDIT_NESTED_VALUES), so the history of a baseline or target, and of what
+ * was shared with donors, can be read back. Never any other value from the request or response body: bodies hold
+ * beneficiaries' personal
  * data and new webhook tokens (CLAUDE.md rules 3 and 5). Written when the response finishes, so uploads,
  * multer refusals and error-handler answers are covered. Requests without a signed-in user (401s, sign-in,
  * webhooks) are not attributed and not written.

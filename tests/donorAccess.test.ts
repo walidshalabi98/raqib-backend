@@ -510,6 +510,8 @@ describe.skipIf(!hasTestDatabase)('donor viewers: results without identities', (
       ]));
       for (const group of res.body.geographic) if (group.area) expect(LISTED_PLACES.has(group.area)).toBe(true);
       const [trend] = res.body.trends;
+      // Level and unit decide how the dashboard shows progress (as indicatorProgress does).
+      expect(trend).toMatchObject({ level: 'outcome', unit: null });
       expect(trend.dataPoints.map((p: { value: string }) => p.value)).toEqual(['25', '20', '14', '12', '10']);
       expect(trend.surveyAggregates.map((x: { period: string }) => x.period)).toEqual(['2026-08']);
 

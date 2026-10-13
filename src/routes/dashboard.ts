@@ -80,6 +80,8 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
     indicatorId: ind.id,
     indicatorText: ind.indicatorText,
     level: ind.level,
+    // The unit and level decide how progress is shown (indicatorProgress: a count with no baseline starts at zero).
+    unit: ind.unit,
     status: ind.status,
     baselineValue: ind.baselineValue,
     targetValue: ind.targetValue,

@@ -86,6 +86,8 @@ export const ROLE_MATRIX: Record<string, Access> = {
   'post /api/projects/:id/reports/generate': STAFF,
   'get /api/reports/:id': 'all', // donors: 404 for drafts
   'get /api/reports/:id/status': 'all', // donors: 404 for drafts
+  'patch /api/reports/:id/publish': ADMIN, // a finished report only (409 otherwise); donor viewers are notified
+  'patch /api/reports/:id/unpublish': ADMIN, // back to draft: donor viewers no longer see it
   // Dashboard
   'get /api/dashboard/projects/:id/dashboard': 'all', // donors: projected recent activity and areas
   'get /api/dashboard/overview': 'all',
