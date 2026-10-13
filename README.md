@@ -60,6 +60,8 @@ Everything else is optional and documented in `.env.example`. Security-related s
 
 All model calls go through `src/services/ai/client.ts` (`generateStructured`): services pick a tier (`main` or `fast`), never a model id. Every call uses structured outputs validated again with zod, sends the shared system prompt (role + `knowledge/me-foundations.md` §1–12, prompt-cached), retries rate limits and server errors, retries a cut-off answer once, turns refusals into typed errors, and writes one `AiCall` row (tokens, latency, estimated cost; never prompt or answer text). Document text and qualitative notes are redacted (phone numbers, ID numbers, email addresses) before they are stored or sent; AiCall rows are deleted after 24 months. Details, prompt versions and privacy limits: [`docs/AI.md`](docs/AI.md).
 
+**KPI Assistant (Phase 4).** `src/services/kpi/` suggests indicators for a project's results chain (`knowledge/kpi-assistant-spec.md` Part A): it builds a redacted project context, ranks indicator-library candidates (Voyage vectors when `VOYAGE_API_KEY` is set, keywords otherwise), asks the main tier (the fast tier for alternatives) for suggestions in batches of up to 4 results, and validates and scores every suggestion in code (no invented baselines or targets, no targets in names, donor caps, accountability indicators for humanitarian projects). Suggestions become cards the M&E officer accepts, edits or rejects; rejections teach the organisation's preferences. AI framework generation uses the same pipeline for its indicator step. The evaluation harness (`npm run eval:kpi`) runs `knowledge/kpi-eval-cases.json` through the same pipeline and checks the §A8 targets; see [`docs/AI.md`](docs/AI.md).
+
 ## Commands
 
 | Command | What it does |
@@ -74,7 +76,9 @@ All model calls go through `src/services/ai/client.ts` (`generateStructured`): s
 | `npm run seed` | reset and seed demo data — **deletes all data**, refuses to run in production; also loads the indicator library |
 | `npm run seed:library` | load or update the indicator library from `knowledge/indicator-library.json` (idempotent, never deletes; safe in any environment; `-- path/to/draft.json` checks a draft file). With `VOYAGE_API_KEY` set, entries without an embedding are embedded (`VOYAGE_MODEL`, 1024 dimensions) and a second run embeds nothing; `-- --reembed` forces every entry to be re-embedded. Without the key it prints "Embeddings skipped". Needs only `DATABASE_URL` (plus `VOYAGE_API_KEY` / `VOYAGE_MODEL` to embed); entries whose vector is missing or was made by another model are embedded on a plain run |
 | `npm run verify:migration` | prove the Phase 2 and Phase 3 SQL (`prisma/sql/2026-10-11_phase2_data_model.sql`, `prisma/sql/2026-10-12_phase3_ai_foundation.sql`) and the Phase 0, Phase 2, Phase 3 rollout order on throwaway local databases (needs git history and local Postgres with pgvector) |
-| `npm run ai:smoke -- --yes` | **calls the real Anthropic API and costs money** (one or two main-tier calls): generates a framework for the dev seed project (or `--project <id>`) on a development database and prints the indicators, the fields still to be confirmed and the AiCall rows. Needs a real `ANTHROPIC_API_KEY`; refuses in production and unless `DATABASE_URL` is local or names a `dev`/`test` database (`--i-know-this-is-not-shared` overrides); adds a framework version it never deletes. See [`docs/AI.md`](docs/AI.md) §10 |
+| `npm run ai:smoke -- --yes` | **calls the real Anthropic API and costs money** (main tier: one call for the results chain when the project has parsed documents, then one per batch of up to 4 results for the indicators): generates a framework for the dev seed project (or `--project <id>`) on a development database and prints the indicators, the fields still to be confirmed and the AiCall rows. Needs a real `ANTHROPIC_API_KEY`; refuses in production and unless `DATABASE_URL` is local or names a `dev`/`test` database (`--i-know-this-is-not-shared` overrides); adds a framework version it never deletes. See [`docs/AI.md`](docs/AI.md) §10 |
+| `npm run eval:kpi -- --fake` | KPI Assistant evaluation with a deterministic fake model: runs the 8 cases of `knowledge/kpi-eval-cases.json` through the real pipeline (retrieval, validation, assertions, metrics) with no key, no network and no database; free. Prints the summary table, saves `eval-results/<timestamp>.json` (git-ignored) and exits 0 only when the run is complete and every target passes (1 otherwise, 2 when it refuses). CI runs it after the tests. Options: `--case <id>` (repeatable), `--no-result-check`, `--out <dir>`, `--help` |
+| `npm run eval:kpi -- --yes` | **calls the real Anthropic API and costs money** (about US$1–2 for all 8 cases; no new case starts once `--max-usd`, default 3, is spent): the same evaluation with the real model, to run after any prompt or library change and before release (spec §A8 targets: schema validity 100%, assertions ≥ 90%, library use ≥ 70%, no hallucinated targets, average quality ≥ 80, result-level calls with a median under 15 s and none over 30 s). `--embeddings` embeds the library in memory with Voyage (needs `VOYAGE_API_KEY`) to test the vector retrieval production uses with that key. Refuses without a real `ANTHROPIC_API_KEY`, without `--yes` and in production. It never uses a database: `DATABASE_URL` and `DIRECT_URL` are always replaced with an unusable placeholder and AiCall records stay in memory |
 | `npm run storage:setup` | create the private Supabase Storage bucket |
 | `npm run storage:migrate` | move pre-Phase-0 files from `uploads/` to private storage (dry run; add `-- --apply`) |
 | `npm run ai-calls:prune` | shows the AiCall retention cutoff and how many rows are older (dry run); `-- --apply` deletes them in batches of 5000. Needs only `DATABASE_URL` (and optionally `AI_CALL_RETENTION_MONTHS`); prints numbers only. The worker does the same every night |
@@ -90,11 +94,11 @@ DATABASE_URL=$TEST_DATABASE_URL DIRECT_URL=$TEST_DATABASE_URL npx prisma db push
 npm test
 ```
 
-Without `TEST_DATABASE_URL` the integration tests are skipped. AI calls are always mocked in tests (`tests/setup.ts` also points the SDK at an unreachable address, so an unmocked call fails at once); `npm run ai:smoke` is the only command that calls the real API.
+Without `TEST_DATABASE_URL` the integration tests are skipped. AI calls are always mocked in tests (`tests/setup.ts` also points the SDK at an unreachable address, so an unmocked call fails at once); `npm run ai:smoke` and `npm run eval:kpi -- --yes` are the only commands that call the real API. `npm run eval:kpi -- --fake` needs no key and no database.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every pull request and on `main`: install, Prisma generate, lint, typecheck, tests against a pgvector Postgres service, build and `npm audit --audit-level=high`.
+`.github/workflows/ci.yml` runs on every pull request and on `main`: install, Prisma generate, lint, typecheck, tests against a pgvector Postgres service, the KPI evaluation with the fake model (`npm run eval:kpi -- --fake`), build and `npm audit --audit-level=high`. The real evaluation (with a spending cap) is added when the Anthropic key exists.
 
 ## Project layout
 
@@ -106,6 +110,7 @@ src/
   middleware/       auth, organisation access checks, rate limits, uploads, webhooks, errors
   routes/           REST endpoints
   services/ai/      AI client, prompts, redaction, embeddings and features (see docs/AI.md)
+  services/kpi/     KPI Assistant: context, retrieval, model calls, validation, runs, accept/reject; eval/ is the evaluation harness
   services/library  indicator library loading, seeding and embedding
   services/storage  private file storage (Supabase / local)
   services/qualitative  redaction of qualitative entries when they are saved
@@ -113,6 +118,7 @@ src/
   jobs/             BullMQ queues and worker
 prisma/             schema, seed, reviewed SQL for shared databases
 knowledge/          M&E rules, indicator library, KPI Assistant spec and eval cases
+scripts/            one-off and maintenance commands (ai:smoke, eval:kpi, storage, backfills)
 docs/               build guide and setup notes
 tests/              Vitest + Supertest
 ```

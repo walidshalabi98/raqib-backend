@@ -5,21 +5,26 @@ import { authenticate } from '../middleware/auth';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { analyzeProjectRisks } from '../services/ai/riskAnalyzer';
+import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
+import { canSeeIndicator, dataPointVisibilityWhere, indicatorVisibilityWhere } from '../services/indicators/visibility';
 
 const router = Router();
 
 // The current framework of a project: the newest version whose AI generation did not fail.
-const CURRENT_FRAMEWORK = { where: { generationError: null }, orderBy: { version: 'desc' }, take: 1 } as const;
+const CURRENT_VERSION = { where: CURRENT_FRAMEWORK, orderBy: { version: 'desc' }, take: 1 } as const;
 
-// GET /api/projects/:id/dashboard — Aggregated dashboard data
+// GET /api/projects/:id/dashboard — Aggregated dashboard data. For donor viewers every figure (status and level
+// counts, trends, geographic counts, recent activity) comes from approved indicators and their data points only
+// (spec §A1; design section 4.7).
 router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
       frameworks: {
-        ...CURRENT_FRAMEWORK,
+        ...CURRENT_VERSION,
         include: {
           indicators: {
+            where: indicatorVisibilityWhere(req.user),
             include: {
               dataPoints: {
                 orderBy: { collectionDate: 'desc' },
@@ -68,13 +73,13 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
   // Geographic data
   const geoData = await prisma.dataPoint.groupBy({
     by: ['geographicArea'],
-    where: { projectId: req.params.id, geographicArea: { not: null } },
+    where: { projectId: req.params.id, geographicArea: { not: null }, ...dataPointVisibilityWhere(req.user) },
     _count: { id: true },
   });
 
-  // Recent data points
+  // Recent data points (donor viewers: of approved indicators only)
   const recentData = await prisma.dataPoint.findMany({
-    where: { projectId: req.params.id },
+    where: { projectId: req.params.id, ...dataPointVisibilityWhere(req.user) },
     orderBy: { createdAt: 'desc' },
     take: 10,
     include: {
@@ -123,7 +128,8 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
   });
 }));
 
-// GET /api/dashboard/overview — Org-level overview
+// GET /api/dashboard/overview — Org-level overview. Donor viewers: indicator counts and off-track alerts from
+// approved indicators only (spec §A1); the record counts (`dataPointCount` etc.) are not filtered.
 router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
 
@@ -131,9 +137,9 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
     where: { organizationId: orgId },
     include: {
       frameworks: {
-        ...CURRENT_FRAMEWORK,
+        ...CURRENT_VERSION,
         include: {
-          indicators: { select: { id: true, indicatorText: true, status: true } },
+          indicators: { where: indicatorVisibilityWhere(req.user), select: { id: true, indicatorText: true, status: true } },
         },
       },
       _count: { select: { assessments: true, reports: true, dataPoints: true } },
@@ -181,11 +187,13 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
   });
 }));
 
-// GET /api/dashboard/projects/:id/risks — AI Risk Analysis
+// GET /api/dashboard/projects/:id/risks — AI Risk Analysis. A donor viewer's analysis is built from approved
+// indicators only, so the model never sees (and the answer never names) an unapproved one (spec §A1; design 4.7).
 router.get('/projects/:id/risks', authenticate, aiLimiter, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
-  const risks = await analyzeProjectRisks(req.params.id);
+  const approvedOnly = !canSeeIndicator(req.user, { isApproved: false });
+  const risks = await analyzeProjectRisks(req.params.id, { approvedOnly });
   res.json({ projectId: req.params.id, risks, analyzedAt: new Date().toISOString() });
 }));
 

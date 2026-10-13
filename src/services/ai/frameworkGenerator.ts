@@ -1,59 +1,62 @@
 /**
- * AI framework generation (BUILD_GUIDE Phase 2 task 7, Phase 3): two structured-output calls on the
- * main tier through the AI client, then deterministic normalisation (frameworkNormalize.ts).
- * 1. "framework.structure": the coded results chain and the figures quoted in the documents
- *    (skipped without documents; the results chain is then built from the project's metadata).
- * 2. "framework.indicators": one draft reference sheet per indicator.
- * Only aggregates and redacted text reach the model; logs hold counts and ids only. FGD and KII
- * transcripts (Document.qualitativeSource) are never used: qualitative coding covers them.
- * When a run fails, the version keeps a safe message in Framework.generationError and is never the
- * project's current framework (the newest version without a generationError).
+ * AI framework generation (BUILD_GUIDE Phase 2 task 7, Phase 3, Phase 4): the structure call, then the KPI pipeline,
+ * then one transaction that writes the results chain and the indicators.
+ * 1. "framework.structure" (main tier, unchanged since Phase 3): the coded results chain and the figures quoted in the
+ *    documents (skipped without documents; the results chain is then built from the project's metadata).
+ * 2. Indicators through the KPI Assistant pipeline (knowledge/kpi-assistant-spec.md §A2 last row; design section 4.6,
+ *    D19): contextFromGeneration (planned results with codes as ids, verified document figures as facts) →
+ *    runKpiPipeline with feature id "framework.indicators" (batches of ≤ 4 results, 3 at a time, prompt kpi-v1, run
+ *    deadline 10 minutes) → validated drafts. Every generated indicator passes the same validation as a suggestion;
+ *    responsibility, assumptions, baseline method and date, phases, milestones and intermediate targets are server
+ *    defaults ("to be confirmed"), and the indicator dates are the project dates (D22).
+ * Generated indicators are written directly as `ai_generated` (no KpiSuggestion rows: the wizard reviews indicators).
+ * Only aggregates and redacted text reach the model; logs hold counts and ids only. FGD and KII transcripts
+ * (Document.qualitativeSource) are never used: qualitative coding covers them.
+ * When a run fails, the version keeps a safe message in Framework.generationError and is never the project's current
+ * framework (the newest version without a generationError). AiError subclasses (KpiPipelineError included) propagate
+ * unchanged, so the stored messages stay those of Phase 3.
  */
 
 import { IndicatorLevel, Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
+import { toIndicatorCreateData } from '../indicators/validation';
+import { KPI_RUN_DEADLINE_MS } from '../kpi/callModel';
+import { contextFromGeneration } from '../kpi/context';
+import { productionPipelineDeps } from '../kpi/deps';
+import { draftToCreateInput } from '../kpi/draft';
+import { runKpiPipeline } from '../kpi/pipeline';
+import { loadOrgPreferences } from '../kpi/preferences';
 import { generateStructured } from './client';
 import { AiError, AiInvalidOutputError, AiOutputTruncatedError, safeErrorSummary } from './errors';
 import { redactPersonalData } from './redact';
 import {
-  FRAMEWORK_INDICATORS_SCHEMA,
-  FRAMEWORK_INDICATORS_SYSTEM,
   FRAMEWORK_PROMPT_VERSION,
   FRAMEWORK_STRUCTURE_SYSTEM,
   FrameworkProjectInfo,
   PROJECT_STRUCTURE_SCHEMA,
   extractProjectStructurePrompt,
-  generateFrameworkPrompt,
 } from './prompts/framework';
+import { KPI_PROMPT_VERSION } from './prompts/kpi';
 import {
-  LibraryEntryReference,
   ProjectStructure,
   SourceDocument,
   buildStructureFromMetadata,
   documentTextForAi,
-  extractIndicatorList,
-  librarySectorsFor,
-  linkedLibraryIds,
-  normalizeIndicators,
   normalizeProjectStructure,
   planResultNodes,
   projectSectors,
-  selectLibraryCandidates,
-  structureForPrompt,
   verifyDocumentFigures,
 } from './frameworkNormalize';
 
-/** Token limits and timeouts (thinking counts towards max tokens; the client retries a cut-off answer once with twice the limit). */
+/** Token limit and timeout of the structure call (thinking counts towards max tokens; the client retries a cut-off answer once with twice the limit). */
 const STRUCTURE_CALL = { maxTokens: 12_000, timeoutMs: 180_000 } as const;
-const INDICATORS_CALL = { maxTokens: 32_000, timeoutMs: 300_000 } as const;
+
+/** Feature id of the indicator step's model calls (AiCall rows and logs keep the Phase 3 id; the prompt is kpi-v1). */
+export const FRAMEWORK_INDICATORS_FEATURE = 'framework.indicators';
 
 const LEVEL_ORDER: IndicatorLevel[] = ['impact', 'outcome', 'output', 'activity'];
 
-/** Library entry fields used for the prompt candidates and for checking the model's indicators against linked entries. */
-const LIBRARY_ENTRY_SELECT = {
-  id: true, sector: true, name: true, definition: true, unit: true, level: true, methods: true, frequency: true,
-  disaggregation: true, standardReference: true, isStandard: true, notes: true, meansOfVerification: true, calculation: true,
-} satisfies Prisma.IndicatorLibraryEntrySelect;
+const EMPTY_INDICATOR_SET = 'AI returned empty or invalid indicator set';
 
 /** A failure of the generator itself, with a message that is safe to store and show (no prompt, document or model text). */
 export class FrameworkGenerationError extends Error {
@@ -189,64 +192,46 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
   if (!structure) structure = buildStructureFromMetadata({ ...project, description, geographicScope });
   // The only document values the indicators may use: figures whose quote is found in a document.
   const verifiedFigures = verifyDocumentFigures(structure.documentFigures, documents);
-
-  // Step 2: Indicator library candidates (project sectors + cross-cutting; accountability entries for humanitarian projects)
-  console.log(`[FrameworkGenerator] Step 2: Querying indicator library`);
-  const libraryRows = await prisma.indicatorLibraryEntry.findMany({
-    where: {
-      OR: [
-        { sector: { in: librarySectorsFor(sectors) } },
-        ...(project.humanitarian ? [{ id: { startsWith: 'AC-' } }] : []),
-      ],
-    },
-    select: LIBRARY_ENTRY_SELECT,
-  });
-  const candidates = selectLibraryCandidates(libraryRows, { sectors, humanitarian: project.humanitarian });
-
-  // Every library id is accepted (not only the candidates): the model may know a better-fitting entry.
-  const libraryIndex = await prisma.indicatorLibraryEntry.findMany({ select: { id: true } });
-  const knownLibraryIds = new Set(libraryIndex.map(e => e.id));
-
-  // Step 3: Generate the indicator set
-  console.log(`[FrameworkGenerator] Step 3: Generating indicators (${candidates.length} library candidates)`);
-  const frameworkPrompt = generateFrameworkPrompt(
-    structureForPrompt(structure),
-    candidates,
-    projectInfo,
-    { hasDocuments: documentTexts.length > 0 },
-  );
-
-  // Errors propagate: the framework stays as it was and the job fails.
-  const indicatorAnswer = await generateStructured({
-    feature: 'framework.indicators',
-    model: 'main',
-    effort: 'medium',
-    ...INDICATORS_CALL,
-    system: FRAMEWORK_INDICATORS_SYSTEM,
-    messages: [{ role: 'user', content: frameworkPrompt }],
-    schema: FRAMEWORK_INDICATORS_SCHEMA,
-    promptVersion: FRAMEWORK_PROMPT_VERSION,
-    context,
-  });
-  const parsedIndicators = indicatorAnswer.data;
-  // The served model (it may differ from the configured one after a server-side fallback).
-  const aiModel = indicatorAnswer.model;
-
-  if (extractIndicatorList(parsedIndicators).length === 0) {
-    throw new FrameworkGenerationError('AI returned empty or invalid indicator set');
-  }
-
-  // Linked library entries (standard reference, sex disaggregation, standard thresholds): the loaded rows,
-  // plus any linked entry outside the candidate sectors.
-  const libraryEntries = new Map<string, LibraryEntryReference>(libraryRows.map(e => [e.id, e]));
-  const missingLibraryIds = linkedLibraryIds(parsedIndicators).filter(id => knownLibraryIds.has(id) && !libraryEntries.has(id));
-  if (missingLibraryIds.length > 0) {
-    const linkedRows = await prisma.indicatorLibraryEntry.findMany({ where: { id: { in: missingLibraryIds } }, select: LIBRARY_ENTRY_SELECT });
-    for (const entry of linkedRows) libraryEntries.set(entry.id, entry);
-  }
-
-  // Step 4: Create the results chain and the indicators together, so a failure leaves no partial framework
   const plan = planResultNodes(structure);
+
+  // Step 2: indicators through the KPI pipeline (spec §A2 last row; design 4.6, D19): candidates from the library,
+  // batches of results, validation; the organisation's rejected library ids are excluded as in every KPI run.
+  const orgPreferences = await loadOrgPreferences(prisma, {
+    organizationId: project.organizationId, projectId, donorType: project.donorType, now: new Date(),
+  });
+  const kpiContext = contextFromGeneration({
+    project: {
+      id: projectId,
+      name: projectInfo.name,
+      sectors,
+      donor: projectInfo.donor,
+      donorType: project.donorType,
+      startDate: projectInfo.startDate as string,
+      endDate: projectInfo.endDate as string,
+      geographicScope,
+      targetBeneficiaries: project.targetBeneficiaries ?? null,
+      humanitarian: project.humanitarian,
+      description,
+    },
+    plan,
+    verifiedFigures,
+    documents,
+    orgPreferences,
+  });
+  console.log(`[FrameworkGenerator] Step 2: KPI pipeline for ${kpiContext.resultsChain.length} results (${verifiedFigures.length} verified document figures)`);
+  // Errors propagate unchanged (AiError subclasses, KpiPipelineError included): the framework stays empty and the job fails.
+  const kpi = await runKpiPipeline(kpiContext, productionPipelineDeps(), {
+    feature: FRAMEWORK_INDICATORS_FEATURE,
+    callContext: context,
+    deadlineMs: KPI_RUN_DEADLINE_MS,
+  });
+  // An appended accountability indicator alone is no indicator set: the model's answers gave nothing usable.
+  if (!kpi.suggestions.some(s => s.origin === 'model')) throw new FrameworkGenerationError(EMPTY_INDICATOR_SET);
+  // The served model of the first successful call (it may differ from the configured one after a server-side fallback).
+  const aiModel = kpi.model ?? 'unknown';
+  console.log(`[FrameworkGenerator] KPI pipeline: ${kpi.suggestions.length} indicators from ${kpi.calls.length} calls, ${kpi.frameworkWarnings.length} framework warnings, retrieval ${kpi.retrieval}`);
+
+  // Step 3: Create the results chain and the indicators together, so a failure leaves no partial framework
   const { resultCount, indicatorCount } = await prisma.$transaction(async tx => {
     const idByCode = new Map<string, string>();
     const nodes: Array<{ id: string; code: string; level: IndicatorLevel; parentId: string | null }> = [];
@@ -266,26 +251,40 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
         select: { id: true, code: true, level: true, parentId: true },
       });
       for (const node of created) idByCode.set(node.code, node.id);
-      // Keep the plan's order (goal, outcomes, outputs, activities) for the "first node of a level" fallback.
       for (const p of rows) {
         const node = created.find(c => c.code === p.code);
         if (node) nodes.push(node);
       }
     }
 
-    const payloads = normalizeIndicators(parsedIndicators, {
-      frameworkId,
-      resultNodes: nodes,
-      knownLibraryIds,
-      libraryEntries,
-      verifiedFigures,
-      aiModel,
-      promptVersion: FRAMEWORK_PROMPT_VERSION,
-    });
-    if (payloads.length === 0) throw new FrameworkGenerationError('AI returned empty or invalid indicator set');
+    // Suggestions come in chain order; their resultId is the plan code (contextFromGeneration: ids = codes).
+    const data: Prisma.IndicatorUncheckedCreateInput[] = [];
+    let skipped = 0;
+    for (const suggestion of kpi.suggestions) {
+      const resultId = idByCode.get(suggestion.resultId);
+      if (!resultId) {
+        skipped += 1;
+        continue;
+      }
+      let input;
+      try {
+        input = draftToCreateInput({ ...suggestion.draft, resultId });
+      } catch {
+        // Drafts always pass the indicator checks (validate.ts); one that does not is skipped, never half-written.
+        skipped += 1;
+        continue;
+      }
+      data.push({
+        ...toIndicatorCreateData(frameworkId, { ...input, provenance: 'ai_generated' }, { sortOrder: data.length, resultLevel: suggestion.level }),
+        aiModel,
+        promptVersion: KPI_PROMPT_VERSION,
+      });
+    }
+    if (skipped > 0) console.warn(`[FrameworkGenerator] ${skipped} generated indicator(s) skipped (no result node or failed the indicator checks)`);
+    if (data.length === 0) throw new FrameworkGenerationError(EMPTY_INDICATOR_SET);
 
-    console.log(`[FrameworkGenerator] Step 4: Creating ${nodes.length} results and ${payloads.length} indicators`);
-    await tx.indicator.createMany({ data: payloads });
+    console.log(`[FrameworkGenerator] Step 3: Creating ${nodes.length} results and ${data.length} indicators`);
+    await tx.indicator.createMany({ data });
 
     // Update framework status
     await tx.framework.update({
@@ -299,7 +298,7 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
       data: { status: 'framework_review' },
     });
 
-    return { resultCount: nodes.length, indicatorCount: payloads.length };
+    return { resultCount: nodes.length, indicatorCount: data.length };
   }, { maxWait: 10_000, timeout: 60_000 });
 
   // Create notification for admins
@@ -322,5 +321,5 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
     });
   }
 
-  console.log(`[FrameworkGenerator] Framework generation complete for ${project.name} (${resultCount} results, ${indicatorCount} indicators)`);
+  console.log(`[FrameworkGenerator] Framework generation complete for project ${projectId} (${resultCount} results, ${indicatorCount} indicators)`);
 }

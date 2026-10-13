@@ -2,7 +2,8 @@ import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bearer, hasTestDatabase, resetDatabase } from './helpers';
 
-// The five AI services end to end against the test database; only generateStructured is
+// The AI services end to end against the test database (the Phase 3 indicator alternatives generator was removed
+// in Phase 4; KPI alternatives are tested in tests/kpiPipeline.test.ts); only generateStructured is
 // mocked (never the SDK, never the network).
 vi.unmock('../src/services/ai/qualitativeCoder');
 vi.unmock('../src/services/ai/reportNarrative');
@@ -16,13 +17,11 @@ vi.mock('../src/services/ai/client', () => ({
 
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
-import { generateIndicatorAlternatives } from '../src/services/ai/indicatorAlternative';
 import { codeQualitativeEntry } from '../src/services/ai/qualitativeCoder';
 import { generateReportNarrative } from '../src/services/ai/reportNarrative';
 import { analyzeProjectRisks } from '../src/services/ai/riskAnalyzer';
 import { ASSESSMENT_SAVE_FAILED, generateAutoAssessment } from '../src/services/ai/assessmentGenerator';
-import { AiInvalidOutputError, AiRefusalError, AiRequestError } from '../src/services/ai/errors';
-import { ALTERNATIVES_PROMPT_VERSION, ALTERNATIVES_SCHEMA, ALTERNATIVES_SYSTEM } from '../src/services/ai/prompts/alternatives';
+import { AiInvalidOutputError, AiRefusalError } from '../src/services/ai/errors';
 import { QUALITATIVE_PROMPT_VERSION, QUALITATIVE_SCHEMA, QUALITATIVE_SYSTEM } from '../src/services/ai/prompts/qualitative';
 import { NARRATIVE_PROMPT_VERSION, NARRATIVE_SCHEMA, NARRATIVE_SYSTEM } from '../src/services/ai/prompts/narrative';
 import { RISK_PROMPT_VERSION, RISK_SCHEMA, RISK_SYSTEM } from '../src/services/ai/prompts/risk';
@@ -146,73 +145,6 @@ describe.skipIf(!hasTestDatabase)('AI services with the AI client mocked', () =>
 
   afterEach(() => {
     vi.restoreAllMocks();
-  });
-
-  describe('generateIndicatorAlternatives', () => {
-    it('calls the fast tier with the indicator details and returns normalised alternatives', async () => {
-      const seed = await seedProject();
-      const indicator = await addIndicator(seed, { indicatorText: '% of households with a stable income' });
-      mocks.generateStructured.mockResolvedValue(structuredResult({
-        alternatives: [
-          {
-            indicatorText: ' % of households with income from two or more sources ', indicatorTextAr: 'نسبة الأسر التي لديها مصدران للدخل أو أكثر', level: 'impact',
-            dataCollectionMethod: 'hh_survey', frequency: 'biannual', rationale: 'EU GERF-aligned.', pros: ['Standard'], cons: ['Survey cost'],
-          },
-          {
-            indicatorText: 'Increase household income to 80%', indicatorTextAr: '', level: 'outcome',
-            dataCollectionMethod: 'kii', frequency: 'annual', rationale: '', pros: [], cons: [],
-          },
-          {
-            indicatorText: 'Average monthly household income (ILS), by sex of household head', indicatorTextAr: '', level: 'outcome',
-            dataCollectionMethod: 'secondary_data', frequency: 'quarterly', rationale: 'PCBS comparable.', pros: [], cons: ['Self-reported'],
-          },
-        ],
-      }, ALTERNATIVES_PROMPT_VERSION));
-
-      const alternatives = await generateIndicatorAlternatives(indicator.id, seed.project.id);
-
-      expect(alternatives).toEqual([
-        {
-          indicatorText: '% of households with income from two or more sources', indicatorTextAr: 'نسبة الأسر التي لديها مصدران للدخل أو أكثر', level: 'outcome',
-          dataCollectionMethod: 'hh_survey', frequency: 'biannual', rationale: 'EU GERF-aligned.', pros: ['Standard'], cons: ['Survey cost'],
-        },
-        {
-          indicatorText: 'Average monthly household income (ILS), by sex of household head', level: 'outcome',
-          dataCollectionMethod: 'secondary_data', frequency: 'quarterly', rationale: 'PCBS comparable.', pros: [], cons: ['Self-reported'],
-        },
-      ]);
-
-      const params = callParams();
-      expect(params).toMatchObject({
-        feature: 'indicator.alternatives', model: 'fast', effort: 'low', maxTokens: 4000,
-        promptVersion: ALTERNATIVES_PROMPT_VERSION, system: ALTERNATIVES_SYSTEM,
-        context: { organizationId: seed.org.id, projectId: seed.project.id },
-      });
-      expect(params.schema).toBe(ALTERNATIVES_SCHEMA);
-      const prompt = params.messages[0].content;
-      expect(prompt).toContain('% of households with a stable income');
-      expect(prompt).toContain('Households reporting income in each of the last three months');
-      expect(prompt).toContain('- Unit: percentage');
-      expect(prompt).toContain('O1 Household income is more stable');
-      expect(prompt).toContain('Women-headed households in Hebron. Focal point [phone removed].');
-      expect(prompt).not.toContain(PHONE);
-    });
-
-    it('propagates AI errors', async () => {
-      const seed = await seedProject();
-      const indicator = await addIndicator(seed, { indicatorText: '% of households with a stable income' });
-      mocks.generateStructured.mockRejectedValue(new AiRequestError('indicator.alternatives', 529, true, 4));
-      await expect(generateIndicatorAlternatives(indicator.id, seed.project.id)).rejects.toBeInstanceOf(AiRequestError);
-    });
-
-    it("refuses an indicator of another organisation's project without calling the model", async () => {
-      const mine = await seedProject();
-      const other = await seedProject();
-      const foreign = await addIndicator(other, { indicatorText: 'Foreign indicator' });
-      await expect(generateIndicatorAlternatives(foreign.id, mine.project.id)).rejects.toThrow(/not found/);
-      await expect(generateIndicatorAlternatives(foreign.id, '00000000-0000-0000-0000-000000000000')).rejects.toThrow(/not found/);
-      expect(mocks.generateStructured).not.toHaveBeenCalled();
-    });
   });
 
   describe('codeQualitativeEntry', () => {

@@ -1,10 +1,21 @@
 import { Router, Request, Response } from 'express';
+import type { Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { assertBeneficiaryAccess, assertIndicatorsInProject, assertProjectAccess } from '../middleware/access';
 import { authenticate } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
+import { canSeeIndicator, indicatorVisibilityWhere } from '../services/indicators/visibility';
 
 const router = Router();
+
+/**
+ * The service records `user` may see: for a donor viewer, services linked to an unapproved indicator are left out
+ * (services without an indicator stay); no condition for every other role (spec §A1; design section 4.7).
+ */
+function serviceVisibilityWhere(user: { role: UserRole } | undefined): Prisma.BeneficiaryServiceWhereInput | undefined {
+  if (canSeeIndicator(user, { isApproved: false })) return undefined;
+  return { OR: [{ indicatorId: null }, { indicator: indicatorVisibilityWhere(user) }] };
+}
 
 // GET /api/projects/:id/beneficiaries - List with filters
 router.get('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req: Request, res: Response) => {
@@ -27,7 +38,7 @@ router.get('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req:
 
   const beneficiaries = await prisma.beneficiary.findMany({
     where,
-    include: { services: { orderBy: { dateProvided: 'desc' }, take: 5 } },
+    include: { services: { where: serviceVisibilityWhere(req.user), orderBy: { dateProvided: 'desc' }, take: 5 } },
     orderBy: { registrationDate: 'desc' },
   });
 
@@ -74,7 +85,8 @@ router.post('/projects/:id/beneficiaries', authenticate, asyncHandler(async (req
   res.status(201).json(beneficiary);
 }));
 
-// GET /api/beneficiaries/:id - Get single with full service history
+// GET /api/beneficiaries/:id - Get single with full service history. Each service names its indicator (id and
+// text only); donor viewers do not get services linked to an unapproved indicator (spec §A1; design section 4.7).
 router.get('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertBeneficiaryAccess(req, req.params.id);
   const beneficiary = await prisma.beneficiary.findUniqueOrThrow({
@@ -82,9 +94,10 @@ router.get('/beneficiaries/:id', authenticate, asyncHandler(async (req: Request,
     include: {
       project: true,
       services: {
+        where: serviceVisibilityWhere(req.user),
         orderBy: { dateProvided: 'desc' },
-        include: { indicator: true }
-      }
+        include: { indicator: { select: { id: true, indicatorText: true } } },
+      },
     },
   });
   res.json(beneficiary);

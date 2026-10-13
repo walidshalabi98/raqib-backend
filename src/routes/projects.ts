@@ -5,7 +5,9 @@ import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { validationErrorBody } from '../services/dataPoints/fields';
 import { DOCUMENT_FIELDS, withTextLength } from './documents';
+import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
 import { sortResultNodes } from '../services/indicators/hierarchy';
+import { indicatorVisibilityWhere } from '../services/indicators/visibility';
 import { parseProjectCreate, parseProjectUpdate } from '../services/projects/validation';
 
 const router = Router();
@@ -41,7 +43,7 @@ router.post('/', authenticate, authorize('org_admin', 'platform_admin'), asyncHa
   res.status(201).json(project);
 }));
 
-// GET /api/projects/:id
+// GET /api/projects/:id — donor viewers get the current framework's approved indicators only (spec §A1)
 router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
@@ -50,10 +52,10 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
       documents: { select: DOCUMENT_FIELDS, orderBy: { uploadedAt: 'desc' } },
       // The current framework: the newest version whose AI generation did not fail.
       frameworks: {
-        where: { generationError: null },
+        where: CURRENT_FRAMEWORK,
         orderBy: { version: 'desc' },
         take: 1,
-        include: { indicators: { orderBy: { sortOrder: 'asc' } } },
+        include: { indicators: { where: indicatorVisibilityWhere(req.user), orderBy: { sortOrder: 'asc' } } },
       },
       _count: {
         select: { assessments: true, dataPoints: true, qualitativeEntries: true, reports: true },
@@ -84,7 +86,9 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
   res.json(updated);
 }));
 
-// GET /api/projects/:id/export - Export project data as JSON (for Excel conversion)
+// GET /api/projects/:id/export - Export project data as JSON (for Excel conversion). Donor viewers get approved
+// indicators only, with their data points (spec §A1). The beneficiary part is unchanged in Phase 4 (design 4.7,
+// owner question 2).
 router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
@@ -96,6 +100,7 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
             select: { id: true, code: true, level: true, text: true, textAr: true, parentId: true, sortOrder: true },
           },
           indicators: {
+            where: indicatorVisibilityWhere(req.user),
             orderBy: { sortOrder: 'asc' },
             include: {
               result: { select: { code: true } },

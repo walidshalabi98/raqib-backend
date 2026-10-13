@@ -635,8 +635,9 @@ const DIGIT = /\d/;
  * Arabic-Indic digits, the Arabic decimal separator (٫) as ".", the Arabic thousands separator (٬)
  * and the Arabic comma (،) as ",", the Arabic percent sign (٪) as "%", typographic quotes and dashes
  * as ASCII, single spaces, no space before "%", lower case. "١٢٬٠٠٠" and "12,000" then compare equal.
+ * Exported for the KPI Assistant (validate.ts finds cue positions in the same normalised text; design 4.2).
  */
-function normaliseForMatch(value: string): string {
+export function normaliseForMatch(value: string): string {
   return value
     .normalize('NFKC')
     .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660)) // Arabic-Indic digits
@@ -754,6 +755,43 @@ function isDateOrRangePart(haystack: string, start: number, end: number): boolea
   if ((before === '/' || before === '-') && DIGIT.test(haystack[start - 2] ?? '')) return true;
   if ((after === '/' || after === '-') && DIGIT.test(haystack[end + 1] ?? '')) return true;
   return false;
+}
+
+/**
+ * A percent marker right after a number in normalised text: "%" ("٪" and " %" are normalised to it), or the words
+ * "percent", "per cent", "بالمئة", "بالمائة", "في المئة", "في المائة" after one optional space.
+ */
+const PERCENT_MARKER_AFTER = /^(?:%| ?(?:percent|per cent)(?![\p{L}\p{N}])| ?(?:بالمئة|بالمائة|في المئة|في المائة)(?!\p{L}))/u;
+
+/**
+ * Every place where `value` stands alone in `text` (KPI Assistant rules 8–9, D14; me-foundations §6): the text is
+ * compared after normaliseForMatch with the text after the AI analysis marker ignored (stripAiAnalysis), and an
+ * occurrence counts only when it is not part of a larger number ("4" in "42", "22" in "22.5%", "1" in "1.200") and
+ * not part of a date or a range (isDateOrRangePart). `start`/`end` are offsets in normaliseForMatch(stripAiAnalysis(text));
+ * `percent` is true when a percent marker follows the number (PERCENT_MARKER_AFTER) or the value itself ends with "%".
+ * [] for values without a digit.
+ */
+export function standaloneValueOffsets(text: string, value: string): Array<{ start: number; end: number; percent: boolean }> {
+  const needle = matchNeedle(value);
+  if (needle === null) return [];
+  const haystack = normaliseForMatch(stripAiAnalysis(text));
+  const valueIsPercent = needle.endsWith('%');
+  const out: Array<{ start: number; end: number; percent: boolean }> = [];
+  for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + 1)) {
+    const end = i + needle.length;
+    if (partOfLargerNumber(haystack, i, end) || isDateOrRangePart(haystack, i, end)) continue;
+    out.push({ start: i, end, percent: valueIsPercent || PERCENT_MARKER_AFTER.test(haystack.slice(end)) });
+  }
+  return out;
+}
+
+/**
+ * True when `value` stands alone in the excerpt (standaloneValueOffsets); with `unitIsPercent` given, at an occurrence
+ * whose `percent` equals it: a percent indicator needs a percent marker after the number, any other unit must not have
+ * one (KPI Assistant rules 8–9, D14: "900 youth" never supports a percentage, "60% employed" never a count).
+ */
+export function excerptSupportsValue(excerpt: string, value: string, unitIsPercent?: boolean): boolean {
+  return standaloneValueOffsets(excerpt, value).some(o => unitIsPercent === undefined || o.percent === unitIsPercent);
 }
 
 /** Quote marks, brackets and final punctuation around a quote, which the model may add or drop. */
@@ -928,7 +966,11 @@ export function isGenericMeansOfVerification(value: string): boolean {
   return GENERIC_MEANS_OF_VERIFICATION.has(key);
 }
 
-function isPercentUnit(unit: string, name: string): boolean {
+/**
+ * True for a percentage indicator: the unit starts with "%" or "percent", or the name starts with "%", "percentage" or
+ * "proportion" (me-foundations §2 rule 3; KPI Assistant rule 5 and rules 8–9). Exported for the KPI Assistant (design 4.2).
+ */
+export function isPercentUnit(unit: string, name: string): boolean {
   const u = unit.trim().toLowerCase();
   return u.startsWith('%') || u.startsWith('percent') || /^(%|percentage\b|proportion\b)/i.test(name.trim());
 }
@@ -1170,7 +1212,13 @@ export type IndicatorCreatePayload = Prisma.IndicatorCreateManyInput & {
   frequency: Frequency;
 };
 
-const codeKey = (code: string) => code.trim().toUpperCase().replace(/\s+/g, '');
+/**
+ * Result-code key: trimmed, upper case, no spaces ("o 1.2" → "O1.2"). Exported for the KPI Assistant (rule x1 and code
+ * collisions, design 4.2 and 4.3).
+ */
+export function codeKey(code: string): string {
+  return code.trim().toUpperCase().replace(/\s+/g, '');
+}
 const GOAL_ALIASES = new Set(['G', 'GOAL', 'IMPACT']);
 
 /**

@@ -3,21 +3,24 @@ import { prisma } from '../config/prisma';
 import { assertProjectAccess } from '../middleware/access';
 import { authenticate } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
+import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
+import { indicatorVisibilityWhere } from '../services/indicators/visibility';
 
 const router = Router();
 
-// GET /api/projects/:id/export/indicators
+// GET /api/projects/:id/export/indicators — donor viewers get approved indicators only (spec §A1)
 router.get('/projects/:id/export/indicators', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
       // The current framework: the newest version whose AI generation did not fail.
       frameworks: {
-        where: { generationError: null },
+        where: CURRENT_FRAMEWORK,
         orderBy: { version: 'desc' },
         take: 1,
         include: {
           indicators: {
+            where: indicatorVisibilityWhere(req.user),
             orderBy: { sortOrder: 'asc' },
             include: { dataPoints: { orderBy: { collectionDate: 'desc' } } },
           },

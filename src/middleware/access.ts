@@ -1,4 +1,5 @@
 import { Request } from 'express';
+import type { KpiSuggestion, KpiSuggestionRun, Project } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { AppError } from './errorHandler';
 
@@ -112,4 +113,31 @@ export async function assertResultAccess(req: Request, resultId: string) {
   });
   if (!result) throw new AppError(404, 'Result not found');
   return result;
+}
+
+/**
+ * A KPI suggestion run of the caller's organisation, with its project (GET /api/kpi-suggestion-runs/:id;
+ * knowledge/kpi-assistant-spec.md §A6 "All routes check that the project belongs to req.user.organizationId").
+ * 404 "Run not found" for another organisation's run, as for every other resource.
+ */
+export async function assertKpiRunAccess(req: Request, runId: string): Promise<KpiSuggestionRun & { project: Project }> {
+  const run = await prisma.kpiSuggestionRun.findFirst({
+    where: { id: runId, project: { organizationId: orgId(req) } },
+    include: { project: true },
+  });
+  if (!run) throw new AppError(404, 'Run not found');
+  return run;
+}
+
+/**
+ * A KPI suggestion of the caller's organisation, with its project (POST /api/kpi-suggestions/:id/accept|reject;
+ * spec §A6). 404 "Suggestion not found" for another organisation's suggestion.
+ */
+export async function assertKpiSuggestionAccess(req: Request, suggestionId: string): Promise<KpiSuggestion & { project: Project }> {
+  const suggestion = await prisma.kpiSuggestion.findFirst({
+    where: { id: suggestionId, project: { organizationId: orgId(req) } },
+    include: { project: true },
+  });
+  if (!suggestion) throw new AppError(404, 'Suggestion not found');
+  return suggestion;
 }

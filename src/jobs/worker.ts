@@ -4,7 +4,6 @@ import { prisma } from '../config/prisma';
 import { redis } from '../config/redis';
 import { parseDocument } from '../services/ai/documentParser';
 import { generateFramework } from '../services/ai/frameworkGenerator';
-import { generateIndicatorAlternatives } from '../services/ai/indicatorAlternative';
 import { generateReportNarrative } from '../services/ai/reportNarrative';
 import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
 import { loadSharedSystemPrompt } from '../services/ai/prompts/system';
@@ -48,19 +47,8 @@ frameworkWorker.on('failed', (job, err) => {
   console.error(`[Worker] Framework generation failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
 
-// Indicator Alternatives Worker
-const indicatorWorker = new Worker('indicator-alternatives', async (job: Job) => {
-  console.log(`[Worker] Generating alternatives for indicator ${job.data.indicatorId}`);
-  const alternatives = await generateIndicatorAlternatives(job.data.indicatorId, job.data.projectId);
-  return alternatives;
-}, { connection: redis, concurrency: 3 });
-
-indicatorWorker.on('completed', (job) => {
-  console.log(`[Worker] Indicator alternatives completed: ${job.id}`);
-});
-indicatorWorker.on('failed', (job, err) => {
-  console.error(`[Worker] Indicator alternatives failed: ${job?.id}: ${safeErrorSummary(err)}`);
-});
+// Indicator alternatives: the Phase 3 'indicator-alternatives' worker was removed in Phase 4 (nothing enqueued to it);
+// alternatives now come from the KPI Assistant (src/services/kpi/, POST /api/indicators/:id/alternative).
 
 // Report Generation Worker
 const reportWorker = new Worker('report-generation', async (job: Job) => {
@@ -108,7 +96,6 @@ async function shutdown() {
   await Promise.all([
     documentWorker.close(),
     frameworkWorker.close(),
-    indicatorWorker.close(),
     reportWorker.close(),
     qualitativeWorker.close(),
     maintenanceWorker.close(),

@@ -2,7 +2,7 @@ import request from 'supertest';
 import { beforeAll, describe, expect, it } from 'vitest';
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
-import { createOrgFixture, hasTestDatabase, OrgFixture, PDF_BYTES, resetDatabase } from './helpers';
+import { createKpiFixtures, createOrgFixture, hasTestDatabase, KpiFixtures, OrgFixture, PDF_BYTES, resetDatabase } from './helpers';
 
 type TargetOrg = OrgFixture & { notificationId: string };
 type Method = 'get' | 'post' | 'patch' | 'delete';
@@ -111,6 +111,13 @@ const ROUTES: RouteCase[] = [
   { method: 'patch', route: '/api/users/:id', path: b => `/api/users/${b.officer.id}`, body: () => ({ fullName: 'Hijacked' }) },
   { method: 'delete', route: '/api/users/:id', path: b => `/api/users/${b.officer.id}` },
   { method: 'patch', route: '/api/notifications/:id/read', path: b => `/api/notifications/${b.notificationId}/read` },
+  // KPI Assistant (Phase 4, design 7.5)
+  { method: 'post', route: '/api/projects/:id/kpi-suggestions', path: b => `/api/projects/${b.project.id}/kpi-suggestions`, body: () => ({ scope: 'framework' }) },
+  { method: 'get', route: '/api/projects/:id/kpi-suggestions', path: b => `/api/projects/${b.project.id}/kpi-suggestions` },
+  { method: 'get', route: '/api/kpi-suggestion-runs/:id', path: b => `/api/kpi-suggestion-runs/${b.kpiRun.id}` },
+  { method: 'post', route: '/api/kpi-suggestions/:id/accept', path: b => `/api/kpi-suggestions/${b.kpiSuggestion.id}/accept`, body: () => ({}) },
+  { method: 'post', route: '/api/kpi-suggestions/:id/reject', path: b => `/api/kpi-suggestions/${b.kpiSuggestion.id}/reject`, body: () => ({ reason: 'not_relevant' }) },
+  { method: 'get', route: '/api/frameworks/:id/indicator-quality', path: b => `/api/frameworks/${b.framework.id}/indicator-quality` },
 ];
 
 // Routes with an id that are not organisation-owned: the global indicator template library.
@@ -199,6 +206,12 @@ describe.skipIf(!hasTestDatabase)('organisation isolation', () => {
     expect(await prisma.document.count({ where: { projectId: b.project.id } })).toBe(1);
     expect(await prisma.webhookToken.count({ where: { organizationId: b.org.id } })).toBe(0);
     expect((await prisma.notification.findUniqueOrThrow({ where: { id: b.notificationId } })).isRead).toBe(false);
+    // KPI Assistant: B's suggestion still pending, no new run, no indicator created from it.
+    expect(await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: b.kpiSuggestion.id } })).toMatchObject({
+      status: 'pending', decidedAt: null, rejectReason: null, indicatorId: null,
+    });
+    expect(await prisma.kpiSuggestionRun.count({ where: { projectId: b.project.id } })).toBe(1);
+    expect(await prisma.kpiSuggestion.count({ where: { projectId: b.project.id } })).toBe(1);
   });
 
   it.each(ROUTES.filter(r => r.method === 'get').map(r => [r.route, r] as const))(
@@ -298,5 +311,97 @@ describe.skipIf(!hasTestDatabase)('organisation isolation', () => {
       .set('Authorization', a.adminAuth)
       .send({ role: 'platform_admin' });
     expect(promote.status).toBe(403);
+  });
+});
+
+describe.skipIf(!hasTestDatabase)('KPI Assistant: ids in request bodies, old framework versions and roles (design 7.5)', () => {
+  let a: OrgFixture;
+  let b: OrgFixture;
+  let k: KpiFixtures;
+
+  const post = (path: string, body: object, auth = a.officerAuth) => request(app).post(path).set('Authorization', auth).send(body);
+  const runsOf = (projectIds: string[]) => prisma.kpiSuggestionRun.count({ where: { projectId: { in: projectIds } } });
+
+  beforeAll(async () => {
+    await resetDatabase();
+    a = await createOrgFixture('ka');
+    b = await createOrgFixture('kb');
+    k = await createKpiFixtures(a);
+  });
+
+  it('answers 400 for a result, indicator or suggestion id of another organisation, another project or an old version, and creates no run', async () => {
+    const projects = [a.project.id, k.a2.project.id, k.a3.project.id];
+    const before = await runsOf(projects);
+    const main = `/api/projects/${a.project.id}/kpi-suggestions`;
+    const a3 = `/api/projects/${k.a3.project.id}/kpi-suggestions`;
+    const cases: Array<[string, string, object, RegExp]> = [
+      ['B result', main, { scope: 'result', resultId: b.result.id }, /resultId/],
+      ['A2 result', main, { scope: 'result', resultId: k.a2.result.id }, /resultId/],
+      ['A3 v1 result', a3, { scope: 'result', resultId: k.a3.v1.result.id }, /resultId/],
+      ['B indicator', main, { scope: 'alternatives', indicatorId: b.indicator.id }, /indicatorId/],
+      ['A2 indicator', main, { scope: 'alternatives', indicatorId: k.a2.indicator.id }, /indicatorId/],
+      ['A3 v1 indicator', a3, { scope: 'alternatives', indicatorId: k.a3.v1.indicator.id }, /indicatorId/],
+      ['B suggestion', main, { scope: 'alternatives', suggestionId: b.kpiSuggestion.id }, /suggestionId/],
+      ['A2 suggestion', main, { scope: 'alternatives', suggestionId: k.a2.kpiSuggestion.id }, /suggestionId/],
+      ['A3 v1 suggestion', a3, { scope: 'alternatives', suggestionId: k.a3.v1.kpiSuggestion.id }, /suggestionId/],
+    ];
+    for (const [name, path, body, message] of cases) {
+      const res = await post(path, body);
+      expect(res.status, name).toBe(400);
+      expect(res.body.message, name).toMatch(message);
+    }
+    expect(await runsOf(projects)).toBe(before);
+    expect(await prisma.kpiSuggestionRun.count({ where: { projectId: b.project.id } })).toBe(1);
+  });
+
+  it('alias route: 409 stale for an indicator of an older framework version, 422 for an indicator without a result', async () => {
+    const stale = await post(`/api/indicators/${k.a3.v1.indicator.id}/alternative`, {});
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('stale');
+
+    const unlinked = await post(`/api/indicators/${k.unlinkedIndicator.id}/alternative`, {});
+    expect(unlinked.status).toBe(422);
+    expect(unlinked.body).toMatchObject({ code: 'not_suggestable', message: 'Link the indicator to a result first.' });
+    expect(await runsOf([a.project.id, k.a3.project.id])).toBe(2);
+  });
+
+  it('accepting a pending suggestion of an older framework version answers 409 stale and expires it', async () => {
+    const res = await post(`/api/kpi-suggestions/${k.a3.v1.kpiSuggestion.id}/accept`, {});
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('stale');
+    expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: k.a3.v1.kpiSuggestion.id } })).status).toBe('expired');
+    expect(await prisma.indicator.count({ where: { frameworkId: k.a3.v2.framework.id } })).toBe(0);
+  });
+
+  it('accept refuses edits that point at another organisation\'s or another project\'s result, or an unknown library id', async () => {
+    const indicatorsBefore = await prisma.indicator.count({ where: { frameworkId: a.framework.id } });
+    for (const edits of [{ resultId: b.result.id }, { resultId: k.a2.result.id }, { libraryId: 'NOPE-99' }]) {
+      const res = await post(`/api/kpi-suggestions/${a.kpiSuggestion.id}/accept`, { edits });
+      expect(res.status, JSON.stringify(edits)).toBe(400);
+    }
+    expect(await prisma.indicator.count({ where: { frameworkId: a.framework.id } })).toBe(indicatorsBefore);
+    expect(await prisma.indicator.count({ where: { frameworkId: b.framework.id } })).toBe(1);
+    expect(await prisma.indicator.count({ where: { frameworkId: k.a2.framework.id } })).toBe(1);
+    // The rolled-back transaction left the suggestion pending.
+    expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: a.kpiSuggestion.id } })).status).toBe('pending');
+  });
+
+  it('donor viewers get 403 on all 8 KPI routes', async () => {
+    const calls = [
+      () => request(app).post(`/api/projects/${a.project.id}/kpi-suggestions`).send({ scope: 'framework' }),
+      () => request(app).get(`/api/projects/${a.project.id}/kpi-suggestions`),
+      () => request(app).get(`/api/kpi-suggestion-runs/${a.kpiRun.id}`),
+      () => request(app).post(`/api/kpi-suggestions/${a.kpiSuggestion.id}/accept`).send({}),
+      () => request(app).post(`/api/kpi-suggestions/${a.kpiSuggestion.id}/reject`).send({ reason: 'not_relevant' }),
+      () => request(app).get(`/api/frameworks/${a.framework.id}/indicator-quality`),
+      () => request(app).get('/api/kpi-assistant/status'),
+      () => request(app).post(`/api/indicators/${a.indicator.id}/alternative`).send({}),
+    ];
+    for (const call of calls) {
+      const res = await call().set('Authorization', a.donorAuth);
+      expect(res.status).toBe(403);
+      expect(res.body.message).toBe('Insufficient permissions');
+    }
+    expect((await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: a.kpiSuggestion.id } })).status).toBe('pending');
   });
 });

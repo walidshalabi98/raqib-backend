@@ -1,26 +1,31 @@
-import { IndicatorLevel } from '@prisma/client';
+import { IndicatorLevel, Prisma, PrismaClient } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../middleware/errorHandler';
+
+/** The Prisma client or an interactive transaction client (KPI accept checks references inside its transaction). */
+type ReferenceDb = Pick<PrismaClient | Prisma.TransactionClient, 'resultNode' | 'indicatorLibraryEntry'>;
 
 /**
  * Checks ids an indicator payload refers to (not the URL id). Throws 400 so a
  * result from another framework (or another organisation) or an unknown
- * library entry cannot be attached.
+ * library entry cannot be attached. `db` defaults to the Prisma client; KPI
+ * accept passes its transaction client (design section 8.1).
  */
 export async function assertIndicatorReferences(
   frameworkId: string,
   input: { resultId?: string | null; libraryId?: string | null },
+  db: ReferenceDb = prisma,
 ): Promise<{ result: { id: string; level: IndicatorLevel } | null }> {
   let result: { id: string; level: IndicatorLevel } | null = null;
   if (input.resultId) {
-    result = await prisma.resultNode.findFirst({
+    result = await db.resultNode.findFirst({
       where: { id: input.resultId, frameworkId },
       select: { id: true, level: true },
     });
     if (!result) throw new AppError(400, 'resultId must be a result in the same framework as the indicator');
   }
   if (input.libraryId) {
-    const entry = await prisma.indicatorLibraryEntry.findUnique({ where: { id: input.libraryId }, select: { id: true } });
+    const entry = await db.indicatorLibraryEntry.findUnique({ where: { id: input.libraryId }, select: { id: true } });
     if (!entry) throw new AppError(400, `libraryId "${input.libraryId}" is not in the indicator library`);
   }
   return { result };

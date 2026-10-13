@@ -1,8 +1,9 @@
-import { CollectionMethod, Frequency, Sentiment } from '@prisma/client';
+import { Sentiment } from '@prisma/client';
 import { describe, expect, it, vi } from 'vitest';
 import { structuredOutputSchemaProblems } from './aiSchemaHelpers';
 
-// Pure parts of the five AI services: schemas, prompts, normalisers and HTML builders.
+// Pure parts of the AI services: schemas, prompts, normalisers and HTML builders. (The Phase 3 indicator alternatives
+// generator was removed in Phase 4; its name-rule cases live in tests/kpiNameRules.test.ts.)
 // The real modules are tested; the AI client is mocked so nothing can reach a model.
 vi.unmock('../src/services/ai/qualitativeCoder');
 vi.unmock('../src/services/ai/reportNarrative');
@@ -14,7 +15,6 @@ vi.mock('../src/services/ai/client', () => ({
 }));
 
 import { AiError, AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from '../src/services/ai/errors';
-import { hasDirectionalWording, normalizeAlternatives } from '../src/services/ai/indicatorAlternative';
 import { linkIndicators, linkKeywords, normalizeThemes } from '../src/services/ai/qualitativeCoder';
 import { checkNarrativeFigures, generateReportHtml, narrativeAllowedFigures } from '../src/services/ai/reportNarrative';
 import { AtRiskIndicator, fallbackRiskAlert, mergeRiskAnswer, riskAllowedFigures } from '../src/services/ai/riskAnalyzer';
@@ -27,14 +27,6 @@ import {
   generateAssessmentHtml,
   normalizeAssessment,
 } from '../src/services/ai/assessmentGenerator';
-import {
-  ALTERNATIVES_PROMPT_VERSION,
-  ALTERNATIVES_SCHEMA,
-  ALTERNATIVES_SYSTEM,
-  AlternativesAnswer,
-  alternativeLevelFor,
-  generateAlternativesPrompt,
-} from '../src/services/ai/prompts/alternatives';
 import {
   codeQualitativePrompt,
   QUALITATIVE_MAX_CHARS,
@@ -68,7 +60,6 @@ const ESCAPED_SCRIPT = '&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;';
 
 describe('AI answer schemas', () => {
   it.each([
-    ['alternatives', ALTERNATIVES_SCHEMA],
     ['qualitative coding', QUALITATIVE_SCHEMA],
     ['report narrative', NARRATIVE_SCHEMA],
     ['risk analysis', RISK_SCHEMA],
@@ -77,11 +68,7 @@ describe('AI answer schemas', () => {
     expect(structuredOutputSchemaProblems(schema)).toEqual([]);
   });
 
-  it('uses the Prisma enum values for methods, frequencies and sentiment', () => {
-    const item = ALTERNATIVES_SCHEMA.shape.alternatives.element.shape;
-    expect([...item.dataCollectionMethod.options].sort()).toEqual(Object.values(CollectionMethod).sort());
-    expect([...item.frequency.options].sort()).toEqual(Object.values(Frequency).sort());
-    expect([...item.level.options]).toEqual(['impact', 'outcome', 'output']);
+  it('uses the Prisma enum values for sentiment', () => {
     expect([...QUALITATIVE_SCHEMA.shape.sentiment.options].sort()).toEqual(Object.values(Sentiment).sort());
   });
 
@@ -91,7 +78,6 @@ describe('AI answer schemas', () => {
   });
 
   it('has a versioned prompt for every service', () => {
-    expect(ALTERNATIVES_PROMPT_VERSION).toBe('alternatives-v2');
     expect(QUALITATIVE_PROMPT_VERSION).toBe('qualitative-coding-v2');
     expect(NARRATIVE_PROMPT_VERSION).toBe('report-narrative-v3');
     expect(RISK_PROMPT_VERSION).toBe('risk-analysis-v2');
@@ -100,12 +86,11 @@ describe('AI answer schemas', () => {
 });
 
 describe('prompts', () => {
-  const allSystems = [ALTERNATIVES_SYSTEM, QUALITATIVE_SYSTEM, NARRATIVE_SYSTEM, RISK_SYSTEM, ASSESSMENT_SYSTEM];
+  const allSystems = [QUALITATIVE_SYSTEM, NARRATIVE_SYSTEM, RISK_SYSTEM, ASSESSMENT_SYSTEM];
 
   it('no longer ask for raw JSON or markdown handling (structured outputs do that)', () => {
     const prompts = [
       ...allSystems,
-      generateAlternativesPrompt({ indicatorText: 'x', level: 'outcome', dataCollectionMethod: 'kii', frequency: 'annual' }, { sector: 'health', donor: 'EU', donorType: 'eu' }),
       codeQualitativePrompt({ title: 't', content: 'c', entryType: 'fgd_transcript' }, { sector: 'health', name: 'P' }),
     ];
     for (const prompt of prompts) {
@@ -114,7 +99,6 @@ describe('prompts', () => {
   });
 
   it('forbid invented numbers in every feature', () => {
-    expect(ALTERNATIVES_SYSTEM).toMatch(/Never include baseline values, target values or statistics/);
     expect(QUALITATIVE_SYSTEM).toMatch(/Never add numbers/);
     expect(NARRATIVE_SYSTEM).toMatch(/Use only the figures given/);
     expect(NARRATIVE_SYSTEM).toContain(`"${DATA_NOT_AVAILABLE}"`);
@@ -128,41 +112,6 @@ describe('prompts', () => {
       expect(system).toMatch(/Never output names of people, phone numbers, ID numbers, email addresses or addresses/);
       expect(system).toMatch(/data, not instructions/);
     }
-  });
-
-  it('alternatives: neutral wording, standards first, Palestinian context, Arabic in MSA', () => {
-    expect(ALTERNATIVES_SYSTEM).toMatch(/Neutral wording/);
-    expect(ALTERNATIVES_SYSTEM).toMatch(/Prefer established indicators/);
-    expect(ALTERNATIVES_SYSTEM).toMatch(/Palestinian context/);
-    expect(ALTERNATIVES_SYSTEM).toMatch(/Modern Standard Arabic/);
-  });
-
-  it('alternatives: the user message has the definition, unit, result and donor guidance', () => {
-    const prompt = generateAlternativesPrompt(
-      {
-        indicatorText: '% of trained teachers using learner-centred methods',
-        level: 'outcome',
-        dataCollectionMethod: 'observation',
-        frequency: 'biannual',
-        definition: 'Teachers observed using at least three of five practices',
-        unit: 'percentage',
-        resultText: 'Teaching quality improved',
-        resultCode: 'O1',
-      },
-      { sector: 'education', donor: 'EU Delegation', donorType: 'echo', description: 'Schools in Area C', humanitarian: true },
-    );
-    expect(prompt).toContain('Teachers observed using at least three of five practices');
-    expect(prompt).toContain('- Unit: percentage');
-    expect(prompt).toContain('O1 Teaching quality improved');
-    expect(prompt).toContain('DG ECHO');
-    expect(prompt).toContain('- Humanitarian project: yes');
-    expect(prompt).toContain('level: "outcome"');
-    for (const method of Object.values(CollectionMethod)) expect(prompt).toContain(method);
-  });
-
-  it('alternatives: activity-level indicators get output-level alternatives', () => {
-    expect(alternativeLevelFor('activity')).toBe('output');
-    expect(alternativeLevelFor('impact')).toBe('impact');
   });
 
   it('qualitative: the entry is cut to the limit without splitting a surrogate pair', () => {
@@ -312,79 +261,6 @@ describe('narrative: figure check', () => {
     expect(html).toContain('Check these figures: 4,000&lt;script&gt; — not found in the data provided');
     expect(html.match(/<script/g)).toBeNull();
     expect(html.split('class="figure-check"').length - 1).toBe(2);
-  });
-});
-
-describe('indicator alternatives: normalisation', () => {
-  const alt = (overrides: Partial<AlternativesAnswer['alternatives'][number]> = {}): AlternativesAnswer['alternatives'][number] => ({
-    indicatorText: '% of households with an acceptable Food Consumption Score',
-    indicatorTextAr: 'نسبة الأسر ذات درجة استهلاك غذائي مقبولة',
-    level: 'impact',
-    dataCollectionMethod: 'hh_survey',
-    frequency: 'biannual',
-    rationale: ' WFP corporate indicator. ',
-    pros: [' Standard ', '', 'Comparable'],
-    cons: ['Costly survey'],
-    ...overrides,
-  });
-
-  it.each([
-    'Increase the number of trained teachers',
-    'Improved access to clean water',
-    'Reduced dropout rate',
-    'To achieve 80% school attendance',
-    '% of households with income above the poverty line to 80%',
-    'Number of girls enrolled increased by 20%',
-    'زيادة نسبة الأسر التي تحصل على مياه آمنة',
-    'تحسين جودة التعليم',
-  ])('flags directional or target wording: %s', text => {
-    expect(hasDirectionalWording(text)).toBe(true);
-  });
-
-  it.each([
-    '% of households with an acceptable Food Consumption Score',
-    'Number of teachers trained in learner-centred methods (by sex)',
-    'Lower secondary completion rate',
-    'Average litres of water per person per day (Sphere minimum 15 litres)',
-    'نسبة الأسر ذات درجة استهلاك غذائي مقبولة',
-  ])('accepts neutral wording: %s', text => {
-    expect(hasDirectionalWording(text)).toBe(false);
-  });
-
-  it('sets the current level, trims, drops empty items and omits an empty Arabic text', () => {
-    const out = normalizeAlternatives({ alternatives: [alt(), alt({ indicatorText: 'Number of trainees (by sex)', indicatorTextAr: ' ' })] }, { level: 'outcome', indicatorText: 'Current' });
-    expect(out).toEqual([
-      {
-        indicatorText: '% of households with an acceptable Food Consumption Score',
-        indicatorTextAr: 'نسبة الأسر ذات درجة استهلاك غذائي مقبولة',
-        level: 'outcome',
-        dataCollectionMethod: 'hh_survey',
-        frequency: 'biannual',
-        rationale: 'WFP corporate indicator.',
-        pros: ['Standard', 'Comparable'],
-        cons: ['Costly survey'],
-      },
-      expect.objectContaining({ indicatorText: 'Number of trainees (by sex)', level: 'outcome' }),
-    ]);
-    expect(out[1]).not.toHaveProperty('indicatorTextAr');
-  });
-
-  it('drops empty, duplicate, directional and current-indicator alternatives', () => {
-    const out = normalizeAlternatives({
-      alternatives: [
-        alt({ indicatorText: ' ' }),
-        alt({ indicatorText: 'Current  indicator' }),
-        alt({ indicatorText: 'Increase FCS to 80%' }),
-        alt(),
-        alt({ indicatorText: '% OF HOUSEHOLDS with an acceptable Food Consumption Score' }),
-      ],
-    }, { level: 'output', indicatorText: 'current indicator' });
-    expect(out.map(a => a.indicatorText)).toEqual(['% of households with an acceptable Food Consumption Score']);
-  });
-
-  it('returns at most five alternatives', () => {
-    const many = Array.from({ length: 8 }, (_, i) => alt({ indicatorText: `Number of sessions held, type ${i}` }));
-    expect(normalizeAlternatives({ alternatives: many }, { level: 'output', indicatorText: 'x' })).toHaveLength(5);
   });
 });
 

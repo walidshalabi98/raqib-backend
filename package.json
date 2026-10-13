@@ -20,6 +20,7 @@
     "seed:library": "tsx scripts/seed-library.ts",
     "verify:migration": "scripts/verify-migrations.sh",
     "ai:smoke": "tsx scripts/ai-smoke.ts",
+    "eval:kpi": "tsx scripts/eval-kpi.ts",
     "ai-calls:prune": "tsx scripts/prune-ai-calls.ts",
     "redact:backfill": "tsx scripts/redact-stored-text.ts"
   },

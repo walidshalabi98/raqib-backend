@@ -5,15 +5,18 @@ import { assertAssessmentInProject, assertIndicatorAccess, assertIndicatorsInPro
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { validationErrorBody } from '../services/dataPoints/fields';
+import { canSeeIndicator } from '../services/indicators/visibility';
 import {
   BulkRowFields, completeDataPoint, parseBulkRowFields, parseDataPointFields, rowLabel,
 } from '../services/dataPoints/validation';
 
 const router = Router();
 
-// GET /api/indicators/:id/data — Get data points for indicator (with trend)
+// GET /api/indicators/:id/data — Get data points for indicator (with trend). A donor viewer gets 404 for an
+// unapproved indicator, as for another organisation's id (spec §A1; design section 4.7).
 router.get('/indicators/:id/data', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const indicator = await assertIndicatorAccess(req, req.params.id);
+  if (!canSeeIndicator(req.user, indicator)) throw new AppError(404, 'Indicator not found');
 
   const dataPoints = await prisma.dataPoint.findMany({
     where: { indicatorId: req.params.id },

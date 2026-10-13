@@ -251,6 +251,14 @@ export function configureAiClientForTests(overrides: {
   deps = { ...deps, ...rest, ...(anthropic ? { anthropic: () => anthropic } : {}) };
 }
 
+/**
+ * For scripts that must not write to the API database (npm run eval:kpi; design section 4.6, knowledge/kpi-assistant-spec.md
+ * §A8): replace the AiCall logger; null restores writeAiCall. Every call still logs its console line (ids and numbers only).
+ */
+export function setAiCallLogger(logger: AiCallLogger | null): void {
+  deps = { ...deps, logCall: logger ?? writeAiCall };
+}
+
 /** Restores the real SDK client, timers and logger (and drops the cached SDK client). */
 export function resetAiClientForTests(): void {
   deps = { ...defaultDeps };

@@ -28,6 +28,7 @@ import exportRoutes from './routes/exports';
 import fileRoutes from './routes/files';
 import resultRoutes from './routes/results';
 import libraryRoutes from './routes/library';
+import kpiSuggestionRoutes from './routes/kpiSuggestions';
 
 const app = express();
 
@@ -85,6 +86,7 @@ app.use('/api', beneficiaryRoutes);       // /api/projects/:id/beneficiaries & /
 app.use('/api', exportRoutes);            // /api/projects/:id/export/*
 app.use('/api', resultRoutes);            // /api/frameworks/:id/results & /api/results/:id
 app.use('/api/indicator-library', libraryRoutes);
+app.use('/api', kpiSuggestionRoutes);     // /api/projects/:id/kpi-suggestions, /api/kpi-suggestions/:id, /api/kpi-suggestion-runs/:id, /api/frameworks/:id/indicator-quality, /api/kpi-assistant/status
 
 // Error handler
 app.use(errorHandler);

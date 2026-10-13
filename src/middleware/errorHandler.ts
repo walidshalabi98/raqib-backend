@@ -1,14 +1,31 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
 import multer from 'multer';
 
+/**
+ * An error the API answers with on purpose: `statusCode`, a safe English `message`, and optionally a machine-readable
+ * `code` (e.g. the KPI Assistant's KpiRequestErrorCode: 'run_in_progress', 'budget_reached'; design section 7) and
+ * `details` (ids and counts only, e.g. `{ runId }`). The JSON body is `{ message, code?, details? }`; existing callers
+ * that pass only the status and message are unchanged.
+ */
 export class AppError extends Error {
   constructor(
     public statusCode: number,
     message: string,
+    public code?: string,
+    public details?: Record<string, unknown>,
   ) {
     super(message);
     this.name = 'AppError';
   }
+}
+
+/** The JSON body of an AppError: `{ message, code?, details? }` (code and details only when set). */
+export function appErrorBody(err: AppError): { message: string; code?: string; details?: Record<string, unknown> } {
+  return {
+    message: err.message,
+    ...(err.code !== undefined && { code: err.code }),
+    ...(err.details !== undefined && { details: err.details }),
+  };
 }
 
 /**
@@ -43,7 +60,7 @@ export function errorHandler(err: Error, _req: Request, res: Response, _next: Ne
   for (const line of errorLogLines(err)) console.error(line);
 
   if (err instanceof AppError) {
-    res.status(err.statusCode).json({ message: err.message });
+    res.status(err.statusCode).json(appErrorBody(err));
     return;
   }
 

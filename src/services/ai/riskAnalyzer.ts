@@ -35,14 +35,23 @@ export interface AtRiskIndicator {
   dataPoints: Array<{ value: string; collectionDate: Date; geographicArea?: string | null }>;
 }
 
+/** Options of analyzeProjectRisks. */
+export interface AnalyzeProjectRisksOptions {
+  /**
+   * Only approved indicators are analysed (and sent to the model): set for donor viewers, who see approved
+   * indicators only (knowledge/kpi-assistant-spec.md §A1; design section 4.7). Default false.
+   */
+  approvedOnly?: boolean;
+}
+
 /**
  * Risk assessment of the at-risk and off-track indicators of the project's current reviewed
- * framework. The model (fast tier) adds a risk level, an analysis and actions; the trend comes from
- * the data whenever there are two comparable data points, and texts with numbers that were not sent
- * are replaced by the deterministic text. On any AI error every indicator gets the deterministic
- * assessment instead.
+ * framework (with `approvedOnly`, of its approved indicators only). The model (fast tier) adds a risk
+ * level, an analysis and actions; the trend comes from the data whenever there are two comparable data
+ * points, and texts with numbers that were not sent are replaced by the deterministic text. On any AI
+ * error every indicator gets the deterministic assessment instead.
  */
-export async function analyzeProjectRisks(projectId: string): Promise<RiskAlert[]> {
+export async function analyzeProjectRisks(projectId: string, options: AnalyzeProjectRisksOptions = {}): Promise<RiskAlert[]> {
   const project = await prisma.project.findUnique({
     where: { id: projectId },
   });
@@ -53,6 +62,7 @@ export async function analyzeProjectRisks(projectId: string): Promise<RiskAlert[
     orderBy: { version: 'desc' },
     include: {
       indicators: {
+        where: options.approvedOnly ? { isApproved: true } : undefined,
         orderBy: { sortOrder: 'asc' },
         include: {
           dataPoints: {

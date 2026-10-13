@@ -2,8 +2,6 @@
  * Donor rules for the KPI Assistant (knowledge/kpi-assistant-spec.md §A3 donorRules; me-foundations §10; design
  * section 4.3). Env-free: imported by the pure KPI modules and the eval. All 12 DonorType values have rules
  * (un_women is missing from the spec table; usaid is a legacy donor type since 1 July 2025).
- *
- * Step 0 (Phase 4 contracts): DONOR_RULES holds the design table; donorRulesFor is implemented by E3.
  */
 import type { DonorType } from '@prisma/client';
 import type { DonorRules } from '../kpi/types';
@@ -59,7 +57,18 @@ export const DONOR_RULES: Readonly<Record<DonorType, Omit<DonorRules, 'donorType
   },
 };
 
-/** The donor rules for a project's donor type (copies, so callers may not change DONOR_RULES). */
-export function donorRulesFor(_donorType: DonorType): DonorRules {
-  throw new Error('Phase 4: not implemented (E3)');
+/**
+ * The donor rules for a project's donor type (spec §A3 donorRules; me-foundations §10), as fresh copies: callers may
+ * change the returned lists without changing DONOR_RULES. An unknown value (a row written before a DonorType was added)
+ * gets the rules of 'other'.
+ */
+export function donorRulesFor(donorType: DonorType): DonorRules {
+  const rules = DONOR_RULES[donorType] ?? DONOR_RULES.other;
+  return {
+    donorType,
+    maxIndicatorsPerResult: rules.maxIndicatorsPerResult,
+    requiredFrameworks: [...rules.requiredFrameworks],
+    libraryFrameworks: [...rules.libraryFrameworks],
+    notes: [...rules.notes],
+  };
 }

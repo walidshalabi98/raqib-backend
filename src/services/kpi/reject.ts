@@ -1,17 +1,60 @@
 /**
  * Reject a KPI suggestion with a reason (and an optional, redacted note) so later runs learn from it
- * (knowledge/kpi-assistant-spec.md §A1, §A5; design sections 8.2–8.3, D8, D9). The note is never sent to a model.
- *
- * Step 0 stub (Phase 4 contracts): signatures are final; E5 implements the bodies.
+ * (knowledge/kpi-assistant-spec.md §A1, §A5; design sections 8.2–8.3, D8, D9). The note is never sent to a model:
+ * preferences read the reason only (context.ts never loads rejectNote).
  */
-import type { SuggestionRejectReason } from '@prisma/client';
+import { SuggestionRejectReason } from '@prisma/client';
+import { z } from 'zod';
+import { prisma } from '../../config/prisma';
+import { AppError } from '../../middleware/errorHandler';
+import { redactPersonalData } from '../ai/redact';
+import { toSuggestionDto } from './runs';
 import type { KpiSuggestionDto } from './types';
 
-/** note ≤ 1000, redacted. */
-export function parseRejectBody(_body: unknown): { reason: SuggestionRejectReason; note: string | null } {
-  throw new Error('Phase 4: not implemented (E5)');
+/** Longest reject note (characters, after trimming). */
+export const MAX_REJECT_NOTE_CHARS = 1000;
+
+const rejectSchema = z.object({
+  reason: z.nativeEnum(SuggestionRejectReason, {
+    errorMap: () => ({ message: `reason must be one of: ${Object.values(SuggestionRejectReason).join(', ')}` }),
+  }),
+  note: z.string({ invalid_type_error: 'note must be text' })
+    .trim()
+    .max(MAX_REJECT_NOTE_CHARS, `note must be at most ${MAX_REJECT_NOTE_CHARS} characters`)
+    .nullish(),
+}, { invalid_type_error: 'the request body must be a JSON object', required_error: 'the request body must be a JSON object' });
+
+/**
+ * `{ reason: SuggestionRejectReason, note?: string }` (design 7.3, 8.2): note trimmed, at most 1000 characters, empty →
+ * null, saved as redactPersonalData(note).text (CLAUDE.md rule 5: the audit log stores the response, which then holds
+ * only redacted text). Throws AppError 400 naming the problem.
+ */
+export function parseRejectBody(body: unknown): { reason: SuggestionRejectReason; note: string | null } {
+  const parsed = rejectSchema.safeParse(body ?? undefined);
+  if (!parsed.success) throw new AppError(400, `Invalid request: ${parsed.error.issues.map(i => i.message).join('; ')}`);
+  const note = parsed.data.note ? redactPersonalData(parsed.data.note).text : null;
+  return { reason: parsed.data.reason, note: note && note.trim() ? note : null };
 }
 
-export async function rejectKpiSuggestion(_input: { suggestionId: string; organizationId: string; userId: string; body: unknown }): Promise<{ suggestion: KpiSuggestionDto }> {
-  throw new Error('Phase 4: not implemented (E5)');
+/**
+ * Records the rejection (design 8.2): organisation-scoped load (404), then one conditional update from pending →
+ * rejected with decidedAt, decidedBy, rejectReason and the redacted rejectNote; nothing changed (no longer pending) →
+ * 409 already_decided. The rejection then excludes the library id per REJECTION_SCOPE (preferences.ts, D9).
+ */
+export async function rejectKpiSuggestion(input: { suggestionId: string; organizationId: string; userId: string; body: unknown }): Promise<{ suggestion: KpiSuggestionDto }> {
+  const existing = await prisma.kpiSuggestion.findFirst({
+    where: { id: input.suggestionId, project: { organizationId: input.organizationId } },
+    select: { id: true },
+  });
+  if (!existing) throw new AppError(404, 'Suggestion not found');
+  const { reason, note } = parseRejectBody(input.body);
+
+  const { count } = await prisma.kpiSuggestion.updateMany({
+    where: { id: existing.id, status: 'pending' },
+    data: { status: 'rejected', decidedAt: new Date(), decidedBy: input.userId, rejectReason: reason, rejectNote: note },
+  });
+  if (count !== 1) throw new AppError(409, 'This suggestion was already accepted, rejected or expired.', 'already_decided');
+  const row = await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: existing.id } });
+  console.log(`[KpiReject] ${row.id} rejected (${reason})`);
+  return { suggestion: toSuggestionDto(row) };
 }

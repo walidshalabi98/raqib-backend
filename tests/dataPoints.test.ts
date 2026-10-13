@@ -233,8 +233,17 @@ describe.skipIf(!hasTestDatabase)('disaggregated data points (API)', () => {
     expect(await prisma.dataPoint.count({ where: { projectId: a.project.id } })).toBe(before);
     expect((await prisma.indicator.findUniqueOrThrow({ where: { id: peopleId } })).currentValue).toBeNull();
 
-    const list = await request(app).get(`/api/indicators/${peopleId}/data`).set('Authorization', viewerAuth);
-    expect(list.status).toBe(200);
+    // Donor viewers see approved indicators only (Phase 4, kpi-assistant-spec §A1): 404 until it is approved.
+    const hidden = await request(app).get(`/api/indicators/${peopleId}/data`).set('Authorization', viewerAuth);
+    expect(hidden.status).toBe(404);
+    await prisma.indicator.update({ where: { id: peopleId }, data: { isApproved: true } });
+    try {
+      const list = await request(app).get(`/api/indicators/${peopleId}/data`).set('Authorization', viewerAuth);
+      expect(list.status).toBe(200);
+    } finally {
+      // The later tests in this file share the fixture; leave it as it was.
+      await prisma.indicator.update({ where: { id: peopleId }, data: { isApproved: false } });
+    }
   });
 
   it('stores a valid breakdown and returns it from GET', async () => {

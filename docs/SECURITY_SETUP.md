@@ -1,6 +1,6 @@
 # Security setup
 
-What changed in Phase 0 (and the AI rules added in Phase 3, §6) and what to do once per environment.
+What changed in Phase 0 (and the AI rules added in Phase 3 and the KPI Assistant of Phase 4, §6) and what to do once per environment.
 
 ## 1. Environment variables
 
@@ -19,8 +19,10 @@ The server now refuses to start when required settings are missing or weak, and 
 | `AI_MAX_RETRIES` | optional, default `3`, from 0 to 10; retries after rate limits, overloads, server and network errors |
 | `AI_REFUSAL_FALLBACK` | optional, `default` (the default) or `off`; `default` lets Anthropic re-run a refused request on its fallback model (Sonnet 5.5, Opus 5, Opus 5.5 only) |
 | `AI_CALL_RETENTION_MONTHS` | optional, default `24`, from 1 to 120; months an `AiCall` log row is kept before the worker's nightly job deletes it |
-| `VOYAGE_API_KEY` | optional secret; embeddings for the indicator library. Without it nothing is sent to Voyage and search uses keywords |
+| `VOYAGE_API_KEY` | optional secret; embeddings for the indicator library and, from Phase 4, the KPI Assistant's query texts. Without it nothing is sent to Voyage and search uses keywords |
 | `VOYAGE_MODEL` | optional, default `voyage-4` |
+| `AI_ORG_DAILY_BUDGET_USD` | optional, default `20` (set by the owner on 13 October 2026), a number of US dollars, at least 0; an organisation's AI spend over the last 24 hours (all AI features, from the `AiCall` log). KPI suggestion requests answer 429 `budget_reached` once it is spent; `0` turns the check off |
+| `PRISMA_LOG_QUERIES` | optional, `0` (the default) or `1`; `1` logs every SQL statement for local debugging (placeholders, not values) |
 
 Blank values (`NAME=`) for the optional AI settings use the default. Changing `JWT_SECRET` signs everyone out once. See `.env.example` for the full list.
 
@@ -55,18 +57,24 @@ Phase 2 and Phase 3 add more reviewed SQL (Phase 3: the `AiCall` table with row 
 ## 5. Other protections
 
 - Security headers (`helmet`), CORS limited to configured origins.
-- Rate limits: 300 requests/minute per IP overall; 30 per 15 minutes on `/api/auth/*`; 60 AI requests/hour per user; 120 webhook calls/minute per IP.
+- Rate limits: 300 requests/minute per IP overall; 30 per 15 minutes on `/api/auth/*`; 60 AI requests/hour per user; 120 KPI suggestion requests/hour per organisation on top of that; 240 KPI run polls/minute per user (they do not count towards the per-IP limit); 120 webhook calls/minute per IP.
 - Every route that takes an id checks the caller's organisation through `src/middleware/access.ts`; other organisations' records answer 404. Ids passed in a request body (indicator, assessment) must belong to the same project.
 - Org admins can no longer grant the `platform_admin` role.
 - The seed refuses to run in production and needs `SEED_PASSWORD` outside development.
 
-## 6. AI providers and personal data (Phase 3)
+## 6. AI providers and personal data (Phase 3, Phase 4)
 
 Raqib sends text to Anthropic (all AI features) and, when `VOYAGE_API_KEY` is set, to Voyage AI (embeddings). Models receive aggregates and organisational text only (CLAUDE.md rule 5). Details per feature: `docs/AI.md` §9.
 
-**Sent to Anthropic:** project metadata (name, sectors, donor, dates, target beneficiaries, geographic scope, the redacted description); redacted document text (at most 8 000 characters per document for frameworks, 12 000 for document analysis) and redacted file names; indicator texts, definitions, baselines, targets and aggregated values with areas and disaggregated counts; redacted qualitative entries (titles, content, themes); indicator library entries.
+**Sent to Anthropic:** project metadata (name, sectors, donor, dates, target beneficiaries, geographic scope, the redacted description); redacted document text (at most 8 000 characters per document for the framework structure step, 12 000 for document analysis) and redacted file names; indicator texts, definitions, baselines, targets and aggregated values with areas and disaggregated counts; redacted qualitative entries (titles, content, themes); indicator library entries. The KPI Assistant (Phase 4; framework generation's indicator step uses it too) sends the redacted project fields above, the redacted results chain (codes, statements, Arabic statements), the redacted names of the framework's indicators and pending suggestions, at most 40 redacted document sentences that hold a number (each at most 300 characters, with the redacted file name; sentences that held a phone number, ID number or email address are left out), up to 40 library candidates, and the organisation's preferred collection methods. It never sends whole documents, reject notes or user names.
 
-**Sent to Voyage:** indicator library text only (name, Arabic name, definition, tags); from Phase 4 also result statements. Never personal data.
+**Sent to Voyage:** indicator library text only (name, Arabic name, definition, tags); from Phase 4 also the redacted English result statements (to rank library candidates) and the redacted English names of suggested and existing indicators (to find near-duplicates). Never personal data.
+
+**Saved from the KPI Assistant.** Every free-text field of a suggestion the model writes (name, Arabic name, definition, means of verification, rationale, notes, custom reason) is redacted before it is stored; sentences with numbers that no source supports are removed. A reject note is redacted when it is saved and is never sent to a model. Document file names are redacted (and clipped to 200 characters) wherever a suggestion cites them. Suggestions and runs are kept as the organisation's history (never pruned); they hold no prompt text.
+
+**Cost limits.** At most 40 results and 20 model calls per KPI run, at most 6 KPI model calls at a time per API process, 120 KPI requests per hour per organisation and the organisation daily budget `AI_ORG_DAILY_BUDGET_USD` (§1). Runs are refused on archived projects. Without a real `ANTHROPIC_API_KEY` a KPI suggestion request answers 503 `ai_not_configured` before a run is created or anything is charged.
+
+**KPI evaluation (`npm run eval:kpi`).** The evaluation never uses a database: before it loads the configuration it always replaces `DATABASE_URL` and `DIRECT_URL` with an unusable placeholder (`postgresql://unused:unused@127.0.0.1:9/unused_eval`), whatever `.env`, the shell or CI set, checks that the placeholder is in force (it refuses otherwise), keeps the AiCall records in memory and reads the library from `knowledge/indicator-library.json`. The real run refuses without a real `ANTHROPIC_API_KEY` (missing, placeholder or not `sk-ant-…`), without `--yes`, in production, and with `--embeddings` but no `VOYAGE_API_KEY`; it stops starting new cases once `--max-usd` (default US$3) is spent. `--fake` uses a deterministic fake model with a placeholder key and an unreachable API address: no key, no network, no cost. The cases are fictional; the report in `eval-results/` (git-ignored) holds ids, numbers and the validated suggestions, never prompt text.
 
 **Never sent:** beneficiary records, user names and email addresses, passwords, tokens and keys, data point notes, original files.
 
@@ -82,7 +90,7 @@ Existing qualitative entries are included with `--include-qualitative`; the owne
 
 **Logs.** Every AI call writes one `AiCall` row (feature, model, prompt versions, status, token counts, latency, estimated cost, organisation and project ids) and one console line with the same numbers. Neither ever holds prompt text, document text, model answers or error messages. AI job failures are logged with the AiError message or the error class name only (`safeErrorSummary`), never database error text. The same holds for every API error (`errorHandler`: the API's own messages, otherwise the class name and Prisma code, plus stack frames outside production) and for unhandled errors; Prisma's own `error` log level is off, because Prisma prints a failed query with the values it was given (a whole qualitative entry, for example). Qualitative entries are checked before they are saved (entry type, participants, date), so a bad value gets a 400 that names the field and never reaches the database. The parser logs document ids, lengths and redaction counts only; saving a qualitative entry logs its id and redaction counts only. `AiCall` rows are deleted after 24 months (`AI_CALL_RETENTION_MONTHS`) by a nightly worker job at 03:30 Asia/Hebron; `npm run ai-calls:prune` runs it by hand (dry run unless `-- --apply`).
 
-**Anthropic API key.** `ANTHROPIC_API_KEY` is a secret like the JWT secrets: keep it in the environment, never in code, tests or logs. Tests point the SDK at an unreachable local address, so they can never call the real API; only `npm run ai:smoke` does.
+**Anthropic API key.** `ANTHROPIC_API_KEY` is a secret like the JWT secrets: keep it in the environment, never in code, tests or logs. Tests point the SDK at an unreachable local address, so they can never call the real API; only `npm run ai:smoke` and `npm run eval:kpi -- --yes` do.
 
 ## 7. Tests
 
@@ -94,3 +102,5 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/raqib_test npm test
 ```
 
 `tests/isolation.test.ts` lists every route that takes an id and fails if a new one is added without an isolation check.
+
+The KPI evaluation's unit tests (`tests/kpiEval.test.ts`) and `npm run eval:kpi -- --fake` need no key, no network and no database (CI runs the fake evaluation after the tests). Tests of the KPI Assistant use fakes for the model (a fake `ModelCaller` or a fake SDK behind the real client) and for Voyage; none calls a real provider.

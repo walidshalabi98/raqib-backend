@@ -4,7 +4,6 @@ import { MAINTENANCE_QUEUE } from '../services/maintenance/aiCallRetention';
 
 let documentParsingQueue: Queue;
 let frameworkQueue: Queue;
-let indicatorQueue: Queue;
 let reportQueue: Queue;
 let qualitativeQueue: Queue;
 let maintenanceQueue: Queue;
@@ -21,13 +20,6 @@ export function getFrameworkQueue(): Queue {
     frameworkQueue = new Queue('framework-generation', { connection: redis });
   }
   return frameworkQueue;
-}
-
-export function getIndicatorQueue(): Queue {
-  if (!indicatorQueue) {
-    indicatorQueue = new Queue('indicator-alternatives', { connection: redis });
-  }
-  return indicatorQueue;
 }
 
 export function getReportQueue(): Queue {

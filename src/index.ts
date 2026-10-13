@@ -2,6 +2,7 @@ import { env } from './config/env';
 import { prisma } from './config/prisma';
 import { loadSharedSystemPrompt } from './services/ai/prompts/system';
 import { safeErrorSummary } from './services/ai/errors';
+import { interruptActiveRuns } from './services/kpi/runs';
 import app from './app';
 
 // Fail fast when the AI system prompt (knowledge/me-foundations.md §1–12) cannot be built.
@@ -34,10 +35,17 @@ process.on('uncaughtException', (err: Error) => {
   // Don't exit — let the server keep running
 });
 
-// Graceful shutdown
+// Graceful shutdown. KPI suggestion runs executing in this process are marked interrupted at once, so the UI offers
+// "try again" instead of waiting 15 minutes for the missing heartbeat (design section 7.4).
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Shutting down...');
   server.close();
+  try {
+    const interrupted = await interruptActiveRuns(prisma);
+    if (interrupted > 0) console.log(`[KpiRun] marked ${interrupted} running run(s) interrupted`);
+  } catch (err) {
+    console.error(`[KpiRun] could not mark running runs interrupted: ${safeErrorSummary(err)}`);
+  }
   await prisma.$disconnect();
   process.exit(0);
 });
