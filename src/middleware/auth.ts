@@ -1,8 +1,31 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { z } from 'zod';
 import { env } from '../config/env';
 import { UserRole } from '@prisma/client';
 import { AuthUser } from '../types/express';
+
+/** The claims of an access token (generateAccessToken): every one is required. */
+const accessTokenClaims = z.object({
+  id: z.string().uuid(),
+  email: z.string().min(1),
+  organizationId: z.string().uuid(),
+  role: z.nativeEnum(UserRole),
+  fullName: z.string(),
+});
+
+/**
+ * The signed-in user from a verified token payload, or null when the payload is not an access token.
+ * Access tokens must carry an organisation and a role; a token with a `purpose` claim (a password-reset
+ * token) is refused. Only the five claims are kept.
+ */
+export function accessTokenUser(payload: unknown): AuthUser | null {
+  if (!payload || typeof payload !== 'object' || Object.prototype.hasOwnProperty.call(payload, 'purpose')) return null;
+  const parsed = accessTokenClaims.safeParse(payload);
+  if (!parsed.success) return null;
+  const { id, email, organizationId, role, fullName } = parsed.data;
+  return { id, email, organizationId, role, fullName };
+}
 
 export function authenticate(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
@@ -12,13 +35,20 @@ export function authenticate(req: Request, res: Response, next: NextFunction): v
   }
 
   const token = authHeader.split(' ')[1];
+  let payload: unknown;
   try {
-    const payload = jwt.verify(token, env.jwtSecret) as AuthUser;
-    req.user = payload;
-    next();
+    payload = jwt.verify(token, env.jwtSecret);
   } catch {
     res.status(401).json({ message: 'Invalid or expired token' });
+    return;
   }
+  const user = accessTokenUser(payload);
+  if (!user) {
+    res.status(401).json({ message: 'Invalid or expired token' });
+    return;
+  }
+  req.user = user;
+  next();
 }
 
 export function authorize(...roles: UserRole[]) {

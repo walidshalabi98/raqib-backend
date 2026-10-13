@@ -57,6 +57,7 @@ Phase 2 and Phase 3 add more reviewed SQL (Phase 3: the `AiCall` table with row 
 - Security headers (`helmet`), CORS limited to configured origins.
 - Rate limits: 300 requests/minute per IP overall; 30 per 15 minutes on `/api/auth/*`; 60 AI requests/hour per user; 120 webhook calls/minute per IP.
 - Every route that takes an id checks the caller's organisation through `src/middleware/access.ts`; other organisations' records answer 404. Ids passed in a request body (indicator, assessment) must belong to the same project.
+- Access tokens must carry an organisation and a role; reset tokens are refused. `authenticate` validates the verified token payload with zod (user id, email, organisation id, a known role, full name) and refuses any token with a `purpose` claim (401); the access helpers answer 401 when the signed-in user has no organisation. Follow-ups: single-use reset links, and a separate audience or secret for reset tokens (RFC 8725 §3.12).
 - Org admins can no longer grant the `platform_admin` role.
 - The seed refuses to run in production and needs `SEED_PASSWORD` outside development.
 
