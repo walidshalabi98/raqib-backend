@@ -135,6 +135,31 @@ export function getLocalStorage(): LocalStorage | null {
   return storage instanceof LocalStorage ? storage : null;
 }
 
+/**
+ * Stores an uploaded file, then creates the database row that refers to it (`createRow`). When the row cannot be
+ * created (for example the project was deleted forever while the file was being stored: the row's foreign key
+ * then fails), the stored file is removed again, best effort, so no file stays in the private bucket without a
+ * row pointing at it, where no route could ever find or remove it; the row's error is then thrown as before. A
+ * removal that fails is logged with the project id and the error class only, never the file name, the storage
+ * key or the error message (which can quote a path).
+ */
+export async function storeUploadedFile<T>(
+  file: { key: string; body: Buffer; contentType: string; projectId: string },
+  createRow: () => Promise<T>,
+): Promise<T> {
+  const storage = getStorage();
+  await storage.put(file.key, file.body, file.contentType);
+  try {
+    return await createRow();
+  } catch (err) {
+    await storage.remove(file.key).catch((removeErr: unknown) => {
+      const errorClass = removeErr instanceof Error ? removeErr.name || 'Error' : 'unknown error';
+      console.error(`[Storage] Could not remove the stored file of an upload to project ${file.projectId} whose record was not saved (${errorClass})`);
+    });
+    throw err;
+  }
+}
+
 export function buildDocumentKey(projectId: string, originalName: string): string {
   const ext = path.extname(originalName).toLowerCase().replace(/[^a-z0-9.]/g, '');
   return `projects/${projectId}/${crypto.randomUUID()}${ext}`;
