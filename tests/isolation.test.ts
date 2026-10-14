@@ -21,7 +21,9 @@ const ROUTES: RouteCase[] = [
   { method: 'get', route: '/api/projects/:id', path: b => `/api/projects/${b.project.id}` },
   { method: 'patch', route: '/api/projects/:id', path: b => `/api/projects/${b.project.id}`, body: () => ({ name: 'Hijacked' }) },
   { method: 'get', route: '/api/projects/:id/export', path: b => `/api/projects/${b.project.id}/export` },
-  { method: 'delete', route: '/api/projects/:id', path: b => `/api/projects/${b.project.id}` },
+  { method: 'delete', route: '/api/projects/:id', path: b => `/api/projects/${b.project.id}`, body: b => ({ confirmName: b.project.name }) },
+  { method: 'post', route: '/api/projects/:id/archive', path: b => `/api/projects/${b.project.id}/archive` },
+  { method: 'post', route: '/api/projects/:id/restore', path: b => `/api/projects/${b.project.id}/restore` },
   // Documents
   { method: 'get', route: '/api/projects/:id/documents', path: b => `/api/projects/${b.project.id}/documents` },
   { method: 'post', route: '/api/projects/:id/documents', path: b => `/api/projects/${b.project.id}/documents`, upload: true },
@@ -112,6 +114,7 @@ const ROUTES: RouteCase[] = [
   },
   { method: 'patch', route: '/api/users/:id', path: b => `/api/users/${b.officer.id}`, body: () => ({ fullName: 'Hijacked' }) },
   { method: 'delete', route: '/api/users/:id', path: b => `/api/users/${b.officer.id}` },
+  { method: 'post', route: '/api/users/:id/reset-password', path: b => `/api/users/${b.officer.id}/reset-password` },
   { method: 'patch', route: '/api/notifications/:id/read', path: b => `/api/notifications/${b.notificationId}/read` },
   // KPI Assistant (Phase 4, design 7.5)
   { method: 'post', route: '/api/projects/:id/kpi-suggestions', path: b => `/api/projects/${b.project.id}/kpi-suggestions`, body: () => ({ scope: 'framework' }) },
@@ -198,6 +201,7 @@ describe.skipIf(!hasTestDatabase)('organisation isolation', () => {
     expect((await prisma.beneficiary.findUniqueOrThrow({ where: { id: b.beneficiary.id } })).fullName).toBe('Person b');
     expect((await prisma.organization.findUniqueOrThrow({ where: { id: b.org.id } })).name).toBe('Org b');
     expect(await prisma.user.findUnique({ where: { id: b.officer.id } })).not.toBeNull();
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: b.officer.id } })).passwordHash).toBe('x');
     expect(await prisma.dataPoint.count({ where: { projectId: b.project.id } })).toBe(1);
     expect(await prisma.indicator.count({ where: { frameworkId: b.framework.id } })).toBe(1);
     expect(await prisma.framework.count({ where: { projectId: b.project.id } })).toBe(1);

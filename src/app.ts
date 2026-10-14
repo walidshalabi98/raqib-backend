@@ -4,7 +4,7 @@ import helmet from 'helmet';
 import { env } from './config/env';
 import { auditMiddleware } from './middleware/audit';
 import { errorHandler } from './middleware/errorHandler';
-import { apiLimiter, authLimiter, webhookLimiter } from './middleware/rateLimit';
+import { apiLimiter, webhookLimiter } from './middleware/rateLimit';
 import './types/express';
 
 // Route imports
@@ -64,7 +64,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 // Public routes
-app.use('/api/auth', authLimiter, authRoutes);
+app.use('/api/auth', authRoutes);            // each route has its own limit (authLimiters, src/routes/auth.ts)
 app.use('/api/webhooks', webhookLimiter, webhookRoutes);   // authenticated by organisation webhook token
 app.use('/api/files', fileRoutes);                         // authenticated by short-lived signed URL
 

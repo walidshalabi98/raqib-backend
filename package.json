@@ -3,10 +3,14 @@
   "version": "1.0.0",
   "description": "RAQIB M&E Platform - Backend & AI Engine",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "prisma generate && tsc",
     "start": "node dist/index.js",
+    "start:worker": "node dist/jobs/worker.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "worker": "tsx src/jobs/worker.ts",

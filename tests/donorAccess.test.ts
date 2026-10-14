@@ -754,7 +754,7 @@ describe.skipIf(!hasTestDatabase)('donor viewers: results without identities', (
 
   // Access tokens must carry an organisation and a role; reset tokens are refused (tests/accessToken.test.ts).
   describe('a reset token', () => {
-    const resetAuth = () => `Bearer ${generateResetToken(a.donor.id)}`;
+    const resetAuth = () => `Bearer ${generateResetToken(a.donor)}`;
 
     it('is refused on writes and reads', async () => {
       const write = await request(app).post(`/api/projects/${a.project.id}/beneficiaries`).set('Authorization', resetAuth()).send({ fullName: 'Injected', gender: 'male' });

@@ -1,0 +1,111 @@
+name: KPI evaluation (real model)
+
+# Runs the KPI Assistant evaluation (npm run eval:kpi -- --yes) against the real Anthropic API, only when someone
+# clicks "Run workflow" (Actions tab). It costs about US$1-2 for all 8 cases; no new case starts once the spend
+# reaches max_usd. The key comes from the repository secret RAQIB_EVAL_ANTHROPIC_API_KEY and reaches the evaluation
+# step only. The script never uses a database, and prints ids, counts and numbers only (never prompt, document or model
+# text); the summary table goes to the run page and the JSON report is kept as an artifact for 30 days.
+# How to run it: README "KPI evaluation".
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit to evaluate (it must contain scripts/eval-kpi.ts)
+        required: true
+        default: main
+      max_usd:
+        description: Spending cap in US dollars (no new case starts after it; at most 10)
+        required: true
+        default: '3'
+      cases:
+        description: Case ids separated by spaces (blank runs all 8)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kpi-eval
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REF: ${{ inputs.ref }}
+      MAX_USD: ${{ inputs.max_usd }}
+      CASES: ${{ inputs.cases }}
+
+    steps:
+      - name: Check the inputs
+        run: |
+          if ! [[ "$MAX_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v v="$MAX_USD" 'BEGIN { exit !(v > 0 && v <= 10) }'; then
+            echo "::error::max_usd must be a number above 0 and at most 10."
+            exit 1
+          fi
+          if [[ -n "$CASES" && ! "$CASES" =~ ^[A-Za-z0-9_\ -]+$ ]]; then
+            echo "::error::cases may contain only letters, digits, '-', '_' and spaces."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Check that this ref has the evaluation
+        run: |
+          if [[ ! -f scripts/eval-kpi.ts ]]; then
+            echo "::error::'$REF' has no scripts/eval-kpi.ts. Choose the Phase 4 branch (claude/funny-planck-ljpix9) or main after Phase 4 is merged."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: KPI evaluation (real model)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.RAQIB_EVAL_ANTHROPIC_API_KEY }}
+        run: |
+          if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+            echo "::error::The repository secret RAQIB_EVAL_ANTHROPIC_API_KEY is not set (README: KPI evaluation)."
+            exit 1
+          fi
+          args=(--yes --max-usd "$MAX_USD" --out eval-results)
+          for c in $CASES; do args+=(--case "$c"); done
+          set -o pipefail
+          npm run --silent eval:kpi -- "${args[@]}" 2>&1 | tee eval-output.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## KPI evaluation"
+            echo
+            echo "Ref \`$REF\`, spending cap US\$$MAX_USD${CASES:+, cases: $CASES}"
+            echo
+            echo '```'
+            if [[ -f eval-output.txt ]]; then cat eval-output.txt; else echo "The evaluation did not run (see the failed step)."; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kpi-eval-results
+          path: |
+            eval-results/
+            eval-output.txt
+          retention-days: 30
+          if-no-files-found: ignore

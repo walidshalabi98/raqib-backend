@@ -33,6 +33,8 @@ export const FAKE_EVAL_API_KEY = 'sk-ant-fake-eval-placeholder';
 export const FAKE_EVAL_BASE_URL = 'http://127.0.0.1:9';
 /** JWT secrets when missing (the configuration requires them; the evaluation never signs a token). */
 export const EVAL_JWT_PLACEHOLDER = 'eval-placeholder-secret-never-used-0123456789';
+/** JWT_REFRESH_SECRET when missing, or when it equals JWT_SECRET: the configuration refuses one value for both. */
+export const EVAL_JWT_REFRESH_PLACEHOLDER = 'eval-placeholder-refresh-secret-never-used-9876543210';
 /** Default spending cap of a real run in US dollars (design 10.1, §12 item 10). */
 export const DEFAULT_MAX_USD = 3;
 /** Default report directory (git-ignored; spec §A8 "eval-results/"). */
@@ -128,15 +130,16 @@ export function evalRefusal(args: EvalCliArgs, environment: Record<string, strin
 
 /**
  * Prepares process.env before anything loads the configuration (design 10.1, SDA-09): DATABASE_URL and DIRECT_URL are
- * always the unusable placeholder; the JWT secrets get a placeholder when missing or too short; in --fake mode the
+ * always the unusable placeholder; the JWT secrets get two different placeholders when missing or too short (and the
+ * refresh secret its own when it equals JWT_SECRET, which the configuration refuses); in --fake mode the
  * Anthropic key is a placeholder and ANTHROPIC_BASE_URL points at a closed local port.
  */
 export function prepareEvalEnvironment(args: Pick<EvalCliArgs, 'fake'>, environment: Record<string, string | undefined> = process.env): void {
   environment.DATABASE_URL = EVAL_DATABASE_PLACEHOLDER;
   environment.DIRECT_URL = EVAL_DATABASE_PLACEHOLDER;
-  for (const name of ['JWT_SECRET', 'JWT_REFRESH_SECRET']) {
-    if ((environment[name] ?? '').trim().length < 32) environment[name] = EVAL_JWT_PLACEHOLDER;
-  }
+  if ((environment.JWT_SECRET ?? '').trim().length < 32) environment.JWT_SECRET = EVAL_JWT_PLACEHOLDER;
+  const refresh = (environment.JWT_REFRESH_SECRET ?? '').trim();
+  if (refresh.length < 32 || refresh === environment.JWT_SECRET.trim()) environment.JWT_REFRESH_SECRET = EVAL_JWT_REFRESH_PLACEHOLDER;
   if (args.fake) {
     environment.ANTHROPIC_API_KEY = FAKE_EVAL_API_KEY;
     environment.ANTHROPIC_BASE_URL = FAKE_EVAL_BASE_URL;

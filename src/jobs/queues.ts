@@ -1,6 +1,13 @@
 import { Queue } from 'bullmq';
-import { redis } from '../config/redis';
+import { redis, redisErrorHandler } from '../config/redis';
 import { MAINTENANCE_QUEUE } from '../services/maintenance/aiCallRetention';
+
+/** Every queue logs connection errors without the password (config/redisErrors.ts). */
+function createQueue(name: string): Queue {
+  const queue = new Queue(name, { connection: redis });
+  queue.on('error', redisErrorHandler(`queue ${name}`));
+  return queue;
+}
 
 let documentParsingQueue: Queue;
 let frameworkQueue: Queue;
@@ -10,28 +17,28 @@ let maintenanceQueue: Queue;
 
 export function getDocumentParsingQueue(): Queue {
   if (!documentParsingQueue) {
-    documentParsingQueue = new Queue('document-parsing', { connection: redis });
+    documentParsingQueue = createQueue('document-parsing');
   }
   return documentParsingQueue;
 }
 
 export function getFrameworkQueue(): Queue {
   if (!frameworkQueue) {
-    frameworkQueue = new Queue('framework-generation', { connection: redis });
+    frameworkQueue = createQueue('framework-generation');
   }
   return frameworkQueue;
 }
 
 export function getReportQueue(): Queue {
   if (!reportQueue) {
-    reportQueue = new Queue('report-generation', { connection: redis });
+    reportQueue = createQueue('report-generation');
   }
   return reportQueue;
 }
 
 export function getQualitativeQueue(): Queue {
   if (!qualitativeQueue) {
-    qualitativeQueue = new Queue('qualitative-coding', { connection: redis });
+    qualitativeQueue = createQueue('qualitative-coding');
   }
   return qualitativeQueue;
 }
@@ -39,7 +46,7 @@ export function getQualitativeQueue(): Queue {
 /** Scheduled housekeeping jobs (the nightly 'prune-ai-calls'); the worker registers the schedule. */
 export function getMaintenanceQueue(): Queue {
   if (!maintenanceQueue) {
-    maintenanceQueue = new Queue(MAINTENANCE_QUEUE, { connection: redis });
+    maintenanceQueue = createQueue(MAINTENANCE_QUEUE);
   }
   return maintenanceQueue;
 }

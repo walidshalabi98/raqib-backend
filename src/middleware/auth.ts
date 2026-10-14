@@ -15,12 +15,19 @@ const accessTokenClaims = z.object({
 });
 
 /**
+ * Claims an access token never has: a password-reset token carries both, a refresh token an audience
+ * (src/utils/tokens.ts).
+ */
+const NOT_ACCESS_CLAIMS = ['purpose', 'aud'] as const;
+
+/**
  * The signed-in user from a verified token payload, or null when the payload is not an access token.
- * Access tokens must carry an organisation and a role; a token with a `purpose` claim (a password-reset
- * token) is refused. Only the five claims are kept.
+ * Access tokens must carry an organisation and a role; a token with a `purpose` or an audience (`aud`) claim,
+ * such as a password-reset token, is refused. Only the five claims are kept.
  */
 export function accessTokenUser(payload: unknown): AuthUser | null {
-  if (!payload || typeof payload !== 'object' || Object.prototype.hasOwnProperty.call(payload, 'purpose')) return null;
+  if (!payload || typeof payload !== 'object') return null;
+  if (NOT_ACCESS_CLAIMS.some(claim => Object.prototype.hasOwnProperty.call(payload, claim))) return null;
   const parsed = accessTokenClaims.safeParse(payload);
   if (!parsed.success) return null;
   const { id, email, organizationId, role, fullName } = parsed.data;
@@ -37,7 +44,7 @@ export function authenticate(req: Request, res: Response, next: NextFunction): v
   const token = authHeader.split(' ')[1];
   let payload: unknown;
   try {
-    payload = jwt.verify(token, env.jwtSecret);
+    payload = jwt.verify(token, env.jwtSecret, { algorithms: ['HS256'] });
   } catch {
     res.status(401).json({ message: 'Invalid or expired token' });
     return;

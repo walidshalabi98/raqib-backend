@@ -1801,6 +1801,22 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(trained.targetValue).toBeNull();
   });
 
+  it('leaves a project archived while its framework was being generated archived', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
+    // Archived after the generation was requested (the request itself is refused once the project is archived).
+    await prisma.project.update({ where: { id: project.id }, data: { status: 'archived' } });
+    mockAi({
+      structure: { data: structureAnswer() },
+      indicators: { suggestions: [custom({ resultCode: 'O1.1', level: 'output', name: 'Number of young people trained', nameAr: 'عدد الشباب المدربين', unit: 'number', numerator: '', denominator: '' })] },
+    });
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+
+    expect(await prisma.indicator.count({ where: { frameworkId: framework.id } })).toBe(1);
+    expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('archived');
+  });
+
   it('redacts phone numbers, emails and ID numbers in the project description before both prompts', async () => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu', documentText: DOCS[0] });
     await prisma.project.update({

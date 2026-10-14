@@ -30,6 +30,7 @@ const { prismaUses, prismaTrap } = vi.hoisted(() => {
 });
 vi.mock('../src/config/prisma', () => ({ prisma: prismaTrap, prismaLogLevels: () => ['warn'] }));
 
+import { parseEnv } from '../src/config/env';
 import { AiInvalidOutputError, AiRefusalError } from '../src/services/ai/errors';
 import { NoopEmbeddingProvider } from '../src/services/ai/embeddingProviders';
 import { configureAiClientForTests, resetAiClientForTests, setAiCallLogger, type AiCallRecord } from '../src/services/ai/client';
@@ -728,6 +729,18 @@ describe('scripts/eval-kpi: arguments and refusals', () => {
     expect(environment.JWT_SECRET!.length).toBeGreaterThanOrEqual(32);
     prepareEvalEnvironment({ fake: true }, environment);
     expect(environment).toMatchObject({ ANTHROPIC_API_KEY: FAKE_EVAL_API_KEY, ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' });
+  });
+
+  it('prepareEvalEnvironment gives the two JWT secrets different values, which the configuration accepts', () => {
+    // Missing secrets, and one value for both (the configuration refuses that since the staging sign-in pull request).
+    for (const start of [{}, { JWT_SECRET: 's'.repeat(40), JWT_REFRESH_SECRET: 's'.repeat(40) }, { JWT_SECRET: 'short', JWT_REFRESH_SECRET: '' }]) {
+      const environment: Record<string, string | undefined> = { ...start };
+      prepareEvalEnvironment({ fake: true }, environment);
+      expect(environment.JWT_SECRET!.length, JSON.stringify(start)).toBeGreaterThanOrEqual(32);
+      expect(environment.JWT_REFRESH_SECRET!.length, JSON.stringify(start)).toBeGreaterThanOrEqual(32);
+      expect(environment.JWT_REFRESH_SECRET, JSON.stringify(start)).not.toBe(environment.JWT_SECRET);
+      expect(() => parseEnv(environment), JSON.stringify(start)).not.toThrow();
+    }
   });
 
   it('takes the system prompt version from the AiCall records (null when no call reached the client)', () => {

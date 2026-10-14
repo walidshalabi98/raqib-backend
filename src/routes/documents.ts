@@ -6,7 +6,7 @@ import { hasStaffRole, STAFF_ROLES } from '../middleware/roles';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { assertDocumentAccess, assertProjectAccess } from '../middleware/access';
 import { assertFileContent, documentUpload } from '../middleware/upload';
-import { buildDocumentKey, getStorage, SIGNED_URL_TTL_SECONDS } from '../services/storage';
+import { buildDocumentKey, getStorage, SIGNED_URL_TTL_SECONDS, storeUploadedFile } from '../services/storage';
 import { parseDocument } from '../services/ai/documentParser';
 import { safeErrorSummary } from '../services/ai/errors';
 import { donorCanSeeDocument, donorDocumentWhere, toDonorDocument } from '../services/privacy/donorView';
@@ -71,20 +71,22 @@ router.post('/projects/:id/documents', authenticate, authorize(...STAFF_ROLES), 
   if (!(Object.values(DocumentType) as string[]).includes(fileType)) {
     throw new AppError(400, `fileType must be one of: ${Object.values(DocumentType).join(', ')}`);
   }
-  const key = buildDocumentKey(req.params.id, req.file.originalname);
-  await getStorage().put(key, req.file.buffer, req.file.mimetype);
-
-  const document = await prisma.document.create({
-    data: {
-      projectId: req.params.id,
-      uploadedBy: req.user!.id,
-      fileName: req.file.originalname,
-      fileUrl: key, // storage key, not a public URL
-      fileType: fileType as DocumentType,
-      fileSizeBytes: req.file.size,
-    },
-    select: DOCUMENT_FIELDS,
-  });
+  const file = req.file;
+  const key = buildDocumentKey(req.params.id, file.originalname);
+  // The file is removed again if its row cannot be saved (the project was deleted meanwhile).
+  const document = await storeUploadedFile({ key, body: file.buffer, contentType: file.mimetype, projectId: req.params.id }, () => (
+    prisma.document.create({
+      data: {
+        projectId: req.params.id,
+        uploadedBy: req.user!.id,
+        fileName: file.originalname,
+        fileUrl: key, // storage key, not a public URL
+        fileType: fileType as DocumentType,
+        fileSizeBytes: file.size,
+      },
+      select: DOCUMENT_FIELDS,
+    })
+  ));
 
   // Parse document inline (no Redis needed). parseDocument logs the cause without document content.
   parseDocument(document.id).catch(() => {

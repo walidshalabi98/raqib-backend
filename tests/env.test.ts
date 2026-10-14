@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { AI_ORG_DAILY_BUDGET_DEFAULT_USD, parseEnv } from '../src/config/env';
+import { AI_ORG_DAILY_BUDGET_DEFAULT_USD, DEFAULT_EMAIL_FROM, parseEnv } from '../src/config/env';
 import { prismaLogLevels } from '../src/config/prisma';
 import { aiCallPruneSettings } from '../src/services/maintenance/aiCallRetention';
 
@@ -31,6 +31,13 @@ describe('environment validation', () => {
     expect(() => parseEnv({ ...valid, JWT_REFRESH_SECRET: 'x'.repeat(31) })).toThrow(/JWT_REFRESH_SECRET/);
   });
 
+  it('refuses one value for both JWT secrets (SR-2: a reset or access token would then pass as a refresh token)', () => {
+    const same = 'c'.repeat(64);
+    expect(() => parseEnv({ ...valid, JWT_SECRET: same, JWT_REFRESH_SECRET: same }))
+      .toThrow(/JWT_REFRESH_SECRET: must be different from JWT_SECRET/);
+    expect(() => parseEnv({ ...valid, JWT_SECRET: same, JWT_REFRESH_SECRET: `${same}d` })).not.toThrow();
+  });
+
   it('lists every problem at once', () => {
     expect(() => parseEnv({})).toThrow(/DATABASE_URL[\s\S]*JWT_SECRET[\s\S]*JWT_REFRESH_SECRET[\s\S]*ANTHROPIC_API_KEY/);
   });
@@ -56,6 +63,32 @@ describe('environment validation', () => {
     const env = parseEnv({ ...valid, WEBHOOK_SECRET: '', VOYAGE_API_KEY: '  ' });
     expect(env.webhookSecret).toBeUndefined();
     expect(env.voyageApiKey).toBeUndefined();
+  });
+});
+
+describe('EMAIL_FROM', () => {
+  it('defaults to the Raqib by Momentum Labs sender (also when blank)', () => {
+    expect(parseEnv(valid).emailFrom).toBe('Raqib by Momentum Labs <noreply@raqib.momentumlabs.ps>');
+    expect(parseEnv({ ...valid, EMAIL_FROM: '  ' }).emailFrom).toBe(DEFAULT_EMAIL_FROM);
+  });
+
+  it.each(['Raqib Staging <staging@raqib.example.org>', 'noreply@raqib.momentumlabs.ps', ' Raqib <a.b+c@mail.example.co.uk> '])(
+    'accepts %s',
+    value => {
+      expect(parseEnv({ ...valid, EMAIL_FROM: value }).emailFrom).toBe(value.trim());
+    },
+  );
+
+  it.each([
+    ['no address', 'Raqib'],
+    ['no domain dot', 'Raqib <noreply@localhost>'],
+    ['two addresses', 'a@example.org, b@example.org'],
+    ['a line break (header injection)', 'Raqib <a@example.org>\nBcc: x@example.org'],
+    ['angle brackets in the name', 'Ra<qib <a@example.org>'],
+    ['quotes in the name', '"Raqib" <a@example.org>'],
+    ['a missing closing bracket', 'Raqib <a@example.org'],
+  ])('refuses a sender with %s', (_label, value) => {
+    expect(() => parseEnv({ ...valid, EMAIL_FROM: value })).toThrow(/EMAIL_FROM: must be an email address/);
   });
 });
 
@@ -200,5 +233,36 @@ describe('Prisma query logging (PRISMA_LOG_QUERIES)', () => {
     expect(prismaLogLevels(false)).toEqual(['warn']);
     expect(prismaLogLevels(true)).toEqual(['query', 'warn']);
     expect(prismaLogLevels(true)).not.toContain('error');
+  });
+});
+
+describe('REDIS_URL', () => {
+  // Made-up password: the refusal must never repeat it, since ioredis would print the whole URL.
+  const PASSWORD = 'not-a-real-redis-password';
+
+  it('defaults for unset or blank values and trims a configured URL', () => {
+    expect(parseEnv(valid).redisUrl).toBe('redis://localhost:6379');
+    expect(parseEnv({ ...valid, REDIS_URL: '  ' }).redisUrl).toBe('redis://localhost:6379');
+    const url = `redis://default:${PASSWORD}@redis.railway.internal:6379`;
+    expect(parseEnv({ ...valid, REDIS_URL: ` ${url} ` }).redisUrl).toBe(url);
+    expect(parseEnv({ ...valid, REDIS_URL: 'rediss://default:a%2Fb%40c@cache.example.org:6380' }).redisUrl)
+      .toBe('rediss://default:a%2Fb%40c@cache.example.org:6380');
+  });
+
+  it.each([
+    ['a password with an unencoded /', `redis://default:${PASSWORD}/x@redis.railway.internal:6379`],
+    ['a password with an unencoded #', `redis://default:${PASSWORD}#x@redis.railway.internal:6379`],
+    ['an empty host', `redis://default:${PASSWORD}@:6379`],
+    ['another scheme', `http://default:${PASSWORD}@redis.railway.internal:6379`],
+    ['no scheme', `default:${PASSWORD}@redis.railway.internal:6379`],
+  ])('refuses %s, naming the setting without repeating its value', (_case, value) => {
+    let message = '';
+    try {
+      parseEnv({ ...valid, REDIS_URL: value });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/REDIS_URL: must be a redis:\/\/ or rediss:\/\/ URL with a host/);
+    expect(message).not.toContain(PASSWORD);
   });
 });

@@ -11,6 +11,7 @@ export class AppError extends Error {
   constructor(
     public statusCode: number,
     message: string,
+    /** Optional stable code sent with the message (e.g. `password_too_short`), so the web app can show its own EN/AR text. */
     public code?: string,
     public details?: Record<string, unknown>,
   ) {
@@ -23,7 +24,7 @@ export class AppError extends Error {
 export function appErrorBody(err: AppError): { message: string; code?: string; details?: Record<string, unknown> } {
   return {
     message: err.message,
-    ...(err.code !== undefined && { code: err.code }),
+    ...(err.code && { code: err.code }),
     ...(err.details !== undefined && { details: err.details }),
   };
 }

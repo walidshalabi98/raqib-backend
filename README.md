@@ -18,7 +18,7 @@ npm run dev                   # API on http://localhost:3001
 
 Check it is running: `curl http://localhost:3001/api/health`.
 
-Demo sign-in after seeding: `admin@momentumlabs.ps`, `me@momentumlabs.ps` or `donor@momentumlabs.ps`, password `admin123` (development only; set `SEED_PASSWORD` elsewhere).
+Demo sign-in after seeding: `admin@momentumlabs.ps`, `me@momentumlabs.ps` or `donor@momentumlabs.ps`, password `admin123` (local development only). Anywhere else set `SEED_PASSWORD`: it must meet the password policy and becomes the org admin's password only; the admin then gives the other demo accounts their own one-time passwords in Settings → Team members → Reset password (`docs/SECURITY_SETUP.md` §9).
 
 ### Local database with Docker
 
@@ -54,6 +54,13 @@ Optional AI settings (defaults in brackets):
 | `VOYAGE_API_KEY` | embeddings for the indicator library; without it search uses keywords [empty] |
 | `VOYAGE_MODEL` | Voyage embedding model [`voyage-4`] |
 
+Optional email settings:
+
+| Variable | Notes |
+|---|---|
+| `RESEND_API_KEY` | Resend key. Without it no email is sent: invites and admin password resets show the temporary password once to the admin, and forgot-password sends nothing. With it, invites, admin resets and forgot-password email a single-use link to choose a password (never a password), in English and Arabic (`docs/SECURITY_SETUP.md` §9) [empty] |
+| `EMAIL_FROM` | sender on a domain verified in Resend [`Raqib by Momentum Labs <noreply@raqib.momentumlabs.ps>`] |
+
 Everything else is optional and documented in `.env.example`. Security-related setup (storage bucket, webhook tokens, migrating old uploads, what is sent to AI providers) is in [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md). The data model (Phase 2: results chain, indicator reference sheets, breakdowns, library; Phase 3: the AiCall log and Document.aiAnalysis) and the rollout steps for its SQL are in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
 
 ## AI layer
@@ -70,6 +77,7 @@ All model calls go through `src/services/ai/client.ts` (`generateStructured`): s
 | `npm run worker` | BullMQ worker for background jobs (needs Redis) |
 | `npm run build` | `prisma generate` + TypeScript compile; fails on any type error |
 | `npm start` | run the compiled API from `dist/` |
+| `npm run start:worker` | run the compiled worker from `dist/` (`dist/jobs/worker.js`; needs Redis) |
 | `npm run lint` | ESLint |
 | `npm run typecheck` | type-check source, tests, scripts and seed |
 | `npm test` | Vitest unit and integration tests (see below) |
@@ -98,9 +106,31 @@ Without `TEST_DATABASE_URL` the integration tests are skipped. AI calls are alwa
 
 Every new route needs a role decision in `tests/roleMatrix.ts`, and every new `app.use` / `router.use` layer a review in `tests/roles.test.ts`: that test (no database) fails otherwise. A route open to donor viewers (`all` or `self`) also needs a request in `tests/donorAi.test.ts` (no donor request may reach an AI model) and, for a GET, in `tests/donorAccess.test.ts` (no personal data in the answer); their coverage tests fail otherwise. See [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md) §8.
 
+## KPI evaluation
+
+The KPI Assistant evaluation runs the cases of `knowledge/kpi-eval-cases.json` through the real model and prints a summary table. It costs about US$1-2 for all 8 cases. CI runs it only with the free fake model; the real run is a button.
+
+One-time setup (repository admin): GitHub → this repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**, name `RAQIB_EVAL_ANTHROPIC_API_KEY`, value an Anthropic API key with a spending limit (the staging key is fine).
+
+To run: **Actions** → **KPI evaluation (real model)** → **Run workflow**. Inputs:
+- `ref`: the branch or commit to evaluate (it must contain `scripts/eval-kpi.ts`);
+- `max_usd`: no new case starts once the spend reaches it (default 3, at most 10);
+- `cases`: case ids separated by spaces, or blank for all.
+
+The table appears on the run's summary page and the JSON report is kept as the `kpi-eval-results` artifact for 30 days. The workflow (`.github/workflows/kpi-eval.yml`) passes the key to the evaluation step only; the script uses no database and prints ids, counts and numbers only.
+
+## Deploy
+
+Node 22 or later (`engines` in `package.json`). One build serves two processes with the same environment (both validate it at start and exit with the list of problems):
+
+- **API:** `npm run build`, then `npm start`. Behind one reverse proxy, with `NODE_ENV=production`. `JWT_SECRET` and `JWT_REFRESH_SECRET` must be two different values (the API refuses one value for both).
+- **Worker:** the same build, then `npm run start:worker` (compiled JavaScript; `npm run worker` is the development command and needs `tsx`, a dev dependency). Needs `REDIS_URL`.
+
+The build runs `prisma generate` and `tsc`, so install with dev dependencies (`npm ci --include=dev`, or `NPM_CONFIG_PRODUCTION=false` on hosts that install with `NODE_ENV=production`). The `knowledge/` folder must be deployed with `dist/`: the API reads the M&E rules and the indicator library from it at run time. Email can stay off at first (no `RESEND_API_KEY`): then temporary passwords are shown once to the admin who invites or resets a user, and nothing secret is written to the logs (`docs/SECURITY_SETUP.md` §9).
+
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every pull request and on `main`: install, Prisma generate, lint, typecheck, tests against a pgvector Postgres service, the KPI evaluation with the fake model (`npm run eval:kpi -- --fake`), build and `npm audit --audit-level=high`. The real evaluation (with a spending cap) is added when the Anthropic key exists.
+`.github/workflows/ci.yml` runs on every pull request and on `main`: install, Prisma generate, lint, typecheck, tests against a pgvector Postgres service, the KPI evaluation with the fake model (`npm run eval:kpi -- --fake`), build and `npm audit --audit-level=high`. `.github/workflows/kpi-eval.yml` runs the real evaluation only on demand, with a spending cap (see [KPI evaluation](#kpi-evaluation)).
 
 ## Project layout
 

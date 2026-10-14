@@ -3,7 +3,8 @@ import request from 'supertest';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
-import { AUDIT_VALUE_ROUTES, auditValues, auditValuesFor, bodyFieldNames } from '../src/middleware/audit';
+import type { Request } from 'express';
+import { AUDIT_VALUE_ROUTES, auditValues, auditValuesFor, bodyFieldNames, registeredRoutePath, requestAuditTarget } from '../src/middleware/audit';
 import { createOrgFixture, hasTestDatabase, OrgFixture, PDF_BYTES, resetDatabase } from './helpers';
 import { ROLE_MATRIX } from './roleMatrix';
 import { routeLayers } from './routeStack';
@@ -65,6 +66,40 @@ describe('audit values (allow-listed fields of M&E records)', () => {
     expect(auditValues(['id', 'targetValue'], { id: 'i-1', targetValue: '300', notes: 'Layla Testname' })).toEqual({ id: 'i-1', targetValue: '300' });
     expect(auditValues(['targetValue'], { notes: 'x' })).toBeNull();
     for (const body of [undefined, null, 'text', [{ targetValue: '1' }]]) expect(auditValues(['targetValue'], body)).toBeNull();
+  });
+});
+
+describe('audit target whatever the capitals of the request path', () => {
+  const id = '6f1c2a9e-1111-4222-8333-444455556666';
+  const req = (fields: object) => fields as unknown as Request;
+
+  it('reads the entity without regard to capitals and stores it in lower case', () => {
+    for (const url of [`/api/projects/${id}/archive`, `/API/Projects/${id}/Archive`, `/Api/PROJECTS/${id}?archived=true`]) {
+      expect(requestAuditTarget(req({ method: 'POST', originalUrl: url, params: {} })), url).toMatchObject({ entity: 'projects', entityId: id });
+    }
+    expect(requestAuditTarget(req({ method: 'PATCH', originalUrl: `/API/Indicator-Library/x`, params: { id: 'x' } })).entity).toBe('indicator-library');
+    expect(requestAuditTarget(req({ method: 'POST', originalUrl: '/', params: {} })).entity).toBe('unknown');
+  });
+
+  it('names the answering route as registered, whatever the capitals the mount matched', () => {
+    expect(registeredRoutePath(req({ baseUrl: '/API/Projects', route: { path: '/:id' } }))).toBe('/api/projects/:id');
+    expect(registeredRoutePath(req({ baseUrl: '/Api', route: { path: '/indicators/:id/data' } }))).toBe('/api/indicators/:id/data');
+    expect(registeredRoutePath(req({ baseUrl: '/api/projects' }))).toBeNull();
+  });
+
+  it('relies on mount paths that are lower case and have no parameter', () => {
+    const mounts: string[] = [];
+    const walk = (stack: { handle?: { stack?: unknown[] }; regexp?: RegExp; keys?: unknown[] }[]) => {
+      for (const layer of stack) {
+        if (!Array.isArray(layer.handle?.stack)) continue;
+        expect(layer.keys ?? [], String(layer.regexp)).toEqual([]);
+        mounts.push(String(layer.regexp?.source));
+        walk(layer.handle.stack as typeof stack);
+      }
+    };
+    walk((app as unknown as { _router: { stack: [] } })._router.stack);
+    expect(mounts.length).toBeGreaterThanOrEqual(10);
+    for (const source of mounts) expect(source, source).toBe(source.toLowerCase());
   });
 });
 
@@ -146,6 +181,22 @@ describe.skipIf(!hasTestDatabase)('audit log', () => {
     expect(projectRow.newValue).toMatchObject({ values: { id: a.project.id, targetBeneficiaries: 1200, name: 'Project a' } });
     const [resultRow] = await waitForRows({ action: `POST /api/frameworks/${a.framework.id}/results` });
     expect(resultRow.newValue).toMatchObject({ values: { id: result.body.id, code: 'O1.1', level: 'output', text: 'Teachers trained in inclusive methods', parentId: a.result.id } });
+  });
+
+  it('records the entity and the values of a write whatever the capitals of its path', async () => {
+    const res = await request(app).patch(`/API/Projects/${a.project.id}`).set('Authorization', a.officerAuth).send({ targetBeneficiaries: 1300 });
+    expect(res.status).toBe(200);
+    const refused = await request(app).patch(`/Api/INDICATORS/${a.indicator.id}`).set('Authorization', a.donorAuth).send({ targetValue: '1' });
+    expect(refused.status).toBe(403);
+    const [row] = await waitForRows({ userId: a.officer.id });
+    expect(row).toMatchObject({
+      action: `PATCH /API/Projects/${a.project.id}`,
+      entity: 'projects',
+      entityId: a.project.id,
+      newValue: { status: 200, fields: ['targetBeneficiaries'], values: { id: a.project.id, targetBeneficiaries: 1300 } },
+    });
+    const [refusedRow] = await waitForRows({ userId: a.donor.id });
+    expect(refusedRow).toMatchObject({ entity: 'indicators', entityId: a.indicator.id, newValue: { status: 403, fields: ['targetValue'] } });
   });
 
   it('records the value of a new data point, never its notes, area or source', async () => {

@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
-import { assertFrameworkAccess, assertProjectAccess } from '../middleware/access';
+import { assertFrameworkAccess, assertProjectAccess, assertProjectWritable } from '../middleware/access';
 import { authenticate, authorize } from '../middleware/auth';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
@@ -15,6 +15,7 @@ import { parseIndicatorCreate } from '../services/indicators/validation';
 import { canSeeIndicator, indicatorVisibilityWhere } from '../services/indicators/visibility';
 import { safeErrorSummary } from '../services/ai/errors';
 import { donorDataPointWhere } from '../services/privacy/donorView';
+import { lockProject } from '../services/projects/lifecycle';
 
 const router = Router();
 
@@ -154,13 +155,18 @@ router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'pl
   // A failed version is never the project's framework; approving it would only mark the project active.
   if (framework.generationError) throw new AppError(409, 'This framework version failed to generate and cannot be approved. Generate a new version.');
 
-  // One transaction; the indicators are approved first so the response shows them approved.
-  const [, updated] = await prisma.$transaction([
-    prisma.indicator.updateMany({
+  // One transaction, on the project's locked row checked again: an archive that committed after the check above
+  // makes the approval wait, then answer 409 project_archived, instead of marking the archived project active.
+  // The indicators are approved first so the response shows them approved.
+  const updated = await prisma.$transaction(async tx => {
+    const project = await lockProject(tx, framework.projectId);
+    if (!project) throw new AppError(404, 'Framework not found');
+    assertProjectWritable(req, project);
+    await tx.indicator.updateMany({
       where: { frameworkId: framework.id },
       data: { isApproved: true },
-    }),
-    prisma.framework.update({
+    });
+    const approved = await tx.framework.update({
       where: { id: framework.id },
       data: {
         status: 'approved',
@@ -168,13 +174,14 @@ router.patch('/frameworks/:id/approve', authenticate, authorize('org_admin', 'pl
         approvedBy: req.user!.id,
       },
       include: frameworkDetailInclude(req.user),
-    }),
+    });
     // Update project status
-    prisma.project.update({
-      where: { id: framework.projectId },
+    await tx.project.update({
+      where: { id: project.id },
       data: { status: 'active' },
-    }),
-  ]);
+    });
+    return approved;
+  });
 
   res.json(withOrderedResults(updated));
 }));

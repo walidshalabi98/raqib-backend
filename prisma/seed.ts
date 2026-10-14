@@ -1,24 +1,21 @@
 import { CollectionMethod, IndicatorLevel, Prisma, PrismaClient } from '@prisma/client';
-import bcrypt from 'bcrypt';
 import { seedLibrary } from '../src/services/library/seed';
+import { hashPassword, unusablePasswordHash } from '../src/services/auth/passwords';
+import { SEED_ACCOUNTS, SEED_ORGANISATION_NAME, SeedPasswordPlan, seedPasswordPlan } from './seedAccounts';
 
 const prisma = new PrismaClient();
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 
-// This seed DELETES all data before inserting demo records. Never run it in production.
-if (nodeEnv === 'production') {
-  console.error('Refusing to seed: NODE_ENV is "production". The seed deletes all existing data.');
+// This seed DELETES all data before inserting demo records. Never run it in production. Outside local
+// development SEED_PASSWORD is required: it becomes the org admin's password only, and must meet the password
+// policy (prisma/seedAccounts.ts).
+const plan = seedPasswordPlan(nodeEnv, process.env.SEED_PASSWORD);
+if (plan.kind === 'refuse') {
+  console.error(`Refusing to seed: ${plan.reason}`);
   process.exit(1);
 }
-
-// Outside local development the demo password must come from SEED_PASSWORD.
-const seedPassword = process.env.SEED_PASSWORD || (nodeEnv === 'development' ? 'admin123' : '');
-if (!seedPassword || seedPassword.length < 8) {
-  console.error('Refusing to seed: set SEED_PASSWORD (at least 8 characters) when NODE_ENV is not "development".');
-  process.exit(1);
-}
-const shownPassword = process.env.SEED_PASSWORD ? '<SEED_PASSWORD>' : seedPassword;
+const passwordPlan: Exclude<SeedPasswordPlan, { kind: 'refuse' }> = plan;
 
 /**
  * Sample history: the model recorded on the seeded AI-generated frameworks and indicators, which stand for
@@ -106,7 +103,7 @@ async function main() {
   // Organization
   const org = await prisma.organization.create({
     data: {
-      name: 'Momentum Labs',
+      name: SEED_ORGANISATION_NAME,
       nameAr: 'مومنتوم لابز',
       type: 'local_ngo',
       country: 'Palestine',
@@ -117,14 +114,16 @@ async function main() {
     },
   });
 
-  // Users
-  const passwordHash = await bcrypt.hash(seedPassword, 12);
+  // Users. With SEED_PASSWORD only the org admin can sign in; each of the other accounts gets its own random
+  // password nobody knows, until the admin resets it in Settings (a one-time temporary password).
+  const adminHash = await hashPassword(passwordPlan.password);
+  const otherHash = () => (passwordPlan.kind === 'sharedDemo' ? hashPassword(passwordPlan.password) : unusablePasswordHash());
 
   const adminUser = await prisma.user.create({
     data: {
       organizationId: org.id,
-      email: 'admin@momentumlabs.ps',
-      passwordHash,
+      email: SEED_ACCOUNTS.admin,
+      passwordHash: adminHash,
       fullName: 'Walid Shalabi',
       fullNameAr: 'وليد شلبي',
       role: 'org_admin',
@@ -135,8 +134,8 @@ async function main() {
   const meOfficer = await prisma.user.create({
     data: {
       organizationId: org.id,
-      email: 'me@momentumlabs.ps',
-      passwordHash,
+      email: SEED_ACCOUNTS.officer,
+      passwordHash: await otherHash(),
       fullName: 'Sara Ahmad',
       fullNameAr: 'سارة أحمد',
       role: 'me_officer',
@@ -147,8 +146,8 @@ async function main() {
   await prisma.user.create({
     data: {
       organizationId: org.id,
-      email: 'donor@momentumlabs.ps',
-      passwordHash,
+      email: SEED_ACCOUNTS.donor,
+      passwordHash: await otherHash(),
       fullName: 'John Smith',
       role: 'donor_viewer',
       languagePref: 'en',
@@ -999,9 +998,18 @@ async function main() {
   console.log('✅ Seed completed successfully!');
   console.log('');
   console.log('Demo accounts:');
-  console.log(`  Admin:   admin@momentumlabs.ps / ${shownPassword}`);
-  console.log(`  M&E:     me@momentumlabs.ps / ${shownPassword}`);
-  console.log(`  Donor:   donor@momentumlabs.ps / ${shownPassword}`);
+  if (passwordPlan.kind === 'sharedDemo') {
+    console.log(`  Admin:   ${SEED_ACCOUNTS.admin} / ${passwordPlan.password}`);
+    console.log(`  M&E:     ${SEED_ACCOUNTS.officer} / ${passwordPlan.password}`);
+    console.log(`  Donor:   ${SEED_ACCOUNTS.donor} / ${passwordPlan.password}`);
+    console.log('  (the local demo password; development only)');
+  } else {
+    console.log(`  Admin:   ${SEED_ACCOUNTS.admin} / <SEED_PASSWORD>`);
+    console.log(`  M&E:     ${SEED_ACCOUNTS.officer} (no password yet)`);
+    console.log(`  Donor:   ${SEED_ACCOUNTS.donor} (no password yet)`);
+    console.log('  Sign in as the admin, then give each tester their own one-time password:');
+    console.log('  Settings → Team members → Reset password.');
+  }
   console.log('');
   console.log(`Projects: ${[project1, project2, project3, project4].map(p => p.name).join(', ')}`);
 }

@@ -1,7 +1,7 @@
 import { Worker, Job } from 'bullmq';
 import { env } from '../config/env';
 import { prisma } from '../config/prisma';
-import { redis } from '../config/redis';
+import { redis, redisErrorHandler } from '../config/redis';
 import { parseDocument } from '../services/ai/documentParser';
 import { generateFramework } from '../services/ai/frameworkGenerator';
 import { generateReportNarrative } from '../services/ai/reportNarrative';
@@ -47,8 +47,9 @@ frameworkWorker.on('failed', (job, err) => {
   console.error(`[Worker] Framework generation failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
 
-// Indicator alternatives: the Phase 3 'indicator-alternatives' worker was removed in Phase 4 (nothing enqueued to it);
-// alternatives now come from the KPI Assistant (src/services/kpi/, POST /api/indicators/:id/alternative).
+// Indicator alternatives: the Phase 3 'indicator-alternatives' worker and queue were removed in Phase 4 (nothing enqueued
+// to them); alternatives now come from the KPI Assistant (src/services/kpi/, POST /api/indicators/:id/alternative), whose
+// suggestion runs execute in the API process (src/services/kpi/runs.ts), not on a queue.
 
 // Report Generation Worker
 const reportWorker = new Worker('report-generation', async (job: Job) => {
@@ -84,6 +85,11 @@ const maintenanceWorker = new Worker(MAINTENANCE_QUEUE, async (job: Job) => {
 maintenanceWorker.on('failed', (job, err) => {
   console.error(`[Worker] Maintenance job ${job?.name} failed: ${job?.id}: ${safeErrorSummary(err)}`);
 });
+
+// Connection errors are logged without the Redis password (config/redisErrors.ts).
+for (const worker of [documentWorker, frameworkWorker, reportWorker, qualitativeWorker, maintenanceWorker]) {
+  worker.on('error', redisErrorHandler(`worker ${worker.name}`));
+}
 
 // Registered at every start; the fixed scheduler id keeps it to one schedule.
 scheduleAiCallPruning(getMaintenanceQueue())

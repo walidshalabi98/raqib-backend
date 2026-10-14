@@ -152,14 +152,15 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
   });
 }));
 
-// GET /api/dashboard/overview — Org-level overview. Donor viewers: indicator counts and off-track alerts from
-// approved indicators only (spec §A1); the record counts (`dataPointCount` etc.) are not filtered by approval, but
-// count what donors can see (SECURITY_SETUP §8.3).
+// GET /api/dashboard/overview — Org-level overview of the projects that are not archived (like GET /api/projects:
+// an archived project is hidden from the lists, and its indicators raise no alerts). Donor viewers: indicator counts
+// and off-track alerts from approved indicators only (spec §A1); the record counts (`dataPointCount` etc.) are not
+// filtered by approval, but count what donors can see (SECURITY_SETUP §8.3).
 router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
 
   const projects = await prisma.project.findMany({
-    where: { organizationId: orgId },
+    where: { organizationId: orgId, status: { not: 'archived' } },
     include: {
       frameworks: {
         ...CURRENT_VERSION,
