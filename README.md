@@ -108,7 +108,7 @@ Every new route needs a role decision in `tests/roleMatrix.ts`, and every new `a
 
 ## KPI evaluation
 
-The KPI Assistant evaluation runs the cases of `knowledge/kpi-eval-cases.json` through the real model and prints a summary table. It costs about US$1-2 for all 8 cases. CI runs it only with the free fake model; the real run is a button.
+The KPI Assistant evaluation runs the cases of `knowledge/kpi-eval-cases.json` through the real model and prints a summary table. It costs about US$1-2 for all 8 cases (the run of 14 October 2026 cost US$0.70 and passed every target; results in [`docs/AI.md`](docs/AI.md) §12 "Evaluation"). CI runs it only with the free fake model; the real run is a button.
 
 One-time setup (repository admin): GitHub → this repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**, name `RAQIB_EVAL_ANTHROPIC_API_KEY`, value an Anthropic API key with a spending limit (the staging key is fine).
 

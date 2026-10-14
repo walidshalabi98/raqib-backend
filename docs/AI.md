@@ -318,3 +318,21 @@ Smaller implementation choices: a call for one result in framework scope (a one-
 ### Evaluation
 
 `npm run eval:kpi -- --yes` runs the 8 cases of `knowledge/kpi-eval-cases.json` through the same pipeline with the real model (about US$1–2, capped by `--max-usd`, default 3; refuses without a real key or `--yes`, and in production); `npm run eval:kpi -- --fake` runs them with a deterministic fake model, free and without network (CI runs it). It never uses a database. Reports go to `eval-results/<timestamp>.json` (git-ignored) with a summary table. Targets (§A8): schema validity 100%, assertion pass rate ≥ 90%, library usage ≥ 70% where candidates exist, hallucinated document values 0 after validation, baselines taken from target sentences 0 (including the target of "from X to Y" and plans after "currently"), standard-threshold targets outside the recognised list 0, average quality ≥ 80, result-scope latency median under 15 s with no call over 30 s. The cost and `--max-usd` count failed calls too. A scoped result without suggestions (`result_empty`) makes the run incomplete. The assertions `peopleIndicatorsHaveSex` and `noTargetInName` use the eval's own word lists and patterns (`eval/metrics.ts`), not the validator's, so a gap in the validator shows up. If the real run misses the latency target, change one thing at a time in `KPI_CALLS` / `LEVEL_SUGGESTION_RANGE` with a `kpi-v3` bump, in this order: at most 3 suggestions per outcome in result scope; 5 candidates and no notes lines in result scope; result scope on the fast tier.
+
+The real evaluation runs on demand from GitHub Actions ("KPI evaluation (real model)", `.github/workflows/kpi-eval.yml`; README "KPI evaluation").
+
+**Real evaluation, 14 October 2026** (the Actions button, on branch `claude/funny-planck-ljpix9` before the merge with main; prompt `kpi-v2`, system prompt `system-v1-295aae744a`, main model `claude-sonnet-5-5`, keyword retrieval). Every gate passed:
+
+| Measure | Result | Target (§A8) |
+|---|---|---|
+| Cases | 8 of 8 complete, 53 suggestions | every case complete |
+| Schema validity | 29 of 29 model calls succeeded | 100% |
+| Assertions | 59 of 59 (100%) | ≥ 90% |
+| Library use | 81% | ≥ 70% |
+| Average quality | 100 | ≥ 80 |
+| Hallucinated document values (after validation) | 0 | 0 |
+| Invented baselines (taken from target sentences) | 0 | 0 |
+| Result-scope latency | median 9.0 s, slowest 12.8 s | median < 15 s, none > 30 s |
+| Cost | US$0.70 for the whole run | capped by `--max-usd` (default 3) |
+
+So no latency change was needed. Repeat the run after any prompt, validation or library change, and compare only runs of the same prompt version.
