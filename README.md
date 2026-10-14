@@ -102,6 +102,19 @@ Without `TEST_DATABASE_URL` the integration tests are skipped. AI calls are alwa
 
 Every new route needs a role decision in `tests/roleMatrix.ts`, and every new `app.use` / `router.use` layer a review in `tests/roles.test.ts`: that test (no database) fails otherwise. A route open to donor viewers (`all` or `self`) also needs a request in `tests/donorAi.test.ts` (no donor request may reach an AI model) and, for a GET, in `tests/donorAccess.test.ts` (no personal data in the answer); their coverage tests fail otherwise. See [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md) §8.
 
+## KPI evaluation
+
+The KPI Assistant evaluation runs the cases of `knowledge/kpi-eval-cases.json` through the real model and prints a summary table. It costs about US$1-2 for all 8 cases. CI runs it only with the free fake model; the real run is a button.
+
+One-time setup (repository admin): GitHub → this repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**, name `RAQIB_EVAL_ANTHROPIC_API_KEY`, value an Anthropic API key with a spending limit (the staging key is fine).
+
+To run: **Actions** → **KPI evaluation (real model)** → **Run workflow**. Inputs:
+- `ref`: the branch or commit to evaluate (it must contain `scripts/eval-kpi.ts`);
+- `max_usd`: no new case starts once the spend reaches it (default 3, at most 10);
+- `cases`: case ids separated by spaces, or blank for all.
+
+The table appears on the run's summary page and the JSON report is kept as the `kpi-eval-results` artifact for 30 days. The workflow (`.github/workflows/kpi-eval.yml`) passes the key to the evaluation step only; the script uses no database and prints ids, counts and numbers only.
+
 ## Deploy
 
 Node 22 or later (`engines` in `package.json`). One build serves two processes with the same environment (both validate it at start and exit with the list of problems):
@@ -113,7 +126,7 @@ The build runs `prisma generate` and `tsc`, so install with dev dependencies (`n
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every pull request and on `main`: install, Prisma generate, lint, typecheck, tests against a pgvector Postgres service, build and `npm audit --audit-level=high`.
+`.github/workflows/ci.yml` runs on every pull request and on `main`: install, Prisma generate, lint, typecheck, tests against a pgvector Postgres service, build and `npm audit --audit-level=high`. `.github/workflows/kpi-eval.yml` runs only on demand (see [KPI evaluation](#kpi-evaluation)).
 
 ## Project layout
 
