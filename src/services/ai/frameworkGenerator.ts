@@ -57,6 +57,7 @@ export const FRAMEWORK_INDICATORS_FEATURE = 'framework.indicators';
 const LEVEL_ORDER: IndicatorLevel[] = ['impact', 'outcome', 'output', 'activity'];
 
 const EMPTY_INDICATOR_SET = 'AI returned empty or invalid indicator set';
+const PROJECT_GONE = 'The project of this framework no longer exists.';
 
 /** A failure of the generator itself, with a message that is safe to store and show (no prompt, document or model text). */
 export class FrameworkGenerationError extends Error {
@@ -111,7 +112,7 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
     },
   });
 
-  if (!project) throw new FrameworkGenerationError('The project of this framework no longer exists.');
+  if (!project) throw new FrameworkGenerationError(PROJECT_GONE);
 
   const framework = await prisma.framework.findUnique({
     where: { id: frameworkId },
@@ -240,6 +241,14 @@ async function runGeneration(frameworkId: string, projectId: string): Promise<vo
 
   // Step 3: Create the results chain and the indicators together, so a failure leaves no partial framework
   const { resultCount, indicatorCount } = await prisma.$transaction(async tx => {
+    // The project row first, like delete forever (project, then its frameworks), archive, restore, edits and framework
+    // approval: a delete that overlaps this write waits for it and then removes the new rows with the project, instead of
+    // deadlocking with it. FOR NO KEY UPDATE is the lock the status update below takes anyway; it does not hold up rows
+    // added to the project meanwhile (their key-share locks). A project deleted forever meanwhile: nothing is written.
+    const lockedProject = await tx.$queryRaw<{ id: string }[]>`
+      SELECT "id" FROM "Project" WHERE "id" = ${projectId} FOR NO KEY UPDATE`;
+    if (lockedProject.length === 0) throw new FrameworkGenerationError(PROJECT_GONE);
+
     const idByCode = new Map<string, string>();
     const nodes: Array<{ id: string; code: string; level: IndicatorLevel; parentId: string | null }> = [];
     for (const level of LEVEL_ORDER) {

@@ -51,6 +51,7 @@ Optional AI settings (defaults in brackets):
 | `AI_MAX_RETRIES` | retries after rate limits, overloads, server and network errors, 0–10 [`3`] |
 | `AI_REFUSAL_FALLBACK` | `default`: a refused request is re-run on Anthropic's fallback model (Sonnet 5.5, Opus 5, Opus 5.5); `off`: refusals are errors [`default`] |
 | `AI_CALL_RETENTION_MONTHS` | months an AiCall log row is kept, 1–120; the worker deletes older rows every night at 03:30 Asia/Hebron [`24`] |
+| `AI_ORG_DAILY_BUDGET_USD` | an organisation's AI spend allowed over the last 24 hours, in US$ (all AI features); once it is spent, KPI suggestion requests answer 429 `budget_reached`; 0 turns the check off [`20`] |
 | `VOYAGE_API_KEY` | embeddings for the indicator library; without it search uses keywords [empty] |
 | `VOYAGE_MODEL` | Voyage embedding model [`voyage-4`] |
 
@@ -61,7 +62,7 @@ Optional email settings:
 | `RESEND_API_KEY` | Resend key. Without it no email is sent: invites and admin password resets show the temporary password once to the admin, and forgot-password sends nothing. With it, invites, admin resets and forgot-password email a single-use link to choose a password (never a password), in English and Arabic (`docs/SECURITY_SETUP.md` §9) [empty] |
 | `EMAIL_FROM` | sender on a domain verified in Resend [`Raqib by Momentum Labs <noreply@raqib.momentumlabs.ps>`] |
 
-Everything else is optional and documented in `.env.example`. Security-related setup (storage bucket, webhook tokens, migrating old uploads, what is sent to AI providers) is in [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md). The data model (Phase 2: results chain, indicator reference sheets, breakdowns, library; Phase 3: the AiCall log and Document.aiAnalysis) and the rollout steps for its SQL are in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
+Everything else is optional and documented in `.env.example`. Security-related setup (storage bucket, webhook tokens, migrating old uploads, what is sent to AI providers) is in [`docs/SECURITY_SETUP.md`](docs/SECURITY_SETUP.md). The data model (Phase 2: results chain, indicator reference sheets, breakdowns, library; Phase 3: the AiCall log and Document.aiAnalysis; Phase 4: KPI suggestion runs and suggestions) and the rollout steps for its SQL are in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
 
 ## AI layer
 

@@ -9,6 +9,24 @@ vi.mock('../src/services/kpi/availability', async importOriginal => {
   const original = await importOriginal<typeof import('../src/services/kpi/availability')>();
   return { ...original, kpiAssistantStatus: vi.fn(() => ({ ...original.kpiAssistantStatus(), aiConfigured: true })) };
 });
+// A hook into a run's save transaction: findCurrentFramework called with a transaction client (not the shared Prisma
+// client) is the save's framework re-check, right after it claimed its run row. Armed by one test, used once.
+const { saveTransactionHook } = vi.hoisted(() => ({ saveTransactionHook: { current: null as null | (() => Promise<void>) } }));
+vi.mock('../src/services/frameworks/current', async importOriginal => {
+  const original = await importOriginal<typeof import('../src/services/frameworks/current')>();
+  const { prisma: shared } = await import('../src/config/prisma');
+  return {
+    ...original,
+    findCurrentFramework: async (...args: Parameters<typeof original.findCurrentFramework>) => {
+      const hook = saveTransactionHook.current;
+      if (hook && args[0] !== shared) {
+        saveTransactionHook.current = null;
+        await hook();
+      }
+      return original.findCurrentFramework(...args);
+    },
+  };
+});
 
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
@@ -19,6 +37,7 @@ import type { KpiModelAnswer } from '../src/services/kpi/types';
 import { fakeSdk, libraryEntry, rawFromEntry, rawMessage, suggestForLines } from './aiFakes';
 import {
   createKpiRunRow, createKpiSuggestionRow, createOrgFixture, hasTestDatabase, kpiValidatedSuggestionFixture, OrgFixture, resetDatabase,
+  waitForLockWaiter,
 } from './helpers';
 import { KPI_ROUTES } from './roleMatrix';
 import { routeLayers } from './routeStack';
@@ -368,6 +387,40 @@ describe.skipIf(!hasTestDatabase)('the KPI Assistant on archived and deleted pro
     expect(await prisma.indicator.count({ where: { frameworkId: w.framework.id } })).toBe(0);
     // The cost of the model call is kept, without the project (AiCall cost history).
     expect(await prisma.aiCall.count({ where: { organizationId: a.org.id, projectId: null, feature: { startsWith: 'kpi' } } })).toBeGreaterThanOrEqual(1);
+  });
+
+  it('delete forever while a run is saving its cards: both take the project row first and queue (no deadlock); the delete answers 200 and no KPI row is left', async () => {
+    const w = await washProject(a, 'KPI late run: deleted while saving');
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let deletion: Promise<{ status: number; body: unknown }> | undefined;
+    // Inside the run's save transaction, after it claimed its run row: the admin deletes the project, and the save goes on
+    // once the delete waits for a lock. Taken in opposite orders, the two would deadlock and PostgreSQL would abort one
+    // of them (the delete answering 409 conflict, or the run failing 'internal').
+    saveTransactionHook.current = async () => {
+      deletion = request(app).delete(`/api/projects/${w.project.id}`).set('Authorization', a.adminAuth)
+        .send({ confirmName: w.project.name }).then(answer => answer);
+      await waitForLockWaiter();
+    };
+    const sdk = fakeSdk(async body => rawMessage(body.model, answerFromPrompt(body)));
+    configureAiClientForTests({ anthropic: sdk.client });
+
+    const res = await request(app).post(`/api/projects/${w.project.id}/kpi-suggestions`).set('Authorization', a.officerAuth)
+      .send({ scope: 'result', resultId: w.o1.id });
+    expect(saveTransactionHook.current).toBeNull();
+    expect(deletion).toBeDefined();
+    const deleted = await deletion!;
+    expect(deleted.body).toMatchObject({ deleted: true, removed: { kpiSuggestionRuns: 1 } });
+    expect(deleted.status).toBe(200);
+    expect(sdk.sent).toHaveLength(1);
+    // The run saved its cards, then the delete removed them with the project; the request may find its run already gone.
+    expect([200, 404]).toContain(res.status);
+    expect(await prisma.project.count({ where: { id: w.project.id } })).toBe(0);
+    expect(await prisma.kpiSuggestionRun.count({ where: { projectId: w.project.id } })).toBe(0);
+    expect(await prisma.kpiSuggestion.count({ where: { projectId: w.project.id } })).toBe(0);
+    expect(await prisma.framework.count({ where: { id: w.framework.id } })).toBe(0);
+    // Neither transaction was aborted: the run did not fail.
+    expect(errors.mock.calls.flat().map(String).filter(line => line.includes('[KpiRun]'))).toEqual([]);
   });
 
   it('delete forever removes the KPI suggestions in every state and their runs, and no KPI row of another project', async () => {

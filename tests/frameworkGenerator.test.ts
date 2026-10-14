@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { CollectionMethod, Frequency, IndicatorDirection } from '@prisma/client';
+import { CollectionMethod, Frequency, IndicatorDirection, type Prisma } from '@prisma/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AI_ANALYSIS_MARKER,
@@ -67,8 +67,11 @@ import { prisma } from '../src/config/prisma';
 import { parseIndicatorCreate } from '../src/services/indicators/validation';
 import { DRAFT_EDITABLE_KEYS } from '../src/services/kpi/draft';
 import { DEFAULT_LIBRARY_PATH } from '../src/services/library/load';
+import { DELETE_TRANSACTION_OPTIONS, deleteProjectRows, lockProject, type RemovedRows } from '../src/services/projects/lifecycle';
 import { structuredOutputSchemaProblems } from './aiSchemaHelpers';
-import { createKpiRunRow, createKpiSuggestionRow, hasTestDatabase, kpiValidatedSuggestionFixture, resetDatabase } from './helpers';
+import {
+  createKpiRunRow, createKpiSuggestionRow, hasTestDatabase, kpiValidatedSuggestionFixture, resetDatabase, waitForLockWaiter,
+} from './helpers';
 
 // tests/setup.ts mocks the generator for every other test file; this file tests the real one
 // with the AI client mocked (generateStructured), so no model is ever called.
@@ -1451,6 +1454,31 @@ const features = () => allCalls().map(p => p.feature);
 /** Features without repeats, in call order. */
 const featureSteps = () => features().filter((f, i, all) => all.indexOf(f) === i);
 
+/**
+ * The generator's transaction client, with `hook` run before `tx.indicator.createMany` (the results chain is written by
+ * then). Every other property is the client's own; its functions keep the client as `this`.
+ */
+function withHookBeforeIndicatorWrite(tx: Prisma.TransactionClient, hook: () => Promise<void>): Prisma.TransactionClient {
+  return new Proxy(tx, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop);
+      if (prop === 'indicator') {
+        const delegate = value as Prisma.TransactionClient['indicator'];
+        return new Proxy(delegate, {
+          get(model, method) {
+            if (method !== 'createMany') return Reflect.get(model, method);
+            return async (args: Prisma.IndicatorCreateManyArgs) => {
+              await hook();
+              return model.createMany(args);
+            };
+          },
+        });
+      }
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 async function loadGenerator() {
   return vi.importActual<typeof import('../src/services/ai/frameworkGenerator')>('../src/services/ai/frameworkGenerator');
 }
@@ -1815,6 +1843,68 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
 
     expect(await prisma.indicator.count({ where: { frameworkId: framework.id } })).toBe(1);
     expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('archived');
+  });
+
+  /** Delete forever as DELETE /api/projects/:id runs it: the project row locked, then every row of the project, in one transaction. */
+  const deleteForever = (projectId: string): Promise<RemovedRows> => prisma.$transaction(async tx => {
+    const locked = await lockProject(tx, projectId);
+    if (!locked) throw new Error('project not found');
+    return (await deleteProjectRows(tx, locked)).removed;
+  }, DELETE_TRANSACTION_OPTIONS);
+
+  /** One output indicator for the metadata results chain of a livelihoods project (as in the archived-project test). */
+  const trainedAnswer = () => mockAi({
+    structure: { data: structureAnswer() },
+    indicators: { suggestions: [custom({ resultCode: 'O1.1', level: 'output', name: 'Number of young people trained', nameAr: 'عدد الشباب المدربين', unit: 'number', numerator: '', denominator: '' })] },
+  });
+
+  it('a delete forever that overlaps the final write waits for it instead of deadlocking, then removes the new framework with the project', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
+    trainedAnswer();
+    // The generator's write transaction (its only one) with a hook before the indicators are written, so the results
+    // chain is already written: the admin's delete starts, and the write goes on once the delete waits for a lock. Taken
+    // in opposite orders (framework rows, then the project row), the two would deadlock and PostgreSQL would abort one.
+    let deletion: Promise<RemovedRows> | undefined;
+    const hook = async () => {
+      deletion = deleteForever(project.id);
+      deletion.catch(() => undefined);
+      await waitForLockWaiter();
+    };
+    const transaction = prisma.$transaction.bind(prisma) as (write: (tx: Prisma.TransactionClient) => Promise<unknown>, options?: object) => Promise<unknown>;
+    vi.spyOn(prisma, '$transaction').mockImplementationOnce(((write: (tx: Prisma.TransactionClient) => Promise<unknown>, options?: object) =>
+      transaction(tx => write(withHookBeforeIndicatorWrite(tx, hook)), options)) as never);
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+
+    expect(deletion).toBeDefined();
+    await expect(deletion).resolves.toMatchObject({ frameworks: 1, indicators: 1 });
+    expect(await prisma.project.count({ where: { id: project.id } })).toBe(0);
+    expect(await prisma.framework.count({ where: { id: framework.id } })).toBe(0);
+    expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(0);
+    expect(await prisma.indicator.count({ where: { frameworkId: framework.id } })).toBe(0);
+  });
+
+  it('stops without writing anything when the project was deleted forever before the final write', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
+    trainedAnswer();
+    // The admin deletes the project while the model writes the indicators.
+    const answer = generateStructured.getMockImplementation()!;
+    let deletion: Promise<RemovedRows> | undefined;
+    generateStructured.mockImplementation(async (params: AnyParams) => {
+      // Batches run side by side: the first one deletes, the others wait for that delete.
+      if (params.feature === 'framework.indicators') await (deletion ??= deleteForever(project.id));
+      return answer(params);
+    });
+
+    const { generateFramework } = await loadGenerator();
+    await expect(generateFramework(framework.id, project.id)).rejects.toMatchObject({
+      name: 'FrameworkGenerationError', message: 'The project of this framework no longer exists.',
+    });
+    await expect(deletion).resolves.toMatchObject({ frameworks: 1, resultNodes: 0, indicators: 0 });
+    expect(await prisma.project.count({ where: { id: project.id } })).toBe(0);
+    expect(await prisma.framework.count({ where: { id: framework.id } })).toBe(0);
+    expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(0);
   });
 
   it('redacts phone numbers, emails and ID numbers in the project description before both prompts', async () => {

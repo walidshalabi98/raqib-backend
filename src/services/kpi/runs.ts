@@ -52,7 +52,10 @@ type Db = Prisma.TransactionClient | PrismaClient;
 /** Run ids executing in this process (heartbeat owners). */
 const active = new Set<string>();
 
-/** The run was marked failed meanwhile (interrupted or stale): its results are discarded, nothing more is written. */
+/**
+ * The run was marked failed meanwhile (interrupted or stale), or its project was deleted forever with the run row: its
+ * results are discarded, nothing more is written.
+ */
 class RunNoLongerRunning extends Error {
   constructor() {
     super('run no longer running');
@@ -67,6 +70,19 @@ class RunNoLongerRunning extends Error {
  */
 export async function lockProject(tx: Prisma.TransactionClient, projectId: string): Promise<void> {
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`kpi-run:${projectId}`}::text))`;
+}
+
+/**
+ * Key-share lock on the project row (SELECT … FOR KEY SHARE), taken by a run's save transaction before it claims its own
+ * run row: delete forever locks the project row (FOR UPDATE) before it deletes the project's runs, so taking the two rows
+ * in the same order means the two transactions queue instead of deadlocking. A delete that started first has removed the
+ * project (false: the run stores nothing); one that starts now waits until the cards are saved and then removes them with
+ * the project. An archive, restore or project edit (FOR UPDATE) only queues with it, for the few milliseconds of the save:
+ * a run that finishes after an archive still stores its cards (docs/SECURITY_SETUP.md §8.6 item 15).
+ */
+export async function keyShareProjectRow(tx: Prisma.TransactionClient, projectId: string): Promise<boolean> {
+  const rows = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "Project" WHERE "id" = ${projectId} FOR KEY SHARE`;
+  return rows.length > 0;
 }
 
 /** The result the scope is about (result scope: that result; alternatives: the source's result; framework: null). */
@@ -262,7 +278,8 @@ export function persistenceWarnings(dropped: readonly PersistenceDrop[]): KpiWar
  * Executes one run in this process (design 4.5): registers it in activeRunIds() and starts a KPI_HEARTBEAT_MS timer that
  * touches updatedAt (so a live run is never reported stale however long one model call takes); step 'context' →
  * buildProjectContext → runKpiPipeline (onStep stores the step, onProgress touches updatedAt) → step 'saving' → one
- * interactive transaction under the project's advisory lock: conditional claim (a run marked interrupted meanwhile is
+ * interactive transaction under the project's advisory lock: key-share lock on the project row (keyShareProjectRow; a
+ * project deleted forever meanwhile: results discarded), conditional claim (a run marked interrupted meanwhile is
  * rolled back and its results discarded), current-framework re-check (else failed 'stale'), the organisation's decisions
  * reloaded (loadOrgPreferences: a library id rejected meanwhile is dropped; CC-05), planPersistence, createMany,
  * expiry, conditional completion with counts, token and cost sums. Any error → failed with errorCodeFor(err)
@@ -301,6 +318,8 @@ export async function executeKpiRun(runId: string, deps: KpiRunDeps): Promise<vo
 
     const saved = await db.$transaction(async tx => {
       await lockProject(tx, projectId);
+      // The project row before the run's own row, in delete forever's order (keyShareProjectRow): no deadlock with a delete.
+      if (!(await keyShareProjectRow(tx, projectId))) throw new RunNoLongerRunning();
       const claimed = await tx.kpiSuggestionRun.updateMany({ where: { id: runId, status: 'running' }, data: { step: 'saving', updatedAt: deps.now() } });
       if (claimed.count === 0) throw new RunNoLongerRunning();
       const current = await findCurrentFramework(tx, projectId);

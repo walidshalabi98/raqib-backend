@@ -110,6 +110,9 @@ const envSchema = z.object({
   CORS_ORIGINS: optionalString,
 });
 
+/** Every environment variable the configuration reads (the documentation tests check that the README lists the AI ones). */
+export const ENV_VARIABLE_NAMES: readonly string[] = Object.keys(envSchema.shape);
+
 export type EnvInput = Record<string, string | undefined>;
 
 export function parseEnv(source: EnvInput) {

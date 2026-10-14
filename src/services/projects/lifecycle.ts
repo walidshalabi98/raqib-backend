@@ -159,9 +159,12 @@ export interface StoredFile {
  * ON DELETE NO ACTION, so the suggestions go first; links between them and to the project's indicators are
  * ON DELETE SET NULL), the indicators and results chains of its frameworks (parent links cleared first: the parent
  * foreign key is ON DELETE RESTRICT), the frameworks, the organisation's notifications whose link holds the
- * project id, then the project. A KPI run still executing in the API process finds its row gone and saves nothing. AiCall rows keep their cost history: their projectId is emptied by the
- * foreign key (ON DELETE SET NULL). Audit rows are kept. Returns the counts and the stored files of the
- * deleted documents, to remove once the transaction has committed (removeStoredFiles).
+ * project id, then the project. A KPI run saving its cards and a framework generation writing its results chain lock
+ * the project row first as well (keyShareProjectRow in kpi/runs.ts, the generator's write transaction), so they queue
+ * with this delete instead of deadlocking: one that was already saving finishes and its rows are deleted here; one
+ * that saves after this delete finds the project gone and saves nothing. AiCall rows keep their cost history:
+ * their projectId is emptied by the foreign key (ON DELETE SET NULL). Audit rows are kept. Returns the counts and
+ * the stored files of the deleted documents, to remove once the transaction has committed (removeStoredFiles).
  */
 export async function deleteProjectRows(
   tx: Prisma.TransactionClient,

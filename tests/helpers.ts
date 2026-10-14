@@ -356,3 +356,21 @@ export async function createKpiFixtures(fx: OrgFixture) {
 }
 
 export type KpiFixtures = Awaited<ReturnType<typeof createKpiFixtures>>;
+
+/**
+ * Waits until another connection to the test database waits for a lock (pg_stat_activity `wait_event_type` 'Lock'):
+ * for example a request this test started that is now blocked on a row the test's own transaction holds. Lock-order
+ * tests call it from inside a transaction to let the other one go as far as it can before the transaction continues.
+ * Throws when nothing waits within `timeoutMs`.
+ */
+export async function waitForLockWaiter(timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const [row] = await prisma.$queryRaw<{ waiting: number }[]>`
+      SELECT count(*)::int AS "waiting" FROM pg_stat_activity
+      WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock'`;
+    if (row.waiting > 0) return;
+    if (Date.now() > deadline) throw new Error(`no database connection waited for a lock within ${timeoutMs} ms`);
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
