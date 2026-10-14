@@ -1,4 +1,5 @@
 import { FrameworkStatus, Prisma, ProjectStatus } from '@prisma/client';
+import type { AuditTarget } from '../../middleware/audit';
 import { safeErrorSummary } from '../ai/errors';
 import { getStorage } from '../storage';
 
@@ -67,9 +68,22 @@ export function derivedRestoreStatus(frameworks: readonly { status: FrameworkSta
   return 'setup';
 }
 
-/** The audit action of an archive (as writeRequestAudit records it for POST /api/projects/:id/archive). */
+/** The audit action of an archive (POST /api/projects/:id/archive), which restore looks up. */
 export function archiveAuditAction(projectId: string): string {
   return `POST /api/projects/${projectId}/archive`;
+}
+
+/**
+ * The audit row of an archive, restore or permanent delete (writeRequestAudit): the route as registered with the
+ * project's id, entity `projects` and the project's id, built from the locked row rather than the request path,
+ * whose capitals the caller chooses (Express routes `POST /API/Projects/<id>/Archive` here too), so restore finds
+ * the archive's row and a review by entity finds every one of them.
+ */
+export function projectAuditTarget(change: 'archive' | 'restore' | 'delete', projectId: string): AuditTarget {
+  const action = change === 'archive' ? archiveAuditAction(projectId)
+    : change === 'restore' ? `POST /api/projects/${projectId}/restore`
+      : `DELETE /api/projects/${projectId}`;
+  return { action, entity: 'projects', entityId: projectId };
 }
 
 export interface LockedProject {
@@ -81,8 +95,9 @@ export interface LockedProject {
 
 /**
  * Locks the project row until the transaction ends (SELECT … FOR UPDATE), so a concurrent archive, restore,
- * delete or rename waits, and no row can be added to the project meanwhile (inserting a child row takes a
- * key-share lock on the project). Null when the project no longer exists.
+ * delete, edit (PATCH /api/projects/:id) or framework approval waits and then sees the committed status, and no
+ * row can be added to the project meanwhile (inserting a child row takes a key-share lock on the project). Null
+ * when the project no longer exists.
  */
 export async function lockProject(tx: Prisma.TransactionClient, projectId: string): Promise<LockedProject | null> {
   const rows = await tx.$queryRaw<LockedProject[]>`

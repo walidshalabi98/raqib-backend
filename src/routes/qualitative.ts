@@ -6,7 +6,7 @@ import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { assertAssessmentInProject, assertProjectAccess, assertQualitativeAccess } from '../middleware/access';
 import { aiLimiter } from '../middleware/rateLimit';
 import { assertFileContent, documentUpload } from '../middleware/upload';
-import { buildDocumentKey, getStorage } from '../services/storage';
+import { buildDocumentKey, storeUploadedFile } from '../services/storage';
 import { codeQualitativeEntry } from '../services/ai/qualitativeCoder';
 import { parseDocument } from '../services/ai/documentParser';
 import { safeErrorSummary } from '../services/ai/errors';
@@ -115,24 +115,25 @@ router.post('/projects/:id/qualitative/upload', authenticate, authorize(...STAFF
   const conductedOn = checked(() => dateOf(req.body.dateConducted, 'dateConducted'));
 
   const key = buildDocumentKey(req.params.id, file.originalname);
-  await getStorage().put(key, file.buffer, file.mimetype);
-
   const { title, location, facilitator } = req.body;
 
   // 1. A document record for the transcript. qualitativeSource: it is coded with its qualitative entry
-  // only, and never sent to document analysis, framework generation or assessment summaries.
-  const document = await prisma.document.create({
-    data: {
-      projectId: req.params.id,
-      uploadedBy: req.user!.id,
-      fileName: file.originalname,
-      fileUrl: key, // storage key, not a public URL
-      fileType: 'other',
-      fileSizeBytes: file.size,
-      parsingStatus: 'pending',
-      qualitativeSource: true,
-    },
-  });
+  // only, and never sent to document analysis, framework generation or assessment summaries. The stored file
+  // is removed again if the record cannot be saved (the project was deleted meanwhile).
+  const document = await storeUploadedFile({ key, body: file.buffer, contentType: file.mimetype, projectId: req.params.id }, () => (
+    prisma.document.create({
+      data: {
+        projectId: req.params.id,
+        uploadedBy: req.user!.id,
+        fileName: file.originalname,
+        fileUrl: key, // storage key, not a public URL
+        fileType: 'other',
+        fileSizeBytes: file.size,
+        parsingStatus: 'pending',
+        qualitativeSource: true,
+      },
+    })
+  ));
 
   // File names can hold phone or ID numbers: the entry's title and placeholder content use a redacted name.
   const safeFileName = redactPersonalData(file.originalname).text;

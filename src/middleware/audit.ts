@@ -82,42 +82,64 @@ export const AUDIT_VALUE_ROUTES: Readonly<Record<string, readonly string[]>> = {
   'PATCH /api/reports/:id/unpublish': REPORT_VALUES,
 };
 
-/** The action ("METHOD /path", no query string), entity (first path segment after /api) and entity id of a request's audit row. */
-export function requestAuditTarget(req: Request): { action: string; entity: string; entityId: string } {
+/** Who and what an audit row is about: "METHOD /path", the resource (first path segment after /api) and its id. */
+export interface AuditTarget {
+  action: string;
+  entity: string;
+  entityId: string;
+}
+
+/**
+ * The action ("METHOD /path" as requested, no query string), entity and entity id of a request's audit row.
+ * Express matches routes whatever the capitals of the path, so the entity is read without regard to them and
+ * stored in lower case (`POST /API/Projects/<id>/archive` is about `projects`, like the lower-case request).
+ */
+export function requestAuditTarget(req: Request): AuditTarget {
   const path = req.originalUrl.split('?')[0];
-  const entity = path.replace(/^\/api\/?/, '').split('/')[0] || 'unknown';
+  const entity = path.replace(/^\/api\/?/i, '').split('/')[0].toLowerCase() || 'unknown';
   // req.params is the route's after a route answered; after an error it may be reset, so fall back to the path.
   const entityId = req.params?.id || path.match(UUID_PATTERN)?.[0] || 'N/A';
   return { action: `${req.method} ${path}`, entity, entityId };
 }
 
 /**
+ * The route that is answering, as registered ("/api/projects/:id"), while it answers (req.route and req.baseUrl
+ * may be reset once the response is done), or null. req.baseUrl is the part of the request path a mount matched,
+ * with the capitals the caller typed; every mount path in src/app.ts is lower case and has no parameter, so its
+ * lower-case form is the mount path as registered (tests/audit.test.ts checks this).
+ */
+export function registeredRoutePath(req: Request): string | null {
+  return req.route?.path ? `${(req.baseUrl ?? '').toLowerCase()}${req.route.path}` : null;
+}
+
+/**
  * The audit row of a request, written by the route inside its own transaction, so the change and its record
  * commit together, with what the middleware cannot know: the previous value (for example the status a project
- * had before it was archived, or what a permanent delete removed). Same action, entity, entity id and
- * `newValue = { status, fields, values }` as the middleware's rows; the action is the route as registered
- * with its ids filled in (`POST /api/projects/<id>/archive`), whatever the spelling of the request path.
- * Call markRequestAudited(res) once the transaction has committed, so the middleware does not write a second
- * row; if the transaction fails, the middleware writes its usual row with the error status.
- * Never put personal data or free text from a request body in `previousValue` or `extra`.
+ * had before it was archived, or what a permanent delete removed). The route names the row's action, entity and
+ * entity id itself (`target`, for example `POST /api/projects/<id>/archive`, `projects`, `<id>` from the locked
+ * row), so the row never depends on how the caller spelled the request path; `newValue = { status, fields,
+ * values }` as in the middleware's rows. Call markRequestAudited(res) once the transaction has committed, so the
+ * middleware does not write a second row; if the transaction fails, the middleware writes its usual row with the
+ * error status. Never put personal data or free text from a request body in `previousValue` or `extra`.
  */
 export async function writeRequestAudit(
   db: Prisma.TransactionClient,
   req: Request,
-  entry: { status: number; previousValue: unknown; values?: Record<string, unknown> | null; extra?: Record<string, unknown> },
+  entry: {
+    target: AuditTarget;
+    status: number;
+    previousValue: unknown;
+    values?: Record<string, unknown> | null;
+    extra?: Record<string, unknown>;
+  },
 ): Promise<void> {
   if (!req.user) throw new Error('writeRequestAudit needs a signed-in user');
-  const { entity, entityId } = requestAuditTarget(req);
-  const routePath = req.route?.path ? `${req.baseUrl}${req.route.path}` : null;
-  const path = routePath
-    ? routePath.replace(/:(\w+)/g, (match, name: string) => (typeof req.params?.[name] === 'string' ? req.params[name] : match))
-    : req.originalUrl.split('?')[0];
   await db.auditLog.create({
     data: {
       userId: req.user.id,
-      action: `${req.method} ${path}`,
-      entity,
-      entityId,
+      action: entry.target.action,
+      entity: entry.target.entity,
+      entityId: entry.target.entityId,
       ...(entry.previousValue != null && { previousValue: JSON.parse(JSON.stringify(entry.previousValue)) }),
       newValue: JSON.parse(JSON.stringify({
         status: entry.status,
@@ -162,7 +184,8 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
     // The route is known while it answers (req.route and req.baseUrl may be reset once the response is done).
     const json = res.json.bind(res);
     res.json = function auditedJson(body?: unknown) {
-      const fields = req.route?.path ? AUDIT_VALUE_ROUTES[`${req.method} ${req.baseUrl}${req.route.path}`] : undefined;
+      const route = registeredRoutePath(req);
+      const fields = route ? AUDIT_VALUE_ROUTES[`${req.method} ${route}`] : undefined;
       if (fields && res.statusCode >= 200 && res.statusCode < 300) values = auditValues(fields, body);
       return json(body);
     } as Response['json'];

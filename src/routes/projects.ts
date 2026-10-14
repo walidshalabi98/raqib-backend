@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
-import { assertProjectAccess } from '../middleware/access';
+import { assertProjectAccess, assertProjectWritable } from '../middleware/access';
 import { auditValues, markRequestAudited, PROJECT_VALUES, writeRequestAudit } from '../middleware/audit';
 import { authenticate, authorize } from '../middleware/auth';
 import { hasStaffRole } from '../middleware/roles';
@@ -12,7 +12,7 @@ import { sortResultNodes } from '../services/indicators/hierarchy';
 import { parseProjectCreate, parseProjectUpdate } from '../services/projects/validation';
 import {
   ALREADY_ARCHIVED, CONFIRM_NAME_MISMATCH, confirmNameMatches, DELETE_BLOCKED_MESSAGE, DELETE_TRANSACTION_OPTIONS, deleteProjectRows, lockProject,
-  NOT_ARCHIVED, removeStoredFiles, restoreStatus,
+  NOT_ARCHIVED, projectAuditTarget, removeStoredFiles, restoreStatus,
 } from '../services/projects/lifecycle';
 import { loadBeneficiaryAggregates, toDonorBeneficiarySummary } from '../services/beneficiaries/donorSummary';
 import {
@@ -97,20 +97,26 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
 // POST /:id/archive, admins only). Changing `sector` or `sectors` keeps the primary sector in `sectors`.
 // An archived project answers 409 project_archived (restore it first).
 router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
-  const current = await assertProjectAccess(req, req.params.id);
+  await assertProjectAccess(req, req.params.id);
 
-  const parsed = parseProjectUpdate(req.body, current);
-  if (parsed.ok === false) {
-    res.status(400).json(validationErrorBody(parsed.errors));
+  // The update runs on the locked row, checked again: an archive that committed after the check above makes this
+  // edit wait, then answer 409 project_archived, instead of overwriting the archived status (only restore, admins
+  // only, un-archives a project).
+  const outcome = await prisma.$transaction(async tx => {
+    const locked = await lockProject(tx, req.params.id);
+    if (!locked) throw new AppError(404, 'Project not found');
+    assertProjectWritable(req, locked);
+    const current = await tx.project.findUniqueOrThrow({ where: { id: locked.id } });
+    const parsed = parseProjectUpdate(req.body, current);
+    if (parsed.ok === false) return parsed;
+    return { ok: true as const, project: await tx.project.update({ where: { id: locked.id }, data: parsed.data }) };
+  });
+  if (outcome.ok === false) {
+    res.status(400).json(validationErrorBody(outcome.errors));
     return;
   }
 
-  const updated = await prisma.project.update({
-    where: { id: req.params.id },
-    data: parsed.data,
-  });
-
-  res.json(updated);
+  res.json(outcome.project);
 }));
 
 // GET /api/projects/:id/export - Export project data as JSON (for Excel conversion).
@@ -304,6 +310,7 @@ router.post('/:id/archive', authenticate, authorize('org_admin', 'platform_admin
     if (locked.status === 'archived') throw new AppError(409, ALREADY_ARCHIVED.message, ALREADY_ARCHIVED.code);
     const project = await tx.project.update({ where: { id: locked.id }, data: { status: 'archived' } });
     await writeRequestAudit(tx, req, {
+      target: projectAuditTarget('archive', locked.id),
       status: 200,
       previousValue: { status: locked.status },
       values: auditValues(PROJECT_VALUES, project),
@@ -328,6 +335,7 @@ router.post('/:id/restore', authenticate, authorize('org_admin', 'platform_admin
     const { status, source } = await restoreStatus(tx, locked.id);
     const project = await tx.project.update({ where: { id: locked.id }, data: { status } });
     await writeRequestAudit(tx, req, {
+      target: projectAuditTarget('restore', locked.id),
       status: 200,
       previousValue: { status: locked.status },
       values: auditValues(PROJECT_VALUES, project),
@@ -361,6 +369,7 @@ router.delete('/:id', authenticate, authorize('org_admin', 'platform_admin'), as
     }
     const result = await deleteProjectRows(tx, locked);
     await writeRequestAudit(tx, req, {
+      target: projectAuditTarget('delete', locked.id),
       status: 200,
       previousValue: { name: locked.name, status: locked.status, removed: result.removed },
     });

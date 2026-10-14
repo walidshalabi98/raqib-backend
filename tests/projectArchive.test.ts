@@ -8,7 +8,7 @@ import { prisma } from '../src/config/prisma';
 import { assertProjectWritable, PROJECT_ARCHIVED_MESSAGE } from '../src/middleware/access';
 import { AppError } from '../src/middleware/errorHandler';
 import {
-  archiveAuditAction, confirmNameMatches, derivedRestoreStatus, statusBeforeArchive,
+  archiveAuditAction, confirmNameMatches, derivedRestoreStatus, projectAuditTarget, statusBeforeArchive,
 } from '../src/services/projects/lifecycle';
 import { parseProjectUpdate } from '../src/services/projects/validation';
 import { buildDocumentKey, getLocalStorage, getStorage } from '../src/services/storage';
@@ -391,6 +391,103 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
       }
       expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('active');
     });
+
+    it('records archive, restore and delete under entity projects whatever the capitals of the path, and restores the recorded status', async () => {
+      // Completed, with an approved framework: the derived status would be active, the recorded one is completed.
+      const project = await makeProject(a, 'Archive: other capitals', 'completed');
+      await prisma.framework.create({ data: { projectId: project.id, version: 1, status: 'approved' } });
+      // Express routes these paths whatever their capitals.
+      const archived = await request(app).post(`/API/Projects/${project.id}/Archive`).set('Authorization', a.adminAuth);
+      expect(archived.status).toBe(200);
+      expect(archived.body.status).toBe('archived');
+      const restored = await request(app).post(`/Api/PROJECTS/${project.id}/RESTORE`).set('Authorization', a.adminAuth);
+      expect(restored.status).toBe(200);
+      expect(restored.body.status).toBe('completed');
+      expect((await request(app).post(`/API/projects/${project.id}/archive`).set('Authorization', a.adminAuth)).status).toBe(200);
+      const deleted = await request(app).delete(`/API/PROJECTS/${project.id}`).set('Authorization', a.adminAuth).send({ confirmName: project.name });
+      expect(deleted.status).toBe(200);
+
+      const rows = await settledAuditRows(project.id, 4);
+      expect(rows.map(row => ({ action: row.action, entity: row.entity, entityId: row.entityId }))).toEqual([
+        projectAuditTarget('archive', project.id),
+        projectAuditTarget('restore', project.id),
+        projectAuditTarget('archive', project.id),
+        projectAuditTarget('delete', project.id),
+      ]);
+      expect(rows.map(row => row.action)).toEqual([
+        `POST /api/projects/${project.id}/archive`, `POST /api/projects/${project.id}/restore`,
+        `POST /api/projects/${project.id}/archive`, `DELETE /api/projects/${project.id}`,
+      ]);
+      expect(rows[0].previousValue).toEqual({ status: 'completed' });
+      expect(rows[1].newValue).toMatchObject({ status: 200, restoredFrom: 'archive_audit' });
+      expect(rows[3].previousValue).toMatchObject({ name: project.name, status: 'archived' });
+      // A review of the audit log by entity finds the permanent delete.
+      expect(await prisma.auditLog.count({ where: { entity: 'projects', entityId: project.id, action: { startsWith: 'DELETE' } } })).toBe(1);
+    });
+
+    it('a project edit that was checked before an archive committed waits for it, then answers 409 and leaves the project archived', async () => {
+      const project = await makeProject(a, 'Archive: racing edit', 'active');
+      const realFindFirst = prisma.project.findFirst.bind(prisma.project) as (args: unknown) => Promise<unknown>;
+      let held = false;
+      let archive: request.Response | undefined;
+      // The M&E officer's edit passes its access check (not archived yet); the admin's archive then commits.
+      vi.spyOn(prisma.project, 'findFirst').mockImplementation((async (args: { where?: { id?: unknown } }) => {
+        const found = await realFindFirst(args);
+        if (!held && args?.where?.id === project.id) {
+          held = true;
+          archive = await request(app).post(`/api/projects/${project.id}/archive`).set('Authorization', a.adminAuth);
+        }
+        return found;
+      }) as never);
+
+      const edit = await request(app).patch(`/api/projects/${project.id}`).set('Authorization', a.officerAuth).send({ status: 'completed' });
+      expect(archive?.status).toBe(200);
+      expect(edit.status).toBe(409);
+      expect(edit.body).toEqual(ARCHIVED);
+      vi.restoreAllMocks();
+      expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('archived');
+      const list = await request(app).get('/api/projects?archived=true').set('Authorization', a.adminAuth);
+      expect(list.body.map((p: { id: string }) => p.id)).toContain(project.id);
+      // Only restore un-archives it, to the status it had.
+      const restored = await request(app).post(`/api/projects/${project.id}/restore`).set('Authorization', a.adminAuth);
+      expect(restored.body.status).toBe('active');
+    });
+
+    it('a framework approval that was checked before an archive committed waits for it, then answers 409 and changes nothing', async () => {
+      const project = await makeProject(a, 'Archive: racing approval', 'framework_review');
+      const framework = await prisma.framework.create({ data: { projectId: project.id, version: 1, status: 'expert_review' } });
+      const indicator = await prisma.indicator.create({
+        data: { frameworkId: framework.id, indicatorText: 'Racing approval', level: 'output', dataCollectionMethod: 'hh_survey', frequency: 'monthly', phases: [] },
+      });
+      const realFindFirst = prisma.framework.findFirst.bind(prisma.framework) as (args: unknown) => Promise<unknown>;
+      let held = false;
+      let archive: request.Response | undefined;
+      // The admin's approval passes its access check (not archived yet); an archive then commits.
+      vi.spyOn(prisma.framework, 'findFirst').mockImplementation((async (args: { where?: { id?: unknown } }) => {
+        const found = await realFindFirst(args);
+        if (!held && args?.where?.id === framework.id) {
+          held = true;
+          archive = await request(app).post(`/api/projects/${project.id}/archive`).set('Authorization', a.adminAuth);
+        }
+        return found;
+      }) as never);
+
+      const approve = await request(app).patch(`/api/frameworks/${framework.id}/approve`).set('Authorization', a.adminAuth);
+      expect(archive?.status).toBe(200);
+      expect(approve.status).toBe(409);
+      expect(approve.body).toEqual(ARCHIVED);
+      vi.restoreAllMocks();
+      expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('archived');
+      expect(await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).toMatchObject({ status: 'expert_review', approvedAt: null, approvedBy: null });
+      expect((await prisma.indicator.findUniqueOrThrow({ where: { id: indicator.id } })).isApproved).toBe(false);
+      const restored = await request(app).post(`/api/projects/${project.id}/restore`).set('Authorization', a.adminAuth);
+      expect(restored.body.status).toBe('framework_review');
+      // Once restored, the approval goes through as before.
+      const approved = await request(app).patch(`/api/frameworks/${framework.id}/approve`).set('Authorization', a.adminAuth);
+      expect(approved.status).toBe(200);
+      expect(approved.body.status).toBe('approved');
+      expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('active');
+    });
   });
 
   describe('an archived project is read-only', () => {
@@ -767,6 +864,65 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
       expect(all).not.toContain('Testperson');
       expect(all).not.toContain(failing.fileUrl);
       expect(all).not.toContain('EACCES');
+    });
+
+    it('an upload whose project is deleted while its file is being stored leaves no file behind (documents and transcripts)', async () => {
+      const storage = getStorage();
+      const realPut = storage.put.bind(storage);
+      for (const route of ['documents', 'qualitative/upload'] as const) {
+        const project = await makeProject(a, `Upload race ${route}`);
+        const keys: string[] = [];
+        let deleted: request.Response | undefined;
+        // The admin deletes the project forever while the upload is between storing its file and saving its row.
+        const put = vi.spyOn(storage, 'put').mockImplementation(async (key, body, contentType) => {
+          await realPut(key, body, contentType);
+          keys.push(key);
+          deleted = await request(app).delete(`/api/projects/${project.id}`).set('Authorization', a.adminAuth).send({ confirmName: project.name });
+        });
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const upload = request(app).post(`/api/projects/${project.id}/${route}`).set('Authorization', a.officerAuth)
+          .attach('file', PDF_BYTES, { filename: 'Register 0599111222.pdf', contentType: 'application/pdf' });
+        const res = route === 'documents' ? await upload.field('fileType', 'other') : await upload;
+
+        expect(deleted?.status, route).toBe(200);
+        expect(deleted?.body.removed, route).toMatchObject({ documents: 0, storageFilesRemoved: 0, storageFilesFailed: 0 });
+        // The row could not be saved (the project is gone), and the file stored for it was removed again.
+        expect(res.status, route).toBe(400);
+        expect(keys, route).toHaveLength(1);
+        expect(keys[0].startsWith(`projects/${project.id}/`), route).toBe(true);
+        expect(fileExists(keys[0]), route).toBe(false);
+        expect(await prisma.document.count({ where: { projectId: project.id } }), route).toBe(0);
+        expect(JSON.stringify(errors.mock.calls), route).not.toMatch(/Register|0599111222/);
+        put.mockRestore();
+        errors.mockRestore();
+      }
+    });
+
+    it('a failed clean-up of such a file is logged with the project id only, and the upload still answers its error', async () => {
+      const storage = getStorage();
+      const realPut = storage.put.bind(storage);
+      const realRemove = storage.remove.bind(storage);
+      const project = await makeProject(a, 'Upload race: clean-up fails');
+      const keys: string[] = [];
+      vi.spyOn(storage, 'put').mockImplementation(async (key, body, contentType) => {
+        await realPut(key, body, contentType);
+        keys.push(key);
+        await request(app).delete(`/api/projects/${project.id}`).set('Authorization', a.adminAuth).send({ confirmName: project.name });
+      });
+      vi.spyOn(storage, 'remove').mockImplementation(async (key: string) => {
+        throw new Error(`EACCES: permission denied, unlink '/srv/storage/${key}' (Register 0599111222.pdf)`);
+      });
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const res = await request(app).post(`/api/projects/${project.id}/documents`).set('Authorization', a.officerAuth)
+        .attach('file', PDF_BYTES, { filename: 'Register 0599111222.pdf', contentType: 'application/pdf' }).field('fileType', 'other');
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ message: 'A related record does not exist (it may have been deleted).' });
+      const logged = errors.mock.calls.map(call => call.join(' ')).filter(line => line.startsWith('[Storage]'));
+      expect(logged).toEqual([`[Storage] Could not remove the stored file of an upload to project ${project.id} whose record was not saved (Error)`]);
+      const all = JSON.stringify(errors.mock.calls);
+      for (const secret of ['Register', '0599111222', keys[0], 'EACCES']) expect(all).not.toContain(secret);
+      await realRemove(keys[0]);
     });
 
     it('rolls back completely when a row outside the project still refers to it', async () => {
