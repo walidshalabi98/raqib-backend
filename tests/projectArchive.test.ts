@@ -12,7 +12,10 @@ import {
 } from '../src/services/projects/lifecycle';
 import { parseProjectUpdate } from '../src/services/projects/validation';
 import { buildDocumentKey, getLocalStorage, getStorage } from '../src/services/storage';
-import { bearer, createOrgFixture, hasTestDatabase, OrgFixture, PDF_BYTES, resetDatabase } from './helpers';
+import {
+  bearer, createKpiRunRow, createKpiSuggestionRow, createOrgFixture, hasTestDatabase, kpiValidatedSuggestionFixture, OrgFixture, PDF_BYTES,
+  resetDatabase,
+} from './helpers';
 import { routeLayers } from './routeStack';
 
 /**
@@ -520,6 +523,8 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
         beneficiaries: await prisma.beneficiary.findMany({ where: { projectId }, orderBy: { id: 'asc' } }),
         services: await prisma.beneficiaryService.findMany({ where: { projectId }, orderBy: { id: 'asc' } }),
         documents: await prisma.document.findMany({ where: { projectId }, orderBy: { id: 'asc' } }),
+        kpiRuns: await prisma.kpiSuggestionRun.findMany({ where: { projectId }, orderBy: { id: 'asc' } }),
+        kpiSuggestions: await prisma.kpiSuggestion.findMany({ where: { projectId }, orderBy: { id: 'asc' } }),
       };
     }
 
@@ -530,6 +535,9 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
       expect(writes.map(w => w.key)).toEqual(expect.arrayContaining([
         'patch /api/projects/:id', 'post /api/frameworks/:id/indicators', 'patch /api/indicators/:id', 'delete /api/documents/:id',
         'post /api/indicators/:id/data', 'post /api/beneficiaries/:id/services', 'patch /api/reports/:id/publish',
+        // KPI Assistant (Phase 4)
+        'post /api/projects/:id/kpi-suggestions', 'post /api/indicators/:id/alternative', 'post /api/kpi-suggestions/:id/accept',
+        'post /api/kpi-suggestions/:id/reject',
       ]));
       const before = await snapshot();
       for (const route of writes) {
@@ -692,6 +700,20 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
           inputTokens: 1000, outputTokens: 500, estimatedCostUsd: 0.0123, organizationId: a.org.id, projectId: project.id,
         },
       });
+      // KPI Assistant (Phase 4): a result run with a pending card and a card accepted as ind2, and an alternatives run
+      // for ind1 with a pending alternative (every state is covered in tests/kpiArchive.test.ts).
+      const kpiRun = await createKpiRunRow({ projectId: project.id, frameworkId: approved.id, resultId: outcome.id, requestedBy: a.officer.id });
+      await createKpiSuggestionRow({ run: kpiRun, suggestion: kpiValidatedSuggestionFixture(outcome, project, { name: `Pending ${label}` }) });
+      await createKpiSuggestionRow({
+        run: kpiRun, suggestion: kpiValidatedSuggestionFixture(output, project, { name: `Accepted ${label}` }),
+        status: 'accepted', decision: { decidedBy: a.officer.id, indicatorId: ind2.id },
+      });
+      const altRun = await createKpiRunRow({
+        projectId: project.id, frameworkId: approved.id, resultId: outcome.id, data: { scope: 'alternatives', sourceIndicatorId: ind1.id },
+      });
+      await createKpiSuggestionRow({
+        run: altRun, suggestion: kpiValidatedSuggestionFixture(outcome, project, { name: `Alternative ${label}` }), data: { alternativeOfIndicatorId: ind1.id },
+      });
       return { project, frameworks: [approved, failed], results: [goal, outcome, output], indicators: [ind1, ind2], assessment, documents, aiCall };
     }
 
@@ -709,12 +731,14 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
         reports: await prisma.report.count({ where: { projectId } }),
         documents: await prisma.document.count({ where: { projectId } }),
         notifications: await prisma.notification.count({ where: { link: { contains: projectId } } }),
+        kpiSuggestions: await prisma.kpiSuggestion.count({ where: { projectId } }),
+        kpiSuggestionRuns: await prisma.kpiSuggestionRun.count({ where: { projectId } }),
       };
     }
 
     const FULL_COUNTS = {
       project: 1, frameworks: 2, resultNodes: 3, indicators: 2, assessments: 1, dataPoints: 3, qualitativeEntries: 2,
-      beneficiaries: 2, beneficiaryServices: 3, reports: 2, documents: 2, notifications: 2,
+      beneficiaries: 2, beneficiaryServices: 3, reports: 2, documents: 2, notifications: 2, kpiSuggestions: 3, kpiSuggestionRuns: 2,
     };
     const fileExists = (key: string) => fs.existsSync(getLocalStorage()!.resolve(key));
 
@@ -775,7 +799,8 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
         deleted: true,
         removed: {
           frameworks: 2, resultNodes: 3, indicators: 2, assessments: 1, dataPoints: 3, qualitativeEntries: 2, beneficiaries: 2,
-          beneficiaryServices: 3, reports: 2, documents: 2, notifications: 2, storageFilesRemoved: 2, storageFilesFailed: 0,
+          beneficiaryServices: 3, reports: 2, documents: 2, notifications: 2, kpiSuggestions: 3, kpiSuggestionRuns: 2,
+          storageFilesRemoved: 2, storageFilesFailed: 0,
         },
       });
 
@@ -797,7 +822,7 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
       // The other project of the organisation, and organisation B, are untouched.
       expect(await rowsOf(a.project.id, [a.framework.id])).toEqual(otherBefore);
       expect(await rowsOf(b.project.id, [b.framework.id])).toEqual(orgBBefore);
-      expect(otherBefore).toMatchObject({ project: 1, frameworks: 1, indicators: 1, resultNodes: 1, documents: 1, notifications: 1 });
+      expect(otherBefore).toMatchObject({ project: 1, frameworks: 1, indicators: 1, resultNodes: 1, documents: 1, notifications: 1, kpiSuggestions: 1, kpiSuggestionRuns: 1 });
       expect(await prisma.notification.findUnique({ where: { id: keepNotification.id } })).not.toBeNull();
       expect(fileExists(a.document.fileUrl)).toBe(true);
       expect(fileExists(b.document.fileUrl)).toBe(true);
@@ -816,7 +841,7 @@ describe.skipIf(!hasTestDatabase)('archive, restore and delete forever', () => {
           status: 'active',
           removed: {
             frameworks: 2, resultNodes: 3, indicators: 2, assessments: 1, dataPoints: 3, qualitativeEntries: 2, beneficiaries: 2,
-            beneficiaryServices: 3, reports: 2, documents: 2, notifications: 2,
+            beneficiaryServices: 3, reports: 2, documents: 2, notifications: 2, kpiSuggestions: 3, kpiSuggestionRuns: 2,
           },
         },
         newValue: { status: 200, fields: ['confirmName'] },

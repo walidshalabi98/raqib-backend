@@ -1,5 +1,5 @@
 import { Request } from 'express';
-import type { KpiSuggestion, KpiSuggestionRun, Project, ProjectStatus } from '@prisma/client';
+import type { KpiSuggestion, KpiSuggestionRun, Prisma, Project, ProjectStatus } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { AppError } from './errorHandler';
 
@@ -35,6 +35,21 @@ export function assertProjectWritable(req: Pick<Request, 'method'>, project: { s
   if (project.status !== 'archived') return;
   const method = typeof req.method === 'string' ? req.method.toUpperCase() : '';
   if (!READ_METHODS.has(method)) throw new AppError(409, PROJECT_ARCHIVED_MESSAGE, PROJECT_ARCHIVED_CODE);
+}
+
+/**
+ * The archived rule again, inside a transaction that adds to or decides something in a project after its access
+ * check (a KPI suggestion run starting, a KPI suggestion accepted or rejected): reads the project row under a share
+ * lock (SELECT … FOR SHARE) and answers 409 `project_archived` when it is archived, 404 when it no longer exists.
+ * An archive or a permanent delete (both lock the row FOR UPDATE) waits for this transaction, and one that committed
+ * first is seen here, so a write that passed its access check just before an archive never lands in the archived
+ * project. The share lock does not block other writes to the project's rows (their key-share locks).
+ */
+export async function assertProjectWritableLocked(tx: Prisma.TransactionClient, projectId: string): Promise<void> {
+  const rows = await tx.$queryRaw<{ status: ProjectStatus }[]>`
+    SELECT "status"::text AS "status" FROM "Project" WHERE "id" = ${projectId} FOR SHARE`;
+  if (!rows[0]) throw new AppError(404, 'Project not found');
+  if (rows[0].status === 'archived') throw new AppError(409, PROJECT_ARCHIVED_MESSAGE, PROJECT_ARCHIVED_CODE);
 }
 
 export interface ProjectAccessOptions {

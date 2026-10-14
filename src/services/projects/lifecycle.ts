@@ -140,6 +140,9 @@ export interface RemovedRows {
   reports: number;
   documents: number;
   notifications: number;
+  /** KPI Assistant (Phase 4): suggestions in every status, and the runs that made them. */
+  kpiSuggestions: number;
+  kpiSuggestionRuns: number;
 }
 
 /** A deleted document's file in private storage. */
@@ -151,9 +154,12 @@ export interface StoredFile {
 /**
  * Deletes every row of the project, in dependency order, inside the caller's transaction (which must hold
  * lockProject): beneficiary services, data points, qualitative entries, assessments, beneficiaries, reports,
- * documents, the indicators and results chains of its frameworks (parent links cleared first: the parent
+ * documents, the KPI Assistant's suggestions (every status: pending, accepted with their indicator, rejected,
+ * expired, alternatives of indicators and of suggestions) and then its suggestion runs (a suggestion's run is
+ * ON DELETE NO ACTION, so the suggestions go first; links between them and to the project's indicators are
+ * ON DELETE SET NULL), the indicators and results chains of its frameworks (parent links cleared first: the parent
  * foreign key is ON DELETE RESTRICT), the frameworks, the organisation's notifications whose link holds the
- * project id, then the project. AiCall rows keep their cost history: their projectId is emptied by the
+ * project id, then the project. A KPI run still executing in the API process finds its row gone and saves nothing. AiCall rows keep their cost history: their projectId is emptied by the
  * foreign key (ON DELETE SET NULL). Audit rows are kept. Returns the counts and the stored files of the
  * deleted documents, to remove once the transaction has committed (removeStoredFiles).
  */
@@ -174,6 +180,8 @@ export async function deleteProjectRows(
   const beneficiaries = (await tx.beneficiary.deleteMany({ where: { projectId } })).count;
   const reports = (await tx.report.deleteMany({ where: { projectId } })).count;
   const documentRows = (await tx.document.deleteMany({ where: { projectId } })).count;
+  const kpiSuggestions = (await tx.kpiSuggestion.deleteMany({ where: { projectId } })).count;
+  const kpiSuggestionRuns = (await tx.kpiSuggestionRun.deleteMany({ where: { projectId } })).count;
   const indicators = (await tx.indicator.deleteMany({ where: { frameworkId: { in: frameworkIds } } })).count;
   await tx.resultNode.updateMany({ where: { frameworkId: { in: frameworkIds }, parentId: { not: null } }, data: { parentId: null } });
   const resultNodes = (await tx.resultNode.deleteMany({ where: { frameworkId: { in: frameworkIds } } })).count;
@@ -186,7 +194,7 @@ export async function deleteProjectRows(
   return {
     removed: {
       frameworks, resultNodes, indicators, assessments, dataPoints, qualitativeEntries, beneficiaries, beneficiaryServices,
-      reports, documents: documentRows, notifications,
+      reports, documents: documentRows, notifications, kpiSuggestions, kpiSuggestionRuns,
     },
     storedFiles: documents.map(doc => ({ documentId: doc.id, key: doc.fileUrl })),
   };

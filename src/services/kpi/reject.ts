@@ -6,6 +6,7 @@
 import { SuggestionRejectReason } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../../config/prisma';
+import { assertProjectWritableLocked } from '../../middleware/access';
 import { AppError } from '../../middleware/errorHandler';
 import { redactPersonalData } from '../ai/redact';
 import { KPI_TRANSACTION_OPTIONS, lockProject, toSuggestionDto } from './runs';
@@ -37,8 +38,8 @@ export function parseRejectBody(body: unknown): { reason: SuggestionRejectReason
 }
 
 /**
- * Records the rejection (design 8.2): organisation-scoped load (404), then, under the project's KPI lock (lockProject), one
- * conditional update from pending → rejected with decidedAt, decidedBy, rejectReason and the redacted rejectNote; nothing changed (no longer pending) →
+ * Records the rejection (design 8.2): organisation-scoped load (404), then, under the project's KPI lock (lockProject) and
+ * with the archived rule checked again on the share-locked project row (409 project_archived), one conditional update from pending → rejected with decidedAt, decidedBy, rejectReason and the redacted rejectNote; nothing changed (no longer pending) →
  * 409 already_decided. The rejection then excludes the library id per REJECTION_SCOPE (preferences.ts, D9).
  */
 export async function rejectKpiSuggestion(input: { suggestionId: string; organizationId: string; userId: string; body: unknown }): Promise<{ suggestion: KpiSuggestionDto }> {
@@ -52,6 +53,8 @@ export async function rejectKpiSuggestion(input: { suggestionId: string; organiz
   // Under the project's KPI lock (CC-04, CC-05): a run saving its cards at the same time sees this rejection.
   const count = await prisma.$transaction(async tx => {
     await lockProject(tx, existing.projectId);
+    // An archive that committed after the route's access check: 409 project_archived, the suggestion stays pending.
+    await assertProjectWritableLocked(tx, existing.projectId);
     return (await tx.kpiSuggestion.updateMany({
       where: { id: existing.id, status: 'pending' },
       data: { status: 'rejected', decidedAt: new Date(), decidedBy: input.userId, rejectReason: reason, rejectNote: note },

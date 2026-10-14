@@ -10,6 +10,7 @@
 import { Prisma } from '@prisma/client';
 import type { KpiSuggestion, KpiSuggestionRun, PrismaClient } from '@prisma/client';
 import { prisma } from '../../config/prisma';
+import { assertProjectWritableLocked } from '../../middleware/access';
 import { AppError } from '../../middleware/errorHandler';
 import {
   AiError, AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError, safeErrorSummary,
@@ -91,8 +92,9 @@ function scopeOfRun(run: Pick<KpiSuggestionRun, 'scope' | 'resultId' | 'sourceIn
 }
 
 /**
- * Takes pg_advisory_xact_lock(hashtext('kpi-run:' || projectId)) in a transaction, re-checks findConflictingRun (409
- * run_in_progress, `details.runId`) and creates the row; then starts executeKpiRun (never rejects `done`). The caller
+ * Takes pg_advisory_xact_lock(hashtext('kpi-run:' || projectId)) in a transaction, checks the archived rule again on the
+ * share-locked project row (409 project_archived), re-checks findConflictingRun (409 run_in_progress, `details.runId`)
+ * and creates the row; then starts executeKpiRun (never rejects `done`). The caller
  * has checked organisation access and resolved the scope ids against the project's current framework (requests.ts).
  * Design 4.5 and 7.2 step 8.
  */
@@ -102,6 +104,8 @@ export async function startKpiRun(input: { projectId: string; organizationId: st
   const { projectId, frameworkId, scope } = input;
   const run = await d.db.$transaction(async tx => {
     await lockProject(tx, projectId);
+    // An archive that committed after the route's access check: 409 project_archived, no run and no AI spend.
+    await assertProjectWritableLocked(tx, projectId);
     const resultId = await scopeResultId(tx, scope);
     const conflict = await findConflictingRun(tx, { projectId, frameworkId, scope, resultId }, d.now());
     if (conflict) {

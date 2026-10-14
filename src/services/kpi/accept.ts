@@ -6,6 +6,7 @@
  */
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
+import { assertProjectWritableLocked } from '../../middleware/access';
 import { AppError } from '../../middleware/errorHandler';
 import { donorRulesFor } from '../ai/donorRules';
 import { redactPersonalData } from '../ai/redact';
@@ -126,8 +127,9 @@ const nameOf = (payload: unknown): string => (isObject(payload) && typeof payloa
  * 1. load (organisation-scoped; 404); 2. not pending → 409 already_decided (expired → 409 stale);
  * 3. stale (framework no longer current, result deleted or its level changed) → expired + 409 stale;
  * 4. edits merged over the stored draft and parsed once (400 naming every failing field);
- * 5. one interactive transaction: the project's KPI lock first (lockProject; CC-03, CC-04), conditional decision (409
- *    already_decided), staleness re-check with tx (409 stale and expired), sibling group expired (before any source
+ * 5. one interactive transaction: the project's KPI lock first (lockProject; CC-03, CC-04), the archived rule on the
+ *    share-locked project row (409 project_archived; the route's access check answered it already unless an archive
+ *    committed in between), conditional decision (409 already_decided), staleness re-check with tx (409 stale and expired), sibling group expired (before any source
  *    indicator is deleted, so the group is still linked), duplicate check on the target result (409 duplicate),
  *    createIndicatorInFramework with provenance ai_suggested, the suggestion's model and prompt version (server-set even
  *    after edits), link;
@@ -173,6 +175,9 @@ export async function acceptKpiSuggestion(input: { suggestionId: string; organiz
       // First, the project's KPI lock (CC-03, CC-04): an accept of a related card, a reject, or a run saving its cards
       // waits for this transaction, so related accepts never deadlock and a run never re-adds what was just accepted.
       await lockProject(tx, s.projectId);
+      // The archived rule again on the project row (share lock): an archive that committed after the route's access
+      // check refuses this accept (409 project_archived) and the suggestion stays pending; an archive waits for it.
+      await assertProjectWritableLocked(tx, s.projectId);
       const now = new Date();
       const claimed = await tx.kpiSuggestion.updateMany({
         where: { id: s.id, status: 'pending' },

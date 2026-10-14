@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { env } from '../../config/env';
 import { budgetCostUsd, getModelInfo, MODELS } from '../ai/models';
 import { prisma } from '../../config/prisma';
+import { PROJECT_ARCHIVED_CODE, PROJECT_ARCHIVED_MESSAGE } from '../../middleware/access';
 import { AppError } from '../../middleware/errorHandler';
 import { STAFF_ROLES } from '../../middleware/roles';
 import { findCurrentFramework } from '../frameworks/current';
@@ -211,8 +212,9 @@ export async function runWithSuggestions(runId: string, now: Date = new Date()):
 
 /**
  * Shared by POST /projects/:id/kpi-suggestions and POST /indicators/:id/alternative (section 7.2). The route has
- * already loaded `project` through the organisation access check (step 1: 404 before anything costs money). Then:
- * 2 body (400) → 3 archived project (409 project_archived) → 4 current framework (409 no_framework) → 5 scope ids
+ * already loaded `project` through the organisation access check (step 1: 404 before anything costs money), which
+ * also answers an archived project (step 2: 409 project_archived, the access choke point; checked again here and in
+ * startKpiRun). Then: 3 body (400) → 4 current framework (409 no_framework) → 5 scope ids
  * (400 / 409 stale / 422 not_suggestable) → 6 preview without documents: nothing in scope (422 nothing_to_suggest with
  * details.reason) or more than KPI_MAX_RESULTS_PER_RUN results (422 too_many_results) → 7 no real key (503
  * ai_not_configured) or the organisation's daily AI budget spent (429 budget_reached) → 8 startKpiRun (409
@@ -223,10 +225,10 @@ export async function handleKpiRequest(req: Request, res: Response, project: Pro
   if (!req.user) throw new AppError(401, 'Not authenticated');
   const organizationId = req.user.organizationId;
 
+  // The routes' access helpers (assertProjectAccess, assertIndicatorAccess) answer an archived project before this
+  // runs; checked again for any other caller, then once more under the project lock in startKpiRun.
+  if (project.status === 'archived') throw new AppError(409, PROJECT_ARCHIVED_MESSAGE, PROJECT_ARCHIVED_CODE);
   const parsed = parseKpiRequestBody(body);
-  if (project.status === 'archived') {
-    throw new AppError(409, 'This project is archived; KPI suggestions are not available for it.', 'project_archived');
-  }
   const framework = await findCurrentFramework(prisma, project.id);
   if (!framework) throw new AppError(409, 'This project has no framework yet. Create or generate one first.', 'no_framework');
   const scope = await resolveScope(prisma, framework.id, project.id, parsed, via);
