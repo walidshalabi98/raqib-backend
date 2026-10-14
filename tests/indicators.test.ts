@@ -9,7 +9,7 @@ import {
   DEFAULT_PHASES, indicatorCreateSchema, isLegacyDate, parseIndicatorCreate, parseIndicatorUpdate, parseIsoDate,
   provenanceAfterUpdate, toIndicatorCreateData, toIndicatorUpdateData,
 } from '../src/services/indicators/validation';
-import { bearer, createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
+import { createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './helpers';
 
 function messageOf(fn: () => unknown): string {
   try {
@@ -625,10 +625,7 @@ describe.skipIf(!hasTestDatabase)('indicator reference sheet API', () => {
   });
 
   it('lets donor viewers read but not write indicators', async () => {
-    const viewer = await prisma.user.create({
-      data: { organizationId: a.org.id, email: 'viewer-ind@example.org', passwordHash: 'x', fullName: 'Viewer', role: 'donor_viewer' },
-    });
-    const auth = bearer(viewer);
+    const auth = a.donorAuth;
     expect((await create({ indicatorText: 'x' }, auth)).status).toBe(403);
     expect((await patch(createdId, { indicatorText: 'x' }, auth)).status).toBe(403);
     const list = await request(app).get(`/api/frameworks/${a.framework.id}/indicators`).set('Authorization', auth);

@@ -80,7 +80,37 @@ export const AUDIT_VALUE_ROUTES: Readonly<Record<string, readonly string[]>> = {
   'POST /api/indicators/:id/data': DATA_POINT_VALUES,
   'PATCH /api/reports/:id/publish': REPORT_VALUES,
   'PATCH /api/reports/:id/unpublish': REPORT_VALUES,
+  // Accepting a KPI suggestion creates an indicator with its target (and possibly a baseline), with the officer's edits.
+  'POST /api/kpi-suggestions/:id/accept': INDICATOR_VALUES,
 };
+
+/**
+ * Routes whose response nests the record (AUDIT_VALUE_ROUTES fields are read from `from`), with ids kept from the top
+ * level (`top`) and the names of the request's edited fields (`editedFrom`: the request body key holding the edits;
+ * names only, never values). SEC-4: the accept response is { indicator, suggestion, warnings, replacedIndicatorId }.
+ */
+export const AUDIT_NESTED_VALUES: Readonly<Record<string, { from: string; top: readonly string[]; editedFrom?: string }>> = {
+  'POST /api/kpi-suggestions/:id/accept': { from: 'indicator', top: ['replacedIndicatorId'], editedFrom: 'edits' },
+};
+
+/**
+ * The audit values of a write that answered `body` on route `routeKey` ("METHOD path" as registered): the listed fields
+ * of the record (nested per AUDIT_NESTED_VALUES), plus the nested routes' top-level ids and the names of the edited
+ * fields of the request; null when the route keeps no values.
+ */
+export function auditValuesFor(routeKey: string, body: unknown, requestBody: unknown): Record<string, unknown> | null {
+  const fields = AUDIT_VALUE_ROUTES[routeKey];
+  if (!fields) return null;
+  const nested = AUDIT_NESTED_VALUES[routeKey];
+  if (!nested) return auditValues(fields, body);
+  const record = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>)[nested.from] : undefined;
+  const values: Record<string, unknown> = { ...(auditValues(fields, record) ?? {}), ...(auditValues(nested.top, body) ?? {}) };
+  if (nested.editedFrom && requestBody && typeof requestBody === 'object' && !Array.isArray(requestBody)) {
+    const edited = bodyFieldNames((requestBody as Record<string, unknown>)[nested.editedFrom]);
+    if (edited.length > 0) values.editedFields = edited;
+  }
+  return Object.keys(values).length > 0 ? values : null;
+}
 
 /** Who and what an audit row is about: "METHOD /path", the resource (first path segment after /api) and its id. */
 export interface AuditTarget {
@@ -170,10 +200,11 @@ export function auditValues(fields: readonly string[], body: unknown): Record<st
  * One AuditLog row per write request by a signed-in user, with who, what (method and path), when, the HTTP
  * status and the names of the fields the body sent (`newValue = { status, fields }`), so refused requests (403)
  * are told apart from successes and a change of, say, an indicator's target can be traced to who and when.
- * Successful writes to project, framework, result, indicator and data point records, and publishing or
- * withdrawing a report, also keep the allow-listed values of the saved record (`values`, AUDIT_VALUE_ROUTES), so
- * the history of a baseline or target, and of what was shared with donors, can be read back. Never any other
- * value from the request or response body: bodies hold beneficiaries' personal
+ * Successful writes to project, framework, result, indicator and data point records, publishing or withdrawing a
+ * report, and KPI suggestion acceptances (which create indicators), also keep the allow-listed values of the saved
+ * record (`values`, AUDIT_VALUE_ROUTES and AUDIT_NESTED_VALUES), so the history of a baseline or target, and of what
+ * was shared with donors, can be read back. Never any other value from the request or response body: bodies hold
+ * beneficiaries' personal
  * data and new webhook tokens (CLAUDE.md rules 3 and 5). Written when the response finishes, so uploads,
  * multer refusals and error-handler answers are covered. Requests without a signed-in user (401s, sign-in,
  * webhooks) are not attributed and not written.
@@ -185,8 +216,7 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
     const json = res.json.bind(res);
     res.json = function auditedJson(body?: unknown) {
       const route = registeredRoutePath(req);
-      const fields = route ? AUDIT_VALUE_ROUTES[`${req.method} ${route}`] : undefined;
-      if (fields && res.statusCode >= 200 && res.statusCode < 300) values = auditValues(fields, body);
+      if (route && res.statusCode >= 200 && res.statusCode < 300) values = auditValuesFor(`${req.method} ${route}`, body, req.body);
       return json(body);
     } as Response['json'];
     let written = false;

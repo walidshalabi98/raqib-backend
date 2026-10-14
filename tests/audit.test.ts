@@ -4,7 +4,7 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
 import type { Request } from 'express';
-import { AUDIT_VALUE_ROUTES, auditValues, bodyFieldNames, registeredRoutePath, requestAuditTarget } from '../src/middleware/audit';
+import { AUDIT_VALUE_ROUTES, auditValues, auditValuesFor, bodyFieldNames, registeredRoutePath, requestAuditTarget } from '../src/middleware/audit';
 import { createOrgFixture, hasTestDatabase, OrgFixture, PDF_BYTES, resetDatabase } from './helpers';
 import { ROLE_MATRIX } from './roleMatrix';
 import { routeLayers } from './routeStack';
@@ -47,6 +47,19 @@ describe('audit values (allow-listed fields of M&E records)', () => {
     for (const field of ['notes', 'geographicArea', 'attachments', 'dataSource', 'fullName', 'phoneNumber', 'nationalId', 'content', 'location', 'description', 'aiRationale', 'token', 'aiNarrative', 'fileUrl', 'title']) {
       expect(fields, field).not.toContain(field);
     }
+  });
+
+  it('SEC-4: an accepted KPI suggestion keeps the created indicator\'s values, the replaced id and the edited field names', () => {
+    const key = 'POST /api/kpi-suggestions/:id/accept';
+    expect(AUDIT_VALUE_ROUTES[key]).toEqual(AUDIT_VALUE_ROUTES['PATCH /api/indicators/:id']);
+    const body = { indicator: { id: 'i-1', targetValue: '70', baselineValue: null, notes: 'Layla Testname' }, suggestion: { id: 's-1', rationale: 'x' }, warnings: [], replacedIndicatorId: 'i-0' };
+    expect(auditValuesFor(key, body, { edits: { targetValue: '70', 'bad key': 1 } })).toEqual({
+      id: 'i-1', targetValue: '70', baselineValue: null, replacedIndicatorId: 'i-0', editedFields: ['targetValue'],
+    });
+    expect(auditValuesFor(key, { indicator: null }, {})).toBeNull();
+    // Flat routes are unchanged.
+    expect(auditValuesFor('PATCH /api/indicators/:id', { id: 'i-1', targetValue: '5', notes: 'x' }, { targetValue: '5' })).toEqual({ id: 'i-1', targetValue: '5' });
+    expect(auditValuesFor('POST /api/projects/:id/beneficiaries', { fullName: 'x' }, {})).toBeNull();
   });
 
   it('pick the listed fields of a plain object only', () => {
@@ -144,6 +157,18 @@ describe.skipIf(!hasTestDatabase)('audit log', () => {
     for (const row of rows) {
       expect(Object.keys((row.newValue as { values: object }).values).every(k => AUDIT_VALUE_ROUTES['PATCH /api/indicators/:id'].includes(k))).toBe(true);
     }
+  });
+
+  it('SEC-4: records who accepted a KPI suggestion, the target they set and that it was edited', async () => {
+    const res = await request(app).post(`/api/kpi-suggestions/${a.kpiSuggestion.id}/accept`).set('Authorization', a.officerAuth)
+      .send({ edits: { targetValue: '70' } });
+    expect(res.status).toBe(201);
+    const [row] = await waitForRows({ action: `POST /api/kpi-suggestions/${a.kpiSuggestion.id}/accept` });
+    expect(row).toMatchObject({ userId: a.officer.id, entity: 'kpi-suggestions', entityId: a.kpiSuggestion.id });
+    expect(row.newValue).toMatchObject({
+      status: 201, fields: ['edits'],
+      values: { id: res.body.indicator.id, targetValue: '70', baselineValue: null, replacedIndicatorId: null, editedFields: ['targetValue'] },
+    });
   });
 
   it('records the values of project and result writes too', async () => {

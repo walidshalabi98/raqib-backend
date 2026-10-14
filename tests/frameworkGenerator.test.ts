@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { CollectionMethod, Frequency, IndicatorDirection } from '@prisma/client';
+import { CollectionMethod, Frequency, IndicatorDirection, type Prisma } from '@prisma/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AI_ANALYSIS_MARKER,
@@ -50,8 +50,6 @@ import { ECHO_INDICATOR_CAP, donorGuidance } from '../src/services/ai/prompts/do
 import {
   FRAMEWORK_DIRECTIONS,
   FRAMEWORK_FREQUENCIES,
-  FRAMEWORK_INDICATORS_SCHEMA,
-  FRAMEWORK_INDICATORS_SYSTEM,
   FRAMEWORK_METHODS,
   FRAMEWORK_PROMPT_VERSION,
   FRAMEWORK_STRUCTURE_SYSTEM,
@@ -59,19 +57,27 @@ import {
   PROJECT_STRUCTURE_SCHEMA,
   STRUCTURE_DOCUMENT_MAX_CHARS,
   extractProjectStructurePrompt,
-  generateFrameworkPrompt,
 } from '../src/services/ai/prompts/framework';
+import * as frameworkPrompts from '../src/services/ai/prompts/framework';
+import { KPI_CALLS, KPI_PROMPT_VERSION, KPI_SUGGESTIONS_SCHEMA, KPI_SYSTEM, type KpiRawSuggestion } from '../src/services/ai/prompts/kpi';
 import { AiInvalidOutputError, AiOutputTruncatedError, AiRefusalError, AiRequestError } from '../src/services/ai/errors';
 import { FrameworkGenerationError, generationFailureMessage } from '../src/services/ai/frameworkGenerator';
 import type { GenerateStructuredParams, StructuredResult } from '../src/services/ai/client';
 import { prisma } from '../src/config/prisma';
+import { parseIndicatorCreate } from '../src/services/indicators/validation';
+import { DRAFT_EDITABLE_KEYS } from '../src/services/kpi/draft';
 import { DEFAULT_LIBRARY_PATH } from '../src/services/library/load';
+import { DELETE_TRANSACTION_OPTIONS, deleteProjectRows, lockProject, type RemovedRows } from '../src/services/projects/lifecycle';
 import { structuredOutputSchemaProblems } from './aiSchemaHelpers';
-import { hasTestDatabase, resetDatabase } from './helpers';
+import {
+  createKpiRunRow, createKpiSuggestionRow, hasTestDatabase, kpiValidatedSuggestionFixture, resetDatabase, waitForLockWaiter,
+} from './helpers';
 
 // tests/setup.ts mocks the generator for every other test file; this file tests the real one
 // with the AI client mocked (generateStructured), so no model is ever called.
 vi.unmock('../src/services/ai/frameworkGenerator');
+// tests/setup.ts answers runKpiPipeline with an empty result for route tests; the generator runs the real pipeline here.
+vi.unmock('../src/services/kpi/pipeline');
 
 const { generateStructured } = vi.hoisted(() => ({ generateStructured: vi.fn() }));
 vi.mock('../src/services/ai/client', () => ({
@@ -531,6 +537,22 @@ describe('frameworkNormalize: people-level disaggregation', () => {
     expect(isPeopleLevelIndicator('Megawatts installed', 'قدرة الطاقة المتجددة المركبة')).toBe(false);
   });
 
+  it('decides by the counted noun, not by a people word used as a modifier (AI-5 side effect)', () => {
+    for (const name of ['Number of water points serving displaced communities', 'Number of family tents distributed',
+      'Number of IDP sites with functioning latrines', 'Number of mother-and-baby spaces established', 'Number of youth-led initiatives funded',
+      "Number of teachers' guides distributed"]) {
+      expect(isPeopleLevelIndicator(name), name).toBe(false);
+    }
+    expect(isPeopleLevelIndicator('Number of family tents distributed', 'عدد الخيام العائلية الموزعة')).toBe(false);
+    expect(isPeopleLevelIndicator('Number of IDP sites with functioning latrines', 'عدد مواقع النازحين المزودة بمراحيض')).toBe(false);
+    for (const name of ['Number of displaced families receiving hygiene kits', 'Number of newly enrolled children', 'Number of children fully immunised',
+      'Number of heads of household trained', 'Number of boys and girls enrolled', 'Number of trained teachers',
+      'Average number of meals per day among children under five', 'Number of persons with disabilities accessing services',
+      'Number of young people trained']) {
+      expect(isPeopleLevelIndicator(name), name).toBe(true);
+    }
+  });
+
   it('recognises the wider list of people nouns in English and Arabic', () => {
     for (const name of [
       'Number of teachers trained', 'Number of health staff trained', 'Number of committee members trained', '% of residents satisfied',
@@ -790,7 +812,7 @@ describe('frameworkNormalize: baselines and targets (never invented)', () => {
     expect(resolveBaselineAndTarget({ ...base, baselineValue: '22%', baselineBasis: 'estimate' }, FIGURES).baselineValue).toBeNull();
   });
 
-  it('keeps a standard threshold only when the linked library entry\'s own text contains it', () => {
+  it('keeps a standard threshold only when it is a recognised threshold of the linked entry, in its unit and in its own text', () => {
     const wa01 = seedEntry('WA-01');
     const sphere = resolveBaselineAndTarget({
       ...base, targetValue: '15', targetBasis: 'standard_threshold', targetJustification: 'Sphere minimum of 15 l/p/d.',
@@ -801,23 +823,33 @@ describe('frameworkNormalize: baselines and targets (never invented)', () => {
       'Proposed standard threshold (Sphere Water supply standard — minimum 15 l/p/d (aim for 20)): Sphere minimum of 15 l/p/d — confirm it applies to this project.'
       + NO_INTERMEDIATE,
     );
+    const wa = (targetValue: string, unit?: string) => resolveBaselineAndTarget({
+      ...base, targetValue, targetBasis: 'standard_threshold', standardReferenceCode: null, libraryEntry: wa01, unit,
+    }, []).targetValue;
+    expect(wa('20')).toBe('20');
+    expect(wa('15 l/p/d', 'litres_per_person_per_day')).toBe('15 l/p/d');
+    // The unit must be the threshold's: a percentage, or "15%", is never the Sphere litres minimum.
+    expect(wa('15', 'percent')).toBeNull();
+    expect(wa('15%')).toBeNull();
 
-    // Notes, means of verification and calculation fields count too (case-insensitive, whole numbers only).
+    // SPEC-1: numbers in an entry's text are not thresholds: recall periods, cut-offs, durations, years, codes, notes.
     const entry = libEntry('ED-04', {
       notes: 'Define completed as AT LEAST 80% of sessions.', meansOfVerification: 'Attendance sheets for all 12 sessions',
       calculation: { numerator: 'Score of 42 or more', formula: 'numerator ÷ denominator × 100' },
     });
     const threshold = (targetValue: string, libraryEntry: LibraryEntryReference | null = entry, standardReferenceCode: string | null = null) =>
       resolveBaselineAndTarget({ ...base, targetValue, targetBasis: 'standard_threshold', standardReferenceCode, libraryEntry }, []);
-    expect(threshold('at least 80%').targetValue).toBe('at least 80%');
-    expect(threshold('12').targetValue).toBe('12');
-    expect(threshold('42').targetValue).toBe('42');
-    expect(threshold('42').targetJustification).toBe(`Proposed standard threshold (library entry ED-04) — confirm it applies to this project.${NO_INTERMEDIATE}`);
-    expect(threshold('4').targetValue).toBeNull(); // part of 42
+    for (const value of ['at least 80%', '12', '42', '4']) expect(threshold(value).targetValue, value).toBeNull();
     expect(libraryEntryTexts(entry)).toEqual([
       'Definition of ED-04', 'Define completed as AT LEAST 80% of sessions.', 'Attendance sheets for all 12 sessions',
       'Score of 42 or more', 'numerator ÷ denominator × 100',
     ]);
+    for (const [id, value] of [['FS-01', '35'], ['FS-01', '7'], ['FS-01', '42'], ['LV-01', '6'], ['AC-01', '2024'], ['AC-01', '5'],
+      ['WA-03', '0'], ['WA-02', '30'], ['HE-02', '4']] as const) {
+      const r = threshold(value, seedEntry(id));
+      expect(r.targetValue, `${id} ${value}`).toBeNull();
+      expect(r.targetJustification).toMatch(/^Proposed method: /);
+    }
 
     // A free-text standard reference is no longer enough, nor is a value missing from the linked entry.
     for (const r of [
@@ -910,7 +942,7 @@ describe('frameworkNormalize: indicators', () => {
     expect(p.calculation).toBeUndefined();
   });
 
-  it('keeps libraryId only when known, and takes the standard reference from the linked library entry', () => {
+  it('keeps libraryId only when known, and takes the standard reference (or none) from the linked library entry', () => {
     const [unknown, known, lower, overridden, custom, none] = normalizeIndicators([
       aiIndicator({ libraryId: 'IM-99', indicatorText: 'A', standardReferenceCode: 'IASC MHPSS O5.4' }),
       aiIndicator({ libraryId: 'LV-02', indicatorText: 'B' }),
@@ -924,8 +956,8 @@ describe('frameworkNormalize: indicators', () => {
     // The library's standard reference is authoritative over the model's code …
     expect(lower).toMatchObject({ libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)' });
     expect(overridden.standardReferenceCode).toBe('EU GERF 2.14');
-    // … and the model's code is kept only when the linked entry has no standard reference.
-    expect(custom).toMatchObject({ libraryId: 'LV-01', standardReferenceCode: 'SDG 8.5.2' });
+    // … and a linked entry without a standard reference carries no code, whatever the model wrote (SPEC-4 re-check).
+    expect(custom).toMatchObject({ libraryId: 'LV-01', standardReferenceCode: null });
     expect(none.standardReferenceCode).toBeNull();
   });
 
@@ -1075,10 +1107,6 @@ function emptyAnswerIndicator(overrides: Record<string, unknown> = {}): Record<s
 }
 
 describe('frameworkNormalize: "" in the structured answer means missing', () => {
-  it('the empty answer is schema-valid', () => {
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [emptyAnswerIndicator()] }).success).toBe(true);
-  });
-
   it('treats "" as missing in every field and marks the reference sheet "to be confirmed"', () => {
     const [p] = normalizeIndicators({ indicators: [emptyAnswerIndicator()] }, ctx());
     expect(p).toMatchObject({
@@ -1244,18 +1272,22 @@ describe('frameworkNormalize: reference-sheet gaps', () => {
 
 // ---------------------------------------------------------------- prompts and schemas
 
-/** A calculation without the rounding part: no longer schema-valid. */
-const EMPTY_CALCULATION_V3 = { numerator: '', denominator: '', formula: '' };
-
 describe('framework prompts and answer schemas', () => {
   const info = {
     name: 'Youth Employment', sector: 'livelihoods', sectors: ['livelihoods', 'youth'], humanitarian: true,
     donor: 'EU', donorType: 'echo', startDate: '2026-01-01', endDate: '2027-12-31',
   };
 
-  it('are valid structured-output schemas', () => {
+  it('the structure schema is a valid structured-output schema', () => {
     expect(structuredOutputSchemaProblems(PROJECT_STRUCTURE_SCHEMA)).toEqual([]);
-    expect(structuredOutputSchemaProblems(FRAMEWORK_INDICATORS_SCHEMA)).toEqual([]);
+  });
+
+  it('the Phase 3 indicator prompt and schema are gone: the indicator step uses the KPI prompt (design 4.6, D19)', () => {
+    for (const removed of ['FRAMEWORK_INDICATORS_SCHEMA', 'FRAMEWORK_INDICATORS_SYSTEM', 'generateFrameworkPrompt']) {
+      expect(frameworkPrompts, removed).not.toHaveProperty(removed);
+    }
+    expect(FRAMEWORK_PROMPT_VERSION).toBe('framework-v4');
+    expect(KPI_PROMPT_VERSION).toBe('kpi-v2');
   });
 
   it('use the database enums, the shared unit list and every unit of the seed library', () => {
@@ -1270,25 +1302,7 @@ describe('framework prompts and answer schemas', () => {
     for (const unit of new Set(LIBRARY_FILE.indicators.map(e => e.unit))) expect(INDICATOR_UNITS).toContain(unit);
   });
 
-  it('accept a complete answer and reject activity indicators, unknown units, missing fields and bare lists', () => {
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator()] }).success).toBe(true);
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ level: 'activity' })] }).success).toBe(false);
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ unit: 'litres' })] }).success).toBe(false);
-    for (const unit of ['ratio', 'index', 'currency_usd', 'currency_eur', 'currency_jod', 'minutes', 'km']) {
-      expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ unit })] }).success, unit).toBe(true);
-    }
-    for (const field of ['baselineDate', 'intermediateTargets']) {
-      const without = aiIndicator();
-      delete without[field];
-      expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [without] }).success, field).toBe(false);
-    }
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ calculation: EMPTY_CALCULATION_V3 })] }).success).toBe(false);
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ intermediateTargets: [{ date: '2026-06-30' }] })] }).success).toBe(false);
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [aiIndicator({ libraryId: null })] }).success).toBe(false);
-    const missing = aiIndicator();
-    delete missing.assumptions;
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse({ indicators: [missing] }).success).toBe(false);
-    expect(FRAMEWORK_INDICATORS_SCHEMA.safeParse([aiIndicator()]).success).toBe(false);
+  it('accepts a complete structure answer and rejects an unknown figure kind', () => {
     expect(PROJECT_STRUCTURE_SCHEMA.safeParse(structureAnswer()).success).toBe(true);
     expect(PROJECT_STRUCTURE_SCHEMA.safeParse({ ...structureAnswer(), documentFigures: [{ resultCode: 'O1', kind: 'estimate', value: '5', description: '', quote: '' }] }).success).toBe(false);
   });
@@ -1317,68 +1331,18 @@ describe('framework prompts and answer schemas', () => {
     expect(prompt).toContain(`${'a'.repeat(STRUCTURE_DOCUMENT_MAX_CHARS - 1)}\n</document>`);
   });
 
-  it('asks for reference-sheet fields, forbids invented values and lists library candidates', () => {
-    const prompt = generateFrameworkPrompt(
-      { goal: { code: 'G', text: 'x' } },
-      [{ ...candidate('LV-01', 'livelihoods'), standardReference: { framework: 'EU GERF', code: '2.14' } }],
-      info,
-      { hasDocuments: false },
-    );
-    for (const field of ['resultCode', 'definition', 'calculation', 'calculation.rounding', 'direction', 'disaggregation', 'meansOfVerification',
-      'baselineBasis', 'baselineDate', 'targetBasis', 'targetJustification', 'intermediateTargets', 'assumptions', 'responsibility', 'libraryId',
-      'standardReferenceCode', 'startDate', 'milestones', 'aiRationale']) {
-      expect(prompt).toContain(field);
-    }
-    expect(prompt).toContain('LV-01 [output]');
-    expect(prompt).toContain('standard: EU GERF 2.14');
-    expect(prompt).toContain('never invent numbers');
-    expect(prompt).toContain('a standard threshold written in the linked library candidate');
-    expect(prompt).toContain('how the target will be set from the baseline');
-    expect(prompt).not.toMatch(/Suggest baseline and target values where possible/i);
-    expect(prompt).toContain('Do not write activity indicators');
-    expect(prompt).toContain('No project documents were provided');
-    expect(prompt).toContain('accountability to affected people');
-    expect(prompt).toContain('indicatorTextAr: the same indicator in Modern Standard Arabic. Always required: never leave it "".');
-    expect(prompt).toContain('only a value listed in documentFigures with kind "baseline"');
-    expect(prompt).toContain('Never split, interpolate or phase a final target yourself');
-    expect(prompt).toContain('a ratio such as people per latrine or pupils per teacher is "ratio"');
-    expect(prompt).toContain('(otherwise "")');
-    expect(prompt).toContain('"" means unknown or not applicable');
-    expect(prompt).toContain(`unit: one of ${INDICATOR_UNITS.join(', ')}`);
-    expect(prompt).not.toMatch(/Return ONLY valid JSON/i);
-    expect(prompt).not.toContain('"resultCode": "O1"');
-  });
-
-  it('gives DG ECHO projects one indicator cap, per result (sub-sector), in the prompt, the donor guidance and the metadata fallback', () => {
+  it('gives DG ECHO projects one indicator cap, per result (sub-sector), in the donor guidance and the metadata fallback', () => {
     expect(ECHO_INDICATOR_CAP).toBe('at most 3 indicators per result (sub-sector), 4 with one justified custom indicator');
-    const echo = generateFrameworkPrompt({ goal: { code: 'G', text: 'x' } }, [], info, { hasDocuments: false });
-    expect(echo.split(ECHO_INDICATOR_CAP)).toHaveLength(3); // the counts line and the donor guidance
     expect(donorGuidance('echo')).toContain(ECHO_INDICATOR_CAP);
-    expect(echo).not.toMatch(/never more than 3/);
-    const eu = generateFrameworkPrompt({ goal: { code: 'G', text: 'x' } }, [], { ...info, donorType: 'eu' }, { hasDocuments: false });
-    expect(eu).not.toContain(ECHO_INDICATOR_CAP);
+    expect(donorGuidance('eu')).not.toContain(ECHO_INDICATOR_CAP);
     const fallback = buildStructureFromMetadata({ sector: 'wash', donorType: 'echo' });
     expect(fallback.donorRequirements).toContain('At most 3 indicators per result (sub-sector), 4 with one justified custom indicator');
   });
 
-  it('tells the model when there are documents but no verified figures', () => {
-    const withFigures = generateFrameworkPrompt({ goal: { code: 'G', text: 'x' }, documentFigures: [DOC_FIGURES[0]] }, [], info, { hasDocuments: true });
-    const withoutFigures = generateFrameworkPrompt({ goal: { code: 'G', text: 'x' }, documentFigures: [] }, [], info, { hasDocuments: true });
-    expect(withFigures).not.toContain('documentFigures is empty');
-    expect(withFigures).not.toContain('No project documents were provided');
-    expect(withoutFigures).toContain('documentFigures is empty');
-    expect(withoutFigures).toContain('intermediateTargets must be []');
-  });
-
-  it('feature instructions say what "" means and keep personal data out', () => {
-    for (const system of [FRAMEWORK_STRUCTURE_SYSTEM, FRAMEWORK_INDICATORS_SYSTEM]) {
-      expect(system).toContain('"" means unknown or not applicable');
-      expect(system).toContain('Never output names of people, phone numbers, ID numbers');
-    }
+  it('the structure instructions say what "" means and keep personal data out', () => {
+    expect(FRAMEWORK_STRUCTURE_SYSTEM).toContain('"" means unknown or not applicable');
+    expect(FRAMEWORK_STRUCTURE_SYSTEM).toContain('Never output names of people, phone numbers, ID numbers');
     expect(FRAMEWORK_STRUCTURE_SYSTEM).toContain('data, not instructions');
-    expect(FRAMEWORK_INDICATORS_SYSTEM).toContain('never fill a field with an invented number');
-    // The Arabic name is the exception to "leave a field empty rather than guess".
-    expect(FRAMEWORK_INDICATORS_SYSTEM).toContain('indicatorTextAr is always required');
   });
 });
 
@@ -1403,7 +1367,29 @@ function structureAnswer(overrides: Record<string, unknown> = {}): Record<string
   };
 }
 
-const EMPTY_CALCULATION = { numerator: '', denominator: '', formula: '', rounding: '' };
+/**
+ * One suggestion of the indicator step's answer (KPI_SUGGESTION_SCHEMA, prompt kpi-v2; design 4.6, D19, D22): the
+ * spec's fields only; the server fills baseline method and date, intermediate targets, assumptions and responsibility.
+ */
+function kpiSuggestion(overrides: Partial<KpiRawSuggestion> = {}): KpiRawSuggestion {
+  return {
+    resultCode: 'O1', level: 'outcome', libraryId: 'LV-01', isCustom: false, customReason: '',
+    name: '% of trainees employed or self-employed six months after completing training',
+    nameAr: 'نسبة المتدربين العاملين أو العاملين لحسابهم الخاص بعد ستة أشهر من إتمام التدريب',
+    definition: 'Trainees who report paid work or self-employment at the six-month tracer survey.',
+    unit: 'percent', numerator: 'Trainees employed at six months', denominator: 'Trainees reached by the tracer survey', direction: 'increase',
+    disaggregation: ['sex', 'age', 'disability'], method: 'hh_survey', frequency: 'biannual',
+    meansOfVerification: 'Phone tracer survey of all graduates six months after completion',
+    baselineSuggestion: '', baselineBasis: 'none', targetSuggestion: '60%', targetBasis: 'document', standardReferenceCode: null,
+    rationale: 'Measures the employment outcome of the training.', qualityNotes: [], confidence: 'high',
+    ...overrides,
+  };
+}
+
+/** A custom indicator (no library entry fits), with the reason the spec requires. */
+const custom = (overrides: Partial<KpiRawSuggestion>) => kpiSuggestion({
+  libraryId: null, isCustom: true, customReason: 'No library candidate measures this result.', targetSuggestion: '', targetBasis: 'method_only', ...overrides,
+});
 
 interface MockReply {
   data?: unknown;
@@ -1412,13 +1398,34 @@ interface MockReply {
   model?: string;
 }
 
+/** The result codes a KPI call suggests for: the lines of its SUGGEST FOR section (buildKpiUserMessage). */
+function suggestForCodes(prompt: string): string[] {
+  const section = prompt.split('\n\n').find(s => s.startsWith('SUGGEST FOR\n')) ?? '';
+  return section.split('\n').slice(1).flatMap(line => {
+    const match = /^(.+?) \[(impact|outcome|output)\]:/.exec(line);
+    return match ? [match[1]] : [];
+  });
+}
+
 /**
- * Mocks generateStructured per feature. Like the real client, the answer is validated with the
- * call's schema, so every fixture must be a schema-valid structured answer.
+ * Mocks generateStructured per feature. Like the real client, the answer is validated with the call's schema, so every
+ * fixture must be a schema-valid structured answer. framework.indicators calls (the KPI pipeline's batches) get the
+ * listed suggestions whose resultCode is one of the call's SUGGEST FOR codes.
  */
-function mockAi(replies: { structure?: MockReply; indicators?: MockReply }) {
+function mockAi(replies: { structure?: MockReply; indicators?: Omit<MockReply, 'data'> & { suggestions?: KpiRawSuggestion[]; frameworkWarnings?: string[] } }) {
   generateStructured.mockImplementation(async (params: AnyParams): Promise<StructuredResult<unknown>> => {
-    const reply = params.feature === 'framework.structure' ? replies.structure : params.feature === 'framework.indicators' ? replies.indicators : undefined;
+    let reply: MockReply | undefined;
+    if (params.feature === 'framework.structure') reply = replies.structure;
+    else if (params.feature === 'framework.indicators' && replies.indicators) {
+      const codes = new Set(suggestForCodes(params.messages[0].content));
+      reply = {
+        ...replies.indicators,
+        data: {
+          suggestions: (replies.indicators.suggestions ?? []).filter(s => codes.has(s.resultCode)),
+          frameworkWarnings: replies.indicators.frameworkWarnings ?? [],
+        },
+      };
+    }
     if (!reply) throw new Error(`unexpected AI call: ${params.feature}`);
     if (reply.error) throw reply.error;
     const parsed = params.schema.safeParse(reply.data);
@@ -1434,17 +1441,56 @@ function mockAi(replies: { structure?: MockReply; indicators?: MockReply }) {
   });
 }
 
+const allCalls = () => generateStructured.mock.calls.map(c => c[0] as AnyParams);
 function callOf(feature: string): AnyParams {
-  const call = generateStructured.mock.calls.map(c => c[0] as AnyParams).find(p => p.feature === feature);
+  const call = allCalls().find(p => p.feature === feature);
   if (!call) throw new Error(`no ${feature} call`);
   return call;
 }
-
 const promptOf = (feature: string): string => callOf(feature).messages[0].content;
-const features = () => generateStructured.mock.calls.map(c => (c[0] as AnyParams).feature);
+/** Every indicator-step prompt (one per KPI batch), joined. */
+const indicatorPrompts = (): string => allCalls().filter(p => p.feature === 'framework.indicators').map(p => p.messages[0].content).join('\n\n');
+const features = () => allCalls().map(p => p.feature);
+/** Features without repeats, in call order. */
+const featureSteps = () => features().filter((f, i, all) => all.indexOf(f) === i);
+
+/**
+ * The generator's transaction client, with `hook` run before `tx.indicator.createMany` (the results chain is written by
+ * then). Every other property is the client's own; its functions keep the client as `this`.
+ */
+function withHookBeforeIndicatorWrite(tx: Prisma.TransactionClient, hook: () => Promise<void>): Prisma.TransactionClient {
+  return new Proxy(tx, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop);
+      if (prop === 'indicator') {
+        const delegate = value as Prisma.TransactionClient['indicator'];
+        return new Proxy(delegate, {
+          get(model, method) {
+            if (method !== 'createMany') return Reflect.get(model, method);
+            return async (args: Prisma.IndicatorCreateManyArgs) => {
+              await hook();
+              return model.createMany(args);
+            };
+          },
+        });
+      }
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
 
 async function loadGenerator() {
   return vi.importActual<typeof import('../src/services/ai/frameworkGenerator')>('../src/services/ai/frameworkGenerator');
+}
+
+/** A stored indicator as an indicator create body (draft keys, dates as YYYY-MM-DD), for parseIndicatorCreate. */
+function asCreateBody(row: Record<string, unknown>): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  for (const key of DRAFT_EDITABLE_KEYS) {
+    const value = row[key];
+    body[key] = value instanceof Date ? value.toISOString().slice(0, 10) : value;
+  }
+  return body;
 }
 
 describe('documentTextForAi', () => {
@@ -1457,10 +1503,11 @@ describe('documentTextForAi', () => {
 });
 
 describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => {
-  const libraryEntry = (id: string, sector: any, level: any, name: string, standardReference: any = null, extra: { notes?: string; disaggregation?: string[] } = {}) => ({
-    id, sector, level, name, nameAr: 'اسم', tags: [], definition: `Definition of ${id}`, unit: 'number', direction: 'increase' as const,
+  const libraryEntry = (id: string, sector: any, level: any, name: string, standardReference: any = null,
+    extra: { notes?: string; disaggregation?: string[]; unit?: string; isStandard?: boolean } = {}) => ({
+    id, sector, level, name, nameAr: 'اسم', tags: [], definition: `Definition of ${id}`, unit: extra.unit ?? 'number', direction: 'increase' as const,
     disaggregation: extra.disaggregation ?? ['sex'], methods: ['document_review' as const], frequency: 'quarterly' as const, meansOfVerification: 'Registers',
-    isStandard: !!standardReference, version: '1.0.0', standardReference: standardReference ?? undefined,
+    isStandard: extra.isStandard ?? !!standardReference, version: '1.0.0', standardReference: standardReference ?? undefined,
     standardFramework: standardReference?.framework ?? null, notes: extra.notes ?? null,
   });
 
@@ -1502,13 +1549,17 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
   beforeEach(async () => {
     generateStructured.mockReset();
     await resetDatabase();
+    vi.spyOn(console, 'info').mockImplementation(() => {});
     await prisma.indicatorLibraryEntry.createMany({
       data: [
-        libraryEntry('LV-01', 'livelihoods', 'outcome', '% of trainees employed six months after training'),
+        libraryEntry('LV-01', 'livelihoods', 'outcome', '% of trainees employed six months after training', null, { unit: 'percent' }),
         libraryEntry('LV-02', 'livelihoods', 'output', 'Number of people benefiting from vocational training', { framework: 'EU GERF', code: '2.14' }),
-        libraryEntry('AC-01', 'other', 'outcome', '% of assisted people who know how to give feedback', { framework: 'Core Humanitarian Standard (2024)', code: 'Commitment 5 (aligned)' }),
-        libraryEntry('HE-03', 'health', 'output', 'Number of consultations provided', null, { notes: 'Facilities aim for at least 1,500 consultations per quarter.' }),
-        libraryEntry('FS-01', 'food_security', 'outcome', '% of households with an acceptable FCS', { framework: 'WFP', code: 'Food Consumption Score' }, { disaggregation: ['sex_of_household_head', 'location'] }),
+        libraryEntry('AC-01', 'other', 'outcome', '% of assisted people who know how to give feedback', { framework: 'Core Humanitarian Standard (2024)', code: 'Commitment 5 (aligned)' }, { unit: 'percent', disaggregation: ['sex', 'age', 'disability'] }),
+        libraryEntry('AC-03', 'other', 'outcome', '% of assisted people who feel treated with respect', { framework: 'Core Humanitarian Standard (2024)', code: 'Commitment 4 (aligned)' }, { unit: 'percent', disaggregation: ['sex', 'age', 'disability'] }),
+        libraryEntry('HE-03', 'health', 'output', 'Number of consultations provided', null, { notes: 'Facilities aim for at least 1,500 consultations per quarter.', isStandard: true }),
+        libraryEntry('FS-01', 'food_security', 'outcome', '% of households with an acceptable FCS', { framework: 'WFP', code: 'Food Consumption Score' }, { disaggregation: ['sex_of_household_head', 'location'], unit: 'percent' }),
+        libraryEntry('WA-01', 'wash', 'outcome', 'Average volume of water available per person per day', { framework: 'Sphere', code: 'Water supply standard — minimum 15 l/p/d (aim for 20)' },
+          { unit: 'litres_per_person_per_day', disaggregation: ['location'] }),
       ],
     });
   });
@@ -1517,7 +1568,7 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     vi.restoreAllMocks();
   });
 
-  it('creates the results chain and reference-sheet indicators from documents', async () => {
+  it('creates the results chain and writes validated KPI-pipeline indicators (kpi-v2 batches, ECHO cap, citations)', async () => {
     const { org, admin, project, framework } = await setup({
       humanitarian: true, sector: 'livelihoods', sectors: ['livelihoods', 'youth'], donorType: 'echo', documentText: DOCS[0],
     });
@@ -1543,56 +1594,58 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
         }),
       },
       indicators: {
-        data: {
-          indicators: [
-            aiIndicator({
-              resultCode: 'G', level: 'impact', indicatorText: 'Employment rate of young people in target governorates', libraryId: 'IM-01',
-              baselineValue: '22%', baselineBasis: 'document', targetValue: '35%', targetBasis: 'document', targetJustification: '',
-              dataCollectionMethod: 'secondary_data', frequency: 'annual',
-            }),
-            aiIndicator({ disaggregation: ['age'], meansOfVerification: 'project reports' }),
-            aiIndicator({
-              resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people completing vocational training', libraryId: 'LV-02',
-              unit: 'number', calculation: EMPTY_CALCULATION, targetValue: '800', targetBasis: 'document', dataCollectionMethod: 'document_review', frequency: 'quarterly',
-            }),
-            aiIndicator({
-              resultCode: 'A1.1.1', level: 'output', indicatorText: 'Number of training sessions delivered', libraryId: '',
-              unit: 'number', calculation: EMPTY_CALCULATION, disaggregation: [], targetValue: '48', targetBasis: 'none', targetJustification: 'two sessions per week',
-            }),
-            aiIndicator({
-              resultCode: 'O1', indicatorText: '% of graduates reporting improved job-search skills', libraryId: '',
-              targetValue: '75', targetBasis: 'method_only', targetJustification: 'baseline + 10 percentage points',
-            }),
-            aiIndicator({
-              resultCode: 'O1', indicatorText: '% of assisted people who know how to give feedback or make a complaint', libraryId: 'ac-01',
-              standardReferenceCode: '', targetValue: '', targetBasis: 'none',
-            }),
-          ],
-        },
+        suggestions: [
+          custom({
+            resultCode: 'G', level: 'impact', name: 'Employment rate of young people in target governorates',
+            nameAr: 'معدل توظيف الشباب في المحافظات المستهدفة', numerator: 'Employed young people', denominator: 'Young people in the labour force',
+            baselineSuggestion: '22%', baselineBasis: 'document', targetSuggestion: '35%', targetBasis: 'document', method: 'secondary_data', frequency: 'annual',
+          }),
+          kpiSuggestion({ disaggregation: ['age'], meansOfVerification: 'project reports' }),
+          custom({ name: '% of graduates reporting improved job-search skills', nameAr: 'نسبة الخريجين الذين يفيدون بتحسن مهارات البحث عن عمل',
+            numerator: 'Graduates reporting improved skills', denominator: 'Graduates surveyed', targetSuggestion: 'baseline + 10 percentage points' }),
+          kpiSuggestion({ name: '% of assisted people who know how to give feedback or make a complaint', libraryId: 'ac-01', nameAr: 'نسبة المستفيدين الذين يعرفون كيفية تقديم الملاحظات أو الشكاوى',
+            numerator: 'Respondents naming a channel', denominator: 'Respondents surveyed', targetSuggestion: '', targetBasis: 'none', confidence: 'medium' }),
+          // A fourth outcome indicator: DG ECHO allows 3 per result, the least confident one is dropped.
+          custom({ name: '% of graduates with a written employment contract', nameAr: 'نسبة الخريجين الحاصلين على عقد عمل مكتوب',
+            numerator: 'Graduates with a contract', denominator: 'Graduates surveyed', confidence: 'low' }),
+          kpiSuggestion({
+            resultCode: 'O1.1', level: 'output', name: 'Number of young people completing vocational training', nameAr: 'عدد الشباب الذين أتموا التدريب المهني',
+            libraryId: 'LV-02', unit: 'number', numerator: '', denominator: '', targetSuggestion: '800', method: 'document_review', frequency: 'quarterly',
+          }),
+          // An activity code is no result of the run: the suggestion is dropped (rule x1).
+          custom({ resultCode: 'A1.1.1', level: 'output', name: 'Number of training sessions delivered', nameAr: 'عدد جلسات التدريب المنفذة', unit: 'number',
+            numerator: '', denominator: '', disaggregation: [] }),
+          custom({ resultCode: 'O1.2', level: 'output', name: 'Number of graduates placed in internships', nameAr: 'عدد الخريجين الملتحقين بالتدريب العملي',
+            unit: 'number', numerator: '', denominator: '', method: 'document_review', frequency: 'quarterly' }),
+        ],
       },
     });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
-    // Calls: main tier, structured outputs, the framework prompt version, ids for cost attribution.
+    // Calls: the structure call (unchanged) and one KPI batch of the four results (main tier, low effort, kpi-v2).
     expect(features()).toEqual(['framework.structure', 'framework.indicators']);
     expect(callOf('framework.structure')).toMatchObject({
       model: 'main', effort: 'medium', maxTokens: 12_000, timeoutMs: 180_000, promptVersion: 'framework-v4',
       schema: PROJECT_STRUCTURE_SCHEMA, system: FRAMEWORK_STRUCTURE_SYSTEM, context: { organizationId: org.id, projectId: project.id },
     });
     expect(callOf('framework.indicators')).toMatchObject({
-      model: 'main', effort: 'medium', maxTokens: 32_000, timeoutMs: 300_000, promptVersion: 'framework-v4',
-      schema: FRAMEWORK_INDICATORS_SCHEMA, system: FRAMEWORK_INDICATORS_SYSTEM, context: { organizationId: org.id, projectId: project.id },
+      model: 'main', effort: 'low', maxTokens: KPI_CALLS.batch.maxTokens, timeoutMs: KPI_CALLS.batch.timeoutMs, promptVersion: KPI_PROMPT_VERSION,
+      schema: KPI_SUGGESTIONS_SCHEMA, system: KPI_SYSTEM, context: { organizationId: org.id, projectId: project.id },
     });
     expect(callOf('framework.indicators').messages).toEqual([{ role: 'user', content: expect.any(String) }]);
 
-    // Prompts: sectors, humanitarian accountability candidates, verified figures only.
+    // Prompt: the four results with their candidates, the accountability entries, verified figures only, no activities.
     const indicatorPrompt = promptOf('framework.indicators');
+    expect(suggestForCodes(indicatorPrompt)).toEqual(['G', 'O1', 'O1.1', 'O1.2']);
     expect(indicatorPrompt).toContain('LV-01 [outcome]');
     expect(indicatorPrompt).toContain('AC-01 [outcome]');
     expect(indicatorPrompt).not.toContain('HE-03');
-    expect(indicatorPrompt).toContain('"value": "60%"');
+    expect(indicatorPrompt).toContain('max indicators per result (existing and new together): 3');
+    // Generation facts name their verified figure and result code (AI-3).
+    expect(indicatorPrompt).toMatch(/\[F\d+ target O1\] proposal\.pdf: target "60%" — "60% of graduates are expected to be employed"/);
+    expect(indicatorPrompt).toMatch(/\[F\d+ baseline G\] proposal\.pdf: baseline "22%" — "found a youth employment rate of 22% in the three governorates"/);
     expect(indicatorPrompt).not.toContain('31%');
     expect(indicatorPrompt).not.toContain('A1.1.1');
 
@@ -1606,32 +1659,43 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(byCode['O1.2']).toMatchObject({ level: 'output', parentId: byCode.O1.id, sortOrder: 1, textAr: null });
     expect(byCode['A1.1.2']).toMatchObject({ level: 'activity', parentId: byCode['O1.1'].id, text: 'Certify graduates', sortOrder: 1 });
 
-    // Indicators: provenance with the served model of the indicator call
+    // Indicators in chain order: provenance with the served model of the indicator call and the KPI prompt version.
     const indicators = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
-    expect(indicators).toHaveLength(6);
-    expect(indicators.every(i => i.provenance === 'ai_generated' && i.aiModel === SERVED_MODEL && i.promptVersion === 'framework-v4')).toBe(true);
-    expect(indicators.every(i => i.level !== 'activity' && i.resultId !== null)).toBe(true);
+    const codeOf = (resultId: string | null) => nodes.find(n => n.id === resultId)?.code;
+    expect(indicators.map(i => [codeOf(i.resultId), i.indicatorText])).toEqual([
+      ['G', 'Employment rate of young people in target governorates'],
+      ['O1', '% of trainees employed or self-employed six months after completing training'],
+      ['O1', '% of graduates reporting improved job-search skills'],
+      ['O1', '% of assisted people who know how to give feedback or make a complaint'],
+      ['O1.1', 'Number of young people completing vocational training'],
+      ['O1.2', 'Number of graduates placed in internships'],
+    ]);
+    expect(indicators.every(i => i.provenance === 'ai_generated' && i.aiModel === SERVED_MODEL && i.promptVersion === KPI_PROMPT_VERSION)).toBe(true);
+    // D19, D22: server defaults for what the model no longer writes; the project dates; every draft passes the indicator checks.
+    for (const i of indicators) {
+      expect(i, i.indicatorText).toMatchObject({
+        responsibility: TO_BE_CONFIRMED, assumptions: TO_BE_CONFIRMED, baselineDate: null, phases: ['baseline', 'midterm', 'endline'],
+        startDate: new Date('2026-01-01'), endDate: new Date('2027-12-31'), isApproved: false,
+      });
+      expect(i.baselineMethod!.endsWith(BASELINE_DATE_TO_BE_CONFIRMED), i.indicatorText).toBe(true);
+      expect(i.targetJustification!.endsWith(INTERMEDIATE_TARGETS_TO_BE_CONFIRMED.trim()), i.indicatorText).toBe(true);
+      expect(() => parseIndicatorCreate(asCreateBody(i as unknown as Record<string, unknown>)), i.indicatorText).not.toThrow();
+    }
 
-    const [impact, employed, trained, sessions, skills, feedback] = indicators;
-    expect(impact).toMatchObject({ resultId: byCode.G.id, level: 'impact', baselineValue: '22%', targetValue: null, libraryId: null, dataCollectionMethod: 'secondary_data' });
-    expect(impact.baselineMethod).toBe('Not applicable for a new cohort; first measured at the six-month tracer survey (source: proposal.pdf)');
-    expect(impact.targetJustification).toMatch(/^Proposed method: .* — confirm after baseline\. The target proposed by the AI was not found/);
-
-    expect(employed).toMatchObject({
-      resultId: byCode.O1.id, level: 'outcome', targetValue: '60%', libraryId: 'LV-01', meansOfVerification: TO_BE_CONFIRMED, direction: 'increase',
-      targetJustification: `Target stated in the proposal (source: proposal.pdf).${NO_INTERMEDIATE}`, standardReferenceCode: null,
-      baselineDate: new Date('2026-12-15T00:00:00.000Z'), intermediateTargets: null,
-    });
-    expect(employed.disaggregation).toEqual(['sex', 'age']);
-    expect(employed.calculation).toMatchObject({ numerator: 'Trainees employed at six months' });
-
-    expect(trained).toMatchObject({
-      resultId: byCode['O1.1'].id, level: 'output', targetValue: '800', libraryId: 'LV-02', standardReferenceCode: 'EU GERF 2.14', calculation: null,
-    });
-    expect(sessions).toMatchObject({ resultId: byCode['O1.1'].id, level: 'output', targetValue: null, libraryId: null });
-    expect(sessions.targetJustification).toBe(`Proposed method: ${DEFAULT_TARGET_METHOD} — confirm after baseline.${NO_INTERMEDIATE}`);
-    expect(skills).toMatchObject({ targetValue: null, targetJustification: `Proposed method: baseline + 10 percentage points — confirm after baseline.${NO_INTERMEDIATE}` });
+    const [impact, employed, skills, feedback, trained, internships] = indicators;
+    // The verified baseline is kept and cited; the invented target is removed.
+    expect(impact).toMatchObject({ level: 'impact', baselineValue: '22%', targetValue: null, libraryId: null, dataCollectionMethod: 'secondary_data' });
+    expect(impact.baselineMethod).toContain('(source: proposal.pdf)');
+    expect(impact.targetJustification).toMatch(/^Proposed method: .* — confirm after baseline\./);
+    expect(employed).toMatchObject({ level: 'outcome', targetValue: '60%', libraryId: 'LV-01', meansOfVerification: TO_BE_CONFIRMED, direction: 'increase' });
+    expect(employed.targetJustification).toContain('(source: proposal.pdf)');
+    expect(employed.disaggregation).toEqual(expect.arrayContaining(['sex', 'age']));
+    expect(employed.calculation).toMatchObject({ numerator: 'Trainees employed at six months', denominator: 'Trainees reached by the tracer survey' });
+    expect(skills).toMatchObject({ targetValue: null, libraryId: null });
+    expect(skills.targetJustification).toMatch(/^Proposed method: baseline \+ 10 percentage points — confirm after baseline\./);
     expect(feedback).toMatchObject({ libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)' });
+    expect(trained).toMatchObject({ level: 'output', targetValue: '800', libraryId: 'LV-02', standardReferenceCode: 'EU GERF 2.14' });
+    expect(internships).toMatchObject({ level: 'output', libraryId: null, targetValue: null });
 
     // Status updates (with the served model) and notification
     expect(await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).toMatchObject({ status: 'expert_review', aiModelUsed: SERVED_MODEL, generationError: null });
@@ -1639,6 +1703,8 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     const notes = await prisma.notification.findMany({ where: { userId: admin.id } });
     expect(notes).toHaveLength(1);
     expect(notes[0].message).toContain('6 indicators across 7 results');
+    // No suggestion cards: the wizard reviews the generated indicators themselves.
+    expect(await prisma.kpiSuggestion.count()).toBe(0);
 
     // A retried job does not duplicate the framework (and calls no model), nor marks the finished version as failed.
     generateStructured.mockClear();
@@ -1646,6 +1712,36 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(generateStructured).not.toHaveBeenCalled();
     expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(7);
     expect(await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).toMatchObject({ status: 'expert_review', generationError: null });
+  });
+
+  it('appends AC-01 for a humanitarian project whose answers hold no accountability indicator, and skips rejected library ids', async () => {
+    const { project, framework } = await setup({ humanitarian: true, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'other' });
+    // The organisation rejected LV-02 as not relevant on an earlier run: it is excluded organisation-wide (D9).
+    const run = await createKpiRunRow({ projectId: project.id, frameworkId: framework.id });
+    await createKpiSuggestionRow({
+      run, status: 'rejected', decision: { rejectReason: 'not_relevant' }, data: { resultId: null },
+      suggestion: kpiValidatedSuggestionFixture({ id: 'none', code: 'O1.1', level: 'output' }, undefined, { libraryId: 'LV-02' }),
+    });
+    mockAi({
+      indicators: {
+        suggestions: [
+          kpiSuggestion({ targetSuggestion: '', targetBasis: 'method_only' }),
+          kpiSuggestion({ resultCode: 'O1.1', level: 'output', name: 'Number of people benefiting from vocational training', nameAr: 'عدد المستفيدين من التدريب المهني',
+            libraryId: 'LV-02', unit: 'number', numerator: '', denominator: '', targetSuggestion: '', targetBasis: 'method_only', method: 'document_review' }),
+        ],
+      },
+    });
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+
+    expect(indicatorPrompts()).not.toContain('LV-02');
+    const indicators = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
+    expect(indicators.map(i => i.libraryId)).not.toContain('LV-02');
+    expect(indicators.map(i => i.libraryId)).toContain('AC-01');
+    const appended = indicators.find(i => i.libraryId === 'AC-01')!;
+    const outcome = await prisma.resultNode.findFirstOrThrow({ where: { frameworkId: framework.id, code: 'O1' } });
+    expect(appended).toMatchObject({ resultId: outcome.id, provenance: 'ai_generated', level: 'outcome' });
   });
 
   it('never uses the AI analysis appended to a document as prompt text or evidence', async () => {
@@ -1664,15 +1760,13 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
         }),
       },
       indicators: {
-        data: {
-          indicators: [
-            aiIndicator({ baselineValue: '41%', baselineBasis: 'document', targetValue: '95%', targetBasis: 'document', targetJustification: '' }),
-            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of training kits distributed', libraryId: '', unit: 'number',
-              calculation: EMPTY_CALCULATION, targetValue: '2,500', targetBasis: 'document', targetJustification: '' }),
-            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: '', unit: 'number',
-              calculation: EMPTY_CALCULATION, targetValue: '800', targetBasis: 'document', targetJustification: '' }),
-          ],
-        },
+        suggestions: [
+          kpiSuggestion({ baselineSuggestion: '41%', baselineBasis: 'document', targetSuggestion: '95%', targetBasis: 'document' }),
+          custom({ resultCode: 'O1.1', level: 'output', name: 'Number of training kits distributed', nameAr: 'عدد حقائب التدريب الموزعة', unit: 'number',
+            numerator: '', denominator: '', targetSuggestion: '2,500', targetBasis: 'document' }),
+          custom({ resultCode: 'O1.1', level: 'output', name: 'Number of young people trained', nameAr: 'عدد الشباب المدربين', unit: 'number',
+            numerator: '', denominator: '', targetSuggestion: '800', targetBasis: 'document' }),
+        ],
       },
     });
 
@@ -1686,16 +1780,17 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(structurePrompt).not.toContain('95%');
     expect(structurePrompt).not.toContain('2,500');
     // Figures found only in the AI analysis are dropped before the indicator prompt.
-    const indicatorPrompt = promptOf('framework.indicators');
-    expect(indicatorPrompt).toContain('"value": "60%"');
-    expect(indicatorPrompt).not.toContain('95%');
+    expect(indicatorPrompts()).toContain('60% of graduates are expected to be employed');
+    expect(indicatorPrompts()).not.toContain('95%');
+    expect(indicatorPrompts()).not.toContain(AI_ANALYSIS_MARKER);
 
     const [employed, kits, trained] = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
     expect(employed).toMatchObject({ baselineValue: null, targetValue: null });
     expect(employed.targetJustification).toMatch(/target proposed by the AI was not found/);
     expect(employed.targetJustification).toMatch(/baseline proposed by the AI was not found/);
     expect(kits).toMatchObject({ targetValue: null });
-    expect(trained).toMatchObject({ targetValue: '800', targetJustification: `Target taken from the project documents (source: proposal.pdf).${NO_INTERMEDIATE}` });
+    expect(trained).toMatchObject({ targetValue: '800' });
+    expect(trained.targetJustification).toContain('(source: proposal.pdf)');
   });
 
   it('redacts legacy unredacted document text before the prompt and before checking figures, and logs counts only', async () => {
@@ -1708,12 +1803,10 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     mockAi({
       structure: { data: structureAnswer({ documentFigures: [{ resultCode: 'O1', kind: 'target', value: '401234567', description: '', quote: '' }] }) },
       indicators: {
-        data: {
-          indicators: [
-            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: '', unit: 'number',
-              calculation: EMPTY_CALCULATION, targetValue: '401234567', targetBasis: 'document', targetJustification: '' }),
-          ],
-        },
+        suggestions: [
+          custom({ resultCode: 'O1.1', level: 'output', name: 'Number of young people trained', nameAr: 'عدد الشباب المدربين', unit: 'number',
+            numerator: '', denominator: '', targetSuggestion: '401234567', targetBasis: 'document' }),
+        ],
       },
     });
 
@@ -1727,7 +1820,7 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(structurePrompt).toContain('[ID number removed]');
     for (const secret of ['0599 123 456', 'coordinator@example.org', '401234567']) {
       expect(structurePrompt).not.toContain(secret);
-      expect(promptOf('framework.indicators')).not.toContain(secret);
+      expect(indicatorPrompts()).not.toContain(secret);
       expect(logs.join('\n')).not.toContain(secret);
     }
     expect(logs.join('\n')).toContain('Removed 3 phone, ID or email matches');
@@ -1742,7 +1835,7 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     await prisma.project.update({ where: { id: project.id }, data: { status: 'archived' } });
     mockAi({
       structure: { data: structureAnswer() },
-      indicators: { data: { indicators: [aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: '', unit: 'number', calculation: EMPTY_CALCULATION })] } },
+      indicators: { suggestions: [custom({ resultCode: 'O1.1', level: 'output', name: 'Number of young people trained', nameAr: 'عدد الشباب المدربين', unit: 'number', numerator: '', denominator: '' })] },
     });
 
     const { generateFramework } = await loadGenerator();
@@ -1750,6 +1843,68 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
 
     expect(await prisma.indicator.count({ where: { frameworkId: framework.id } })).toBe(1);
     expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('archived');
+  });
+
+  /** Delete forever as DELETE /api/projects/:id runs it: the project row locked, then every row of the project, in one transaction. */
+  const deleteForever = (projectId: string): Promise<RemovedRows> => prisma.$transaction(async tx => {
+    const locked = await lockProject(tx, projectId);
+    if (!locked) throw new Error('project not found');
+    return (await deleteProjectRows(tx, locked)).removed;
+  }, DELETE_TRANSACTION_OPTIONS);
+
+  /** One output indicator for the metadata results chain of a livelihoods project (as in the archived-project test). */
+  const trainedAnswer = () => mockAi({
+    structure: { data: structureAnswer() },
+    indicators: { suggestions: [custom({ resultCode: 'O1.1', level: 'output', name: 'Number of young people trained', nameAr: 'عدد الشباب المدربين', unit: 'number', numerator: '', denominator: '' })] },
+  });
+
+  it('a delete forever that overlaps the final write waits for it instead of deadlocking, then removes the new framework with the project', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
+    trainedAnswer();
+    // The generator's write transaction (its only one) with a hook before the indicators are written, so the results
+    // chain is already written: the admin's delete starts, and the write goes on once the delete waits for a lock. Taken
+    // in opposite orders (framework rows, then the project row), the two would deadlock and PostgreSQL would abort one.
+    let deletion: Promise<RemovedRows> | undefined;
+    const hook = async () => {
+      deletion = deleteForever(project.id);
+      deletion.catch(() => undefined);
+      await waitForLockWaiter();
+    };
+    const transaction = prisma.$transaction.bind(prisma) as (write: (tx: Prisma.TransactionClient) => Promise<unknown>, options?: object) => Promise<unknown>;
+    vi.spyOn(prisma, '$transaction').mockImplementationOnce(((write: (tx: Prisma.TransactionClient) => Promise<unknown>, options?: object) =>
+      transaction(tx => write(withHookBeforeIndicatorWrite(tx, hook)), options)) as never);
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+
+    expect(deletion).toBeDefined();
+    await expect(deletion).resolves.toMatchObject({ frameworks: 1, indicators: 1 });
+    expect(await prisma.project.count({ where: { id: project.id } })).toBe(0);
+    expect(await prisma.framework.count({ where: { id: framework.id } })).toBe(0);
+    expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(0);
+    expect(await prisma.indicator.count({ where: { frameworkId: framework.id } })).toBe(0);
+  });
+
+  it('stops without writing anything when the project was deleted forever before the final write', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
+    trainedAnswer();
+    // The admin deletes the project while the model writes the indicators.
+    const answer = generateStructured.getMockImplementation()!;
+    let deletion: Promise<RemovedRows> | undefined;
+    generateStructured.mockImplementation(async (params: AnyParams) => {
+      // Batches run side by side: the first one deletes, the others wait for that delete.
+      if (params.feature === 'framework.indicators') await (deletion ??= deleteForever(project.id));
+      return answer(params);
+    });
+
+    const { generateFramework } = await loadGenerator();
+    await expect(generateFramework(framework.id, project.id)).rejects.toMatchObject({
+      name: 'FrameworkGenerationError', message: 'The project of this framework no longer exists.',
+    });
+    await expect(deletion).resolves.toMatchObject({ frameworks: 1, resultNodes: 0, indicators: 0 });
+    expect(await prisma.project.count({ where: { id: project.id } })).toBe(0);
+    expect(await prisma.framework.count({ where: { id: framework.id } })).toBe(0);
+    expect(await prisma.resultNode.count({ where: { frameworkId: framework.id } })).toBe(0);
   });
 
   it('redacts phone numbers, emails and ID numbers in the project description before both prompts', async () => {
@@ -1760,15 +1915,16 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     });
     mockAi({
       structure: { data: structureAnswer() },
-      indicators: { data: { indicators: [aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of young people trained', libraryId: '', unit: 'number', calculation: EMPTY_CALCULATION })] } },
+      indicators: { suggestions: [custom({ resultCode: 'O1.1', level: 'output', name: 'Number of young people trained', nameAr: 'عدد الشباب المدربين', unit: 'number', numerator: '', denominator: '' })] },
     });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
-    const prompts = [promptOf('framework.structure'), promptOf('framework.indicators')];
+    const prompts = [promptOf('framework.structure'), indicatorPrompts()];
     expect(prompts[0]).toContain('Vocational training for young people in Nablus.');
     expect(prompts[0]).toContain('[phone removed]');
+    expect(prompts[1]).toContain('Vocational training for young people in Nablus.');
     for (const prompt of prompts) {
       for (const secret of ['0598 765 432', 'focal@example.org', '412345678']) expect(prompt).not.toContain(secret);
     }
@@ -1778,59 +1934,65 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     const { project, framework } = await setup({ humanitarian: false, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'eu' });
     mockAi({
       indicators: {
-        data: {
-          indicators: [
-            // HE-03 (health) is not a candidate for a livelihoods project; its notes hold the threshold.
-            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of consultations provided', libraryId: 'he-03', unit: 'number',
-              calculation: EMPTY_CALCULATION, disaggregation: [], targetValue: '1,500', targetBasis: 'standard_threshold', standardReferenceCode: 'WHO 1500',
-              targetJustification: 'Library threshold' }),
-            // A free-text standard reference does not make an invented threshold acceptable; the library's reference replaces it.
-            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of people benefiting from vocational training', libraryId: 'LV-02',
-              unit: 'number', calculation: EMPTY_CALCULATION, targetValue: '900', targetBasis: 'standard_threshold', standardReferenceCode: 'EU GERF 9.99',
-              targetJustification: '' }),
-            aiIndicator({ resultCode: 'O1', indicatorText: 'Food Consumption Score', libraryId: 'FS-01', disaggregation: ['location'], targetValue: '', targetBasis: 'none' }),
-          ],
-        },
+        suggestions: [
+          // HE-03 (health) is not a candidate for a livelihoods project; a number in its notes is no recognised threshold (SPEC-1).
+          kpiSuggestion({ resultCode: 'O1.1', level: 'output', name: 'Number of consultations provided', nameAr: 'عدد الاستشارات المقدمة', libraryId: 'he-03', unit: 'number',
+            numerator: '', denominator: '', disaggregation: [], targetSuggestion: '1,500', targetBasis: 'standard_threshold', method: 'document_review' }),
+          // WA-01 (wash) is not a candidate either; its Sphere minimum is a recognised threshold, checked against the linked entry.
+          kpiSuggestion({ name: 'Average litres of water per person per day', nameAr: 'متوسط لترات المياه للفرد يومياً', libraryId: 'WA-01', unit: 'litres_per_person_per_day',
+            numerator: '', denominator: '', disaggregation: ['location'], targetSuggestion: '15', targetBasis: 'standard_threshold', method: 'hh_survey' }),
+          // A free-text standard reference does not make an invented threshold acceptable; the library's reference replaces it.
+          kpiSuggestion({ resultCode: 'O1.1', level: 'output', name: 'Number of people benefiting from vocational training', nameAr: 'عدد المستفيدين من التدريب المهني',
+            libraryId: 'LV-02', unit: 'number', numerator: '', denominator: '', targetSuggestion: '900', targetBasis: 'standard_threshold',
+            standardReferenceCode: 'EU GERF 9.99', method: 'document_review' }),
+          kpiSuggestion({ name: 'Food Consumption Score', nameAr: 'مؤشر استهلاك الغذاء', libraryId: 'FS-01', unit: 'percent', disaggregation: ['location'],
+            targetSuggestion: '', targetBasis: 'none' }),
+        ],
       },
     });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
-    const prompt = promptOf('framework.indicators');
-    expect(prompt).not.toContain('HE-03');
-    expect(prompt).not.toContain('FS-01');
+    expect(indicatorPrompts()).not.toContain('HE-03');
+    expect(indicatorPrompts()).not.toContain('FS-01');
 
-    const [consultations, vocational, fcs] = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
-    expect(consultations).toMatchObject({ libraryId: 'HE-03', targetValue: '1,500', standardReferenceCode: 'WHO 1500', disaggregation: ['sex'] });
-    expect(consultations.targetJustification).toBe(`Proposed standard threshold (WHO 1500): Library threshold — confirm it applies to this project.${NO_INTERMEDIATE}`);
-    expect(vocational).toMatchObject({ libraryId: 'LV-02', targetValue: null, standardReferenceCode: 'EU GERF 2.14' });
-    expect(vocational.targetJustification).toMatch(/^Proposed method: .* The standard threshold proposed by the AI was not found in the linked library entry/);
-    expect(fcs).toMatchObject({ libraryId: 'FS-01', standardReferenceCode: 'WFP Food Consumption Score', disaggregation: ['sex_of_household_head', 'location'] });
+    const indicators = await prisma.indicator.findMany({ where: { frameworkId: framework.id }, orderBy: { sortOrder: 'asc' } });
+    const byLibrary = Object.fromEntries(indicators.map(i => [i.libraryId, i]));
+    expect(byLibrary['HE-03']).toMatchObject({ targetValue: null, disaggregation: ['sex'] });
+    expect(byLibrary['HE-03'].targetJustification).toMatch(/^Proposed method: .* The standard threshold proposed by the AI was not found in the linked library entry/);
+    expect(byLibrary['WA-01']).toMatchObject({ targetValue: '15', standardReferenceCode: 'Sphere Water supply standard — minimum 15 l/p/d (aim for 20)' });
+    expect(byLibrary['WA-01'].targetJustification).toMatch(/^Proposed standard threshold \(Sphere Water supply standard/);
+    expect(byLibrary['LV-02']).toMatchObject({ targetValue: null, standardReferenceCode: 'EU GERF 2.14' });
+    expect(byLibrary['LV-02'].targetJustification).toMatch(/^Proposed method: .* The standard threshold proposed by the AI was not found in the linked library entry/);
+    expect(byLibrary['FS-01']).toMatchObject({ standardReferenceCode: 'WFP Food Consumption Score', disaggregation: ['sex_of_household_head', 'location'] });
   });
 
-  it('builds a coded results chain from metadata when there are no documents and keeps no document values', async () => {
+  it('builds a coded results chain from metadata when there are no documents, batches it and keeps no document values', async () => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'health', sectors: [], donorType: 'eu' });
     mockAi({
       indicators: {
-        data: {
-          indicators: [
-            aiIndicator({ resultCode: 'G', level: 'impact', indicatorText: 'Under-five mortality rate', libraryId: '', baselineValue: '22%', baselineBasis: 'document',
-              targetValue: '60%', targetBasis: 'document' }),
-            aiIndicator({ resultCode: 'O1.1', level: 'output', indicatorText: 'Number of consultations provided', libraryId: 'HE-03', unit: 'number',
-              calculation: EMPTY_CALCULATION }),
-          ],
-        },
+        suggestions: [
+          custom({ resultCode: 'G', level: 'impact', name: 'Under-five mortality rate', nameAr: 'معدل وفيات الأطفال دون سن الخامسة', unit: 'ratio',
+            numerator: '', denominator: '', baselineSuggestion: '22%', baselineBasis: 'document', targetSuggestion: '60%', targetBasis: 'document', method: 'secondary_data' }),
+          kpiSuggestion({ resultCode: 'O1.1', level: 'output', name: 'Number of consultations provided', nameAr: 'عدد الاستشارات المقدمة', libraryId: 'HE-03', unit: 'number',
+            numerator: '', denominator: '', targetSuggestion: '', targetBasis: 'method_only', method: 'document_review' }),
+        ],
       },
     });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
-    expect(features()).toEqual(['framework.indicators']);
-    const prompt = promptOf('framework.indicators');
-    expect(prompt).toContain('No project documents were provided');
-    expect(prompt).toContain('HE-03 [output]');
-    expect(prompt).not.toContain('Humanitarian project: include');
+    // Six results: a batch of four (the goal, then O1 with its outputs) and a batch of two (O2 with its output); then one
+    // call each for the results the answers left without an indicator (AI-2).
+    expect(featureSteps()).toEqual(['framework.indicators']);
+    const batches = allCalls().map(p => suggestForCodes(p.messages[0].content));
+    expect(batches.slice(0, 2)).toEqual([['G', 'O1', 'O1.1', 'O1.2'], ['O2', 'O2.1']]);
+    expect(batches.slice(2).map(b => b.join()).sort()).toEqual(['O1', 'O1.2', 'O2', 'O2.1']);
+    expect(allCalls().slice(0, 2).every(p => p.effort === 'low' && p.maxTokens === KPI_CALLS.batch.maxTokens && p.promptVersion === KPI_PROMPT_VERSION)).toBe(true);
+    expect(allCalls().slice(2).every(p => p.maxTokens === KPI_CALLS.result.maxTokens)).toBe(true);
+    expect(indicatorPrompts()).toContain('none: no document values are available');
+    expect(indicatorPrompts()).toContain('HE-03 [output]');
 
     const nodes = await prisma.resultNode.findMany({ where: { frameworkId: framework.id } });
     expect(nodes.filter(n => n.level !== 'activity').map(n => n.code).sort()).toEqual(['G', 'O1', 'O1.1', 'O1.2', 'O2', 'O2.1']);
@@ -1841,6 +2003,13 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(indicators).toHaveLength(2);
     expect(indicators[0]).toMatchObject({ baselineValue: null, targetValue: null, resultId: nodes.find(n => n.code === 'G')!.id });
     expect(indicators[1]).toMatchObject({ libraryId: 'HE-03', resultId: nodes.find(n => n.code === 'O1.1')!.id });
+    // The admins' notification names the results left without an indicator (AI-2).
+    const notes = await prisma.notification.findMany({ where: { type: 'framework_approved', link: `/projects/${project.id}/framework` } });
+    expect(notes.length).toBeGreaterThan(0);
+    for (const note of notes) {
+      const named = /No indicator could be generated for ([^;]+);/.exec(note.message)?.[1].split(', ').sort();
+      expect(named).toEqual(['O1', 'O1.2', 'O2', 'O2.1']);
+    }
   });
 
   it.each([
@@ -1852,18 +2021,19 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     vi.spyOn(console, 'log').mockImplementation(() => {});
     mockAi({
       structure: { error: error() },
-      indicators: { data: { indicators: [aiIndicator({ resultCode: 'O1', indicatorText: '% of pupils reaching minimum reading proficiency', libraryId: '' })] } },
+      indicators: { suggestions: [custom({ name: '% of pupils reaching minimum reading proficiency', nameAr: 'نسبة التلاميذ الذين يبلغون الحد الأدنى من الكفاءة في القراءة',
+        numerator: 'Pupils at minimum proficiency', denominator: 'Pupils assessed', targetSuggestion: '60%', targetBasis: 'document' })] },
     });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
-    expect(features()).toEqual(['framework.structure', 'framework.indicators']);
+    expect(featureSteps()).toEqual(['framework.structure', 'framework.indicators']);
     expect(warn.mock.calls.flat().join(' ')).toMatch(/Unusable AI structure answer \((AiInvalidOutputError|AiOutputTruncatedError)\), using metadata fallback/);
     // Without the structure step there are no verified document figures, so no document value can be used,
     // even one that is written in the document (the indicator step never sees the document text).
-    expect(promptOf('framework.indicators')).not.toContain('No project documents were provided');
-    expect(promptOf('framework.indicators')).toContain('documentFigures is empty');
+    expect(indicatorPrompts()).toContain('none: no document values are available');
+    expect(indicatorPrompts()).not.toContain('60% of graduates');
     const nodes = await prisma.resultNode.findMany({ where: { frameworkId: framework.id } });
     expect(nodes.filter(n => n.level !== 'activity').map(n => n.code).sort()).toEqual(['G', 'O1', 'O1.1', 'O1.2', 'O2', 'O2.1']);
     const [indicator] = await prisma.indicator.findMany({ where: { frameworkId: framework.id } });
@@ -1877,7 +2047,8 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     mockAi({
       structure: { data: structureAnswer({ goal: { code: 'G', text: '', textAr: '' }, outcomes: [] }) },
-      indicators: { data: { indicators: [aiIndicator({ libraryId: '' })] } },
+      indicators: { suggestions: [custom({ name: '% of pupils reaching minimum reading proficiency', nameAr: 'نسبة التلاميذ الذين يبلغون الحد الأدنى من الكفاءة في القراءة',
+        numerator: 'Pupils at minimum proficiency', denominator: 'Pupils assessed' })] },
     });
 
     const { generateFramework } = await loadGenerator();
@@ -1891,7 +2062,7 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     ['a failed request', () => new AiRequestError('framework.structure', 529, true, 4)],
   ])('stops without writing anything when the structure call ends in %s', async (_label, error) => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef', documentText: DOCS[0] });
-    mockAi({ structure: { error: error() }, indicators: { data: { indicators: [aiIndicator()] } } });
+    mockAi({ structure: { error: error() }, indicators: { suggestions: [kpiSuggestion()] } });
 
     const { generateFramework } = await loadGenerator();
     await expect(generateFramework(framework.id, project.id)).rejects.toBeInstanceOf(error().constructor);
@@ -1900,28 +2071,75 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
   });
 
   it.each([
-    ['a refusal', () => new AiRefusalError('framework.indicators', 'cyber')],
-    ['a cut-off answer', () => new AiOutputTruncatedError('framework.indicators', 64_000)],
-    ['invalid output', () => new AiInvalidOutputError('framework.indicators', ['indicators[3].unit: not one of the allowed values'])],
-    ['a failed request', () => new AiRequestError('framework.indicators', 500, true, 4)],
-  ])('leaves no partial framework when the indicator call ends in %s', async (_label, error) => {
+    ['a refusal', () => new AiRefusalError('framework.indicators', 'cyber'), 4],
+    ['a cut-off answer', () => new AiOutputTruncatedError('framework.indicators', 64_000), 4],
+    ['invalid output', () => new AiInvalidOutputError('framework.indicators', ['suggestions[3].unit: not one of the allowed values']), 4],
+    ['a failed request', () => new AiRequestError('framework.indicators', 500, true, 4), 1],
+  ])('leaves no partial framework when every indicator call ends in %s', async (_label, error, indicatorCalls) => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef', documentText: DOCS[0] });
-    mockAi({ structure: { data: structureAnswer() }, indicators: { error: error() } });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const thrown = error();
+    mockAi({ structure: { data: structureAnswer() }, indicators: { error: thrown } });
 
     const { generateFramework } = await loadGenerator();
-    await expect(generateFramework(framework.id, project.id)).rejects.toBeInstanceOf(error().constructor);
-    expect(features()).toEqual(['framework.structure', 'framework.indicators']);
+    // The pipeline rethrows the client's original error unchanged when every result failed (design M6).
+    await expect(generateFramework(framework.id, project.id)).rejects.toBe(thrown);
+    // One batch of three results; a refused, cut-off or invalid batch is retried result by result, a failed request is not.
+    expect(features()).toEqual(['framework.structure', ...Array<string>(indicatorCalls).fill('framework.indicators')]);
     // The stored message is the AiError's own (feature and problem, never prompt or answer text).
-    await expectNothingWritten(framework.id, project.id, error().message);
+    await expectNothingWritten(framework.id, project.id, thrown.message);
     expect(await prisma.notification.count()).toBe(0);
   });
 
+  it('stops at once on a wrong key (HTTP 401) without retrying the other results', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'health', sectors: [], donorType: 'eu' });
+    const thrown = new AiRequestError('framework.indicators', 401, false, 1);
+    mockAi({ indicators: { error: thrown } });
+
+    const { generateFramework } = await loadGenerator();
+    await expect(generateFramework(framework.id, project.id)).rejects.toBe(thrown);
+    expect(features().length).toBeLessThanOrEqual(2);
+    await expectNothingWritten(framework.id, project.id, 'The AI request failed (framework.indicators, HTTP 401).');
+  });
+
+  it('keeps the results that answered when one batch fails', async () => {
+    const { project, framework } = await setup({ humanitarian: false, sector: 'health', sectors: [], donorType: 'eu' });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const suggestions = [
+      kpiSuggestion({ resultCode: 'O1.1', level: 'output', name: 'Number of consultations provided', nameAr: 'عدد الاستشارات المقدمة', libraryId: 'HE-03', unit: 'number',
+        numerator: '', denominator: '', targetSuggestion: '', targetBasis: 'method_only', method: 'document_review' }),
+    ];
+    mockAi({ indicators: { suggestions } });
+    const answer = generateStructured.getMockImplementation()!;
+    // The batch of O2 and O2.1 fails after the client's own retries; the other batch answers.
+    generateStructured.mockImplementation(async (params: AnyParams) => {
+      if (suggestForCodes(params.messages[0].content).includes('O2')) throw new AiRequestError('framework.indicators', 529, true, 4);
+      return answer(params);
+    });
+
+    const { generateFramework } = await loadGenerator();
+    await generateFramework(framework.id, project.id);
+    const indicators = await prisma.indicator.findMany({ where: { frameworkId: framework.id } });
+    expect(indicators.map(i => i.libraryId)).toEqual(['HE-03']);
+    expect(await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).toMatchObject({ status: 'expert_review', generationError: null });
+  });
+
   it.each([
-    ['no indicators', { indicators: [] }],
-    ['only indicators without text', { indicators: [aiIndicator({ indicatorText: '' }), aiIndicator({ indicatorText: '   ' })] }],
-  ])('rejects an answer with %s without writing anything', async (_label, data) => {
+    ['no indicators', [] as KpiRawSuggestion[]],
+    ['only indicators without text', [custom({ name: '' }), custom({ name: '   ' })]],
+  ])('rejects an answer with %s without writing anything', async (_label, suggestions) => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'education', sectors: ['education'], donorType: 'unicef' });
-    mockAi({ indicators: { data } });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mockAi({ indicators: { suggestions } });
+
+    const { generateFramework } = await loadGenerator();
+    await expect(generateFramework(framework.id, project.id)).rejects.toThrow(/empty or invalid indicator set/);
+    await expectNothingWritten(framework.id, project.id, 'AI returned empty or invalid indicator set');
+  });
+
+  it('rejects a humanitarian answer whose only indicator would be the appended accountability one', async () => {
+    const { project, framework } = await setup({ humanitarian: true, sector: 'livelihoods', sectors: ['livelihoods'], donorType: 'other' });
+    mockAi({ indicators: { suggestions: [] } });
 
     const { generateFramework } = await loadGenerator();
     await expect(generateFramework(framework.id, project.id)).rejects.toThrow(/empty or invalid indicator set/);
@@ -1944,7 +2162,8 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     const failed = await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } });
     expect(failed.generationError).toBe('Framework generation failed because of an internal error (LeakyError).');
 
-    mockAi({ indicators: { data: { indicators: [aiIndicator({ resultCode: 'O1', libraryId: '' })] } } });
+    mockAi({ indicators: { suggestions: [custom({ name: '% of pupils reaching minimum reading proficiency', nameAr: 'نسبة التلاميذ الذين يبلغون الحد الأدنى من الكفاءة في القراءة',
+      numerator: 'Pupils at minimum proficiency', denominator: 'Pupils assessed' })] } });
     await generateFramework(framework.id, project.id);
     expect(await prisma.framework.findUniqueOrThrow({ where: { id: framework.id } })).toMatchObject({ status: 'expert_review', generationError: null });
   });
@@ -1960,14 +2179,14 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     });
     mockAi({
       structure: { data: structureAnswer({ documentFigures: [{ resultCode: 'O1', kind: 'baseline', value: '75%', description: '', quote: 'said 75% of the women in her street cannot find work' }] }) },
-      indicators: { data: { indicators: [aiIndicator({ baselineValue: '75%', baselineBasis: 'document' })] } },
+      indicators: { suggestions: [kpiSuggestion({ baselineSuggestion: '75%', baselineBasis: 'document' })] },
     });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
     expect(promptOf('framework.structure')).toContain('<document index="1">');
     expect(promptOf('framework.structure')).not.toContain('<document index="2">');
-    for (const prompt of [promptOf('framework.structure'), promptOf('framework.indicators')]) {
+    for (const prompt of [promptOf('framework.structure'), indicatorPrompts()]) {
       expect(prompt).not.toContain('Um Ahmad');
       expect(prompt).not.toContain('75%');
     }
@@ -1975,7 +2194,7 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
     expect(indicator.baselineValue).toBeNull();
   });
 
-  it('redacts every free-text project field in both prompts and in the metadata results chain', async () => {
+  it('redacts every free-text project field in the indicator prompts and in the metadata results chain', async () => {
     const { project, framework } = await setup({ humanitarian: false, sector: 'health', sectors: ['health'], donorType: 'eu' });
     await prisma.project.update({
       where: { id: project.id },
@@ -1984,15 +2203,16 @@ describe.skipIf(!hasTestDatabase)('generateFramework (AI client mocked)', () => 
         geographicScope: 'Hebron, contact 0598 765 432 or ID 412345678', description: 'Primary care in Hebron; questions to 0597 000 111.',
       },
     });
-    mockAi({ indicators: { data: { indicators: [aiIndicator({ resultCode: 'O1', libraryId: '' })] } } });
+    mockAi({ indicators: { suggestions: [custom({ name: '% of patients satisfied with primary care services', nameAr: 'نسبة المرضى الراضين عن خدمات الرعاية الأولية',
+      numerator: 'Satisfied patients', denominator: 'Patients surveyed' })] } });
 
     const { generateFramework } = await loadGenerator();
     await generateFramework(framework.id, project.id);
 
     // No documents: the results chain is built from the (redacted) description and scope.
-    const prompt = promptOf('framework.indicators');
+    const prompt = indicatorPrompts();
     for (const secret of ['0599 111 222', 'donor@example.org', '0598 765 432', '412345678', '0597 000 111']) expect(prompt).not.toContain(secret);
-    expect(prompt).toContain('- Geographic scope: Hebron, contact [phone removed] or ID [ID number removed]');
+    expect(prompt).toContain('Hebron, contact [phone removed] or ID [ID number removed]');
     expect(prompt).toContain('Primary care in Hebron; questions to [phone removed].');
     const outcome = await prisma.resultNode.findFirstOrThrow({ where: { frameworkId: framework.id, code: 'O1' } });
     expect(outcome.text).toBe('Primary care in Hebron; questions to [phone removed].');

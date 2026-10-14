@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_EMAIL_FROM, parseEnv } from '../src/config/env';
+import { AI_ORG_DAILY_BUDGET_DEFAULT_USD, DEFAULT_EMAIL_FROM, parseEnv } from '../src/config/env';
+import { prismaLogLevels } from '../src/config/prisma';
 import { aiCallPruneSettings } from '../src/services/maintenance/aiCallRetention';
 
 const valid = {
@@ -192,6 +193,46 @@ describe('AiCall retention setting', () => {
   it('the prune script needs DATABASE_URL but none of the API secrets', () => {
     expect(aiCallPruneSettings({ DATABASE_URL: valid.DATABASE_URL })).toEqual({ months: 24 });
     expect(() => aiCallPruneSettings({ DATABASE_URL: ' ' })).toThrow(/DATABASE_URL is required/);
+  });
+});
+
+describe('KPI Assistant cost limit (AI_ORG_DAILY_BUDGET_USD, design D20)', () => {
+  it('defaults to US$20 per organisation per day (owner decision, 13 October 2026), also for a blank value', () => {
+    expect(AI_ORG_DAILY_BUDGET_DEFAULT_USD).toBe(20);
+    expect(parseEnv(valid).aiOrgDailyBudgetUsd).toBe(20);
+    expect(parseEnv({ ...valid, AI_ORG_DAILY_BUDGET_USD: '' }).aiOrgDailyBudgetUsd).toBe(20);
+    expect(parseEnv({ ...valid, AI_ORG_DAILY_BUDGET_USD: '  ' }).aiOrgDailyBudgetUsd).toBe(20);
+  });
+
+  it.each([['0', 0], ['12.5', 12.5], [' 100 ', 100]])('reads AI_ORG_DAILY_BUDGET_USD=%j (0 turns the check off)', (value, budget) => {
+    expect(parseEnv({ ...valid, AI_ORG_DAILY_BUDGET_USD: value }).aiOrgDailyBudgetUsd).toBe(budget);
+  });
+
+  it.each([
+    ['-1', /AI_ORG_DAILY_BUDGET_USD: must be 0 \(no budget\) or more/],
+    ['ten', /AI_ORG_DAILY_BUDGET_USD: must be a number/],
+    ['Infinity', /AI_ORG_DAILY_BUDGET_USD: must be a number/],
+  ])('refuses AI_ORG_DAILY_BUDGET_USD=%s', (value, message) => {
+    expect(() => parseEnv({ ...valid, AI_ORG_DAILY_BUDGET_USD: value })).toThrow(message);
+  });
+});
+
+describe('Prisma query logging (PRISMA_LOG_QUERIES)', () => {
+  it('is off by default (also in development and for a blank value) and on only with 1', () => {
+    expect(parseEnv(valid).prismaLogQueries).toBe(false);
+    expect(parseEnv({ ...valid, NODE_ENV: 'development', PRISMA_LOG_QUERIES: '' }).prismaLogQueries).toBe(false);
+    expect(parseEnv({ ...valid, PRISMA_LOG_QUERIES: '0' }).prismaLogQueries).toBe(false);
+    expect(parseEnv({ ...valid, PRISMA_LOG_QUERIES: ' 1 ' }).prismaLogQueries).toBe(true);
+  });
+
+  it.each(['true', 'yes', '2'])('refuses PRISMA_LOG_QUERIES=%s', value => {
+    expect(() => parseEnv({ ...valid, PRISMA_LOG_QUERIES: value })).toThrow(/PRISMA_LOG_QUERIES: must be 1 \(on\) or 0 \(off\)/);
+  });
+
+  it('logs warnings always and queries only when asked; never the error level (it would print query values)', () => {
+    expect(prismaLogLevels(false)).toEqual(['warn']);
+    expect(prismaLogLevels(true)).toEqual(['query', 'warn']);
+    expect(prismaLogLevels(true)).not.toContain('error');
   });
 });
 

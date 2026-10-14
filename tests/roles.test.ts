@@ -13,11 +13,12 @@ import app from '../src/app';
 import { auditMiddleware } from '../src/middleware/audit';
 import { authenticate, authorize, RoleGuard } from '../src/middleware/auth';
 import { errorHandler } from '../src/middleware/errorHandler';
-import { aiLimiter, apiLimiter, webhookLimiter } from '../src/middleware/rateLimit';
+import { aiLimiter, apiLimiter, kpiOrgLimiter, kpiPollLimiter, webhookLimiter } from '../src/middleware/rateLimit';
 import { ADMIN_ROLES, hasStaffRole, PLATFORM_ROLES, STAFF_ROLES } from '../src/middleware/roles';
 import { authenticateWebhook } from '../src/middleware/webhookAuth';
 import { generateAccessToken, generateResetToken } from '../src/utils/tokens';
-import { ADMIN, AI_ROUTES, NON_GET_WITHOUT_AUTHORIZE, PA, ROLE_MATRIX, STAFF } from './roleMatrix';
+import { KPI_ROLES } from '../src/services/kpi/requests';
+import { ADMIN, AI_ROUTES, KPI_ROUTES, NON_GET_WITHOUT_AUTHORIZE, PA, ROLE_MATRIX, STAFF } from './roleMatrix';
 import { AppStack, appStack, RouteLayer } from './routeStack';
 
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
@@ -151,7 +152,7 @@ describe('role matrix', () => {
     const decided = Object.keys(ROLE_MATRIX).sort();
     expect(registered.filter(k => !(k in ROLE_MATRIX))).toEqual([]);
     expect(decided.filter(k => !byKey.has(k))).toEqual([]);
-    expect(registered).toHaveLength(87);
+    expect(registered).toHaveLength(94);
   });
 
   it.each(Object.entries(ROLE_MATRIX))('%s matches its entry exactly', (key, access) => {
@@ -189,7 +190,7 @@ describe('role matrix', () => {
   it('every route with the AI limiter is an AI route, and no AI route is open to donor viewers', () => {
     const limited = routes.filter(r => r.handlers.includes(aiLimiter)).map(r => r.key);
     expect(limited.filter(k => !AI_ROUTES.has(k))).toEqual([]);
-    expect(AI_ROUTES.size).toBe(9);
+    expect(AI_ROUTES.size).toBe(10);
     for (const key of AI_ROUTES) {
       const route = byKey.get(key);
       expect(route, key).toBeDefined();
@@ -210,6 +211,40 @@ describe('role matrix', () => {
     }
     const uploads = routes.filter(r => r.handlers.some(h => h?.name === 'multerMiddleware'));
     expect(uploads.map(r => r.key).sort()).toEqual(['post /api/projects/:id/documents', 'post /api/projects/:id/qualitative/upload']);
+  });
+});
+
+describe('KPI Assistant routes (Phase 4)', () => {
+  it('KPI_ROLES is exactly STAFF_ROLES', () => {
+    expect(sorted(KPI_ROLES)).toEqual(sorted(STAFF_ROLES));
+    expect(KPI_ROLES).not.toContain('donor_viewer');
+  });
+
+  it('lists every registered KPI route, each with the STAFF decision', () => {
+    const registered = routes.map(r => r.key).filter(k => /kpi|indicator-quality|\/alternative$/.test(k)).sort();
+    expect(registered).toEqual([...KPI_ROUTES].sort());
+    for (const key of KPI_ROUTES) {
+      expect(ROLE_MATRIX[key], key).toEqual(STAFF);
+      const guards = guardsOf(byKey.get(key)!);
+      expect(guards, key).toHaveLength(1);
+      expect(sorted(guards[0].allowedRoles), key).toEqual(sorted(KPI_ROLES));
+    }
+  });
+
+  it('the KPI routes that run the model are AI routes, with the organisation limiter after the role guard', () => {
+    for (const key of ['post /api/projects/:id/kpi-suggestions', 'post /api/indicators/:id/alternative']) {
+      expect(AI_ROUTES.has(key), key).toBe(true);
+      const { handlers } = byKey.get(key)!;
+      expect(handlers.indexOf(aiLimiter), key).toBe(2);
+      expect(handlers.indexOf(kpiOrgLimiter), key).toBe(3);
+    }
+    expect(byKey.get('get /api/kpi-suggestion-runs/:id')!.handlers.indexOf(kpiPollLimiter)).toBe(2);
+  });
+
+  it.each(KPI_ROUTES.map(key => [key]))('a donor viewer gets 403 on %s', async key => {
+    const res = await send(key, tokenFor('donor_viewer'));
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ message: 'Insufficient permissions' });
   });
 });
 

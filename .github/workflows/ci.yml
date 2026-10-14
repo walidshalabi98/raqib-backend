@@ -61,6 +61,12 @@ jobs:
       - name: Test
         run: npm test
 
+      # The KPI Assistant evaluation harness end to end with the deterministic fake model (design section 10.3): no
+      # key, no network, no database (the script replaces DATABASE_URL with an unusable placeholder), free. The real
+      # run (npm run eval:kpi -- --yes) needs the Anthropic key and is not run in CI.
+      - name: KPI evaluation (fake model)
+        run: npm run eval:kpi -- --fake
+
       - name: Build
         run: npm run build
 
@@ -70,7 +76,8 @@ jobs:
   # The reviewed SQL files in prisma/sql are what shared and Supabase databases get (docs/DATA_MODEL.md §9); the tests
   # above use `prisma db push`. This job proves the SQL against throwaway databases on its own Postgres service
   # (scripts/verify-migrations.sh): no drift from prisma/schema.prisma, data kept, guards, self-checks, lock_timeout,
-  # pgvector in an `extensions` schema as on Supabase.
+  # pgvector in an `extensions` schema as on Supabase. It covers every file up to the Phase 4 KPI Assistant SQL
+  # (prisma/sql/2026-10-12_phase4_kpi_assistant.sql).
   migrations:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -95,7 +102,7 @@ jobs:
       VERIFY_PG_BASE_URL: postgresql://raqib:raqib@localhost:5432
 
     steps:
-      # Full history: the script reads the schema and seed at BASE_REV, PHASE2_REV and PRE_PHASE0_REV.
+      # Full history: the script reads the schema and seed at BASE_REV, PHASE2_REV, PHASE3_REV and PRE_PHASE0_REV.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

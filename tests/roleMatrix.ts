@@ -65,7 +65,7 @@ export const ROLE_MATRIX: Record<string, Access> = {
   'post /api/frameworks/:id/indicators': STAFF,
   'get /api/frameworks/:id/indicators': 'all',
   'patch /api/indicators/:id': STAFF,
-  'post /api/indicators/:id/alternative': STAFF,
+  'post /api/indicators/:id/alternative': STAFF, // KPI Assistant alternatives (alias of POST kpi-suggestions)
   'patch /api/indicators/:id/approve': ADMIN,
   'delete /api/indicators/:id': STAFF,
   'get /api/frameworks/:id/results': 'all',
@@ -118,13 +118,35 @@ export const ROLE_MATRIX: Record<string, Access> = {
   // Indicator library (global)
   'get /api/indicator-library/': 'all',
   'get /api/indicator-library/:id': 'all',
+  // KPI Assistant (Phase 4): staff only. Donor viewers never see raw suggestions (kpi-assistant-spec §A1) and never
+  // spend AI budget; KPI_ROLES (src/services/kpi/requests.ts) is STAFF_ROLES.
+  'post /api/projects/:id/kpi-suggestions': STAFF, // runs the model
+  'get /api/projects/:id/kpi-suggestions': STAFF,
+  'get /api/kpi-suggestion-runs/:id': STAFF,
+  'post /api/kpi-suggestions/:id/accept': STAFF,
+  'post /api/kpi-suggestions/:id/reject': STAFF,
+  'get /api/frameworks/:id/indicator-quality': STAFF,
+  'get /api/kpi-assistant/status': STAFF,
 };
+
+/** Every KPI Assistant route, the alternatives alias included (design section 7.1). All are STAFF. */
+export const KPI_ROUTES: readonly string[] = [
+  'post /api/projects/:id/kpi-suggestions',
+  'get /api/projects/:id/kpi-suggestions',
+  'get /api/kpi-suggestion-runs/:id',
+  'post /api/kpi-suggestions/:id/accept',
+  'post /api/kpi-suggestions/:id/reject',
+  'get /api/frameworks/:id/indicator-quality',
+  'get /api/kpi-assistant/status',
+  'post /api/indicators/:id/alternative',
+];
 
 /** Routes that call (or will soon call) an AI model. None may be open to donor viewers. */
 export const AI_ROUTES: ReadonlySet<string> = new Set([
   'post /api/projects/:id/documents', // document analysis
   'post /api/projects/:id/framework/generate',
-  'post /api/indicators/:id/alternative',
+  'post /api/indicators/:id/alternative', // KPI Assistant alternatives
+  'post /api/projects/:id/kpi-suggestions', // KPI Assistant
   'post /api/projects/:id/assessments',
   'post /api/projects/:id/qualitative',
   'post /api/projects/:id/qualitative/upload',

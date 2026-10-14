@@ -2,6 +2,7 @@ import { CollectionMethod, Frequency, IndicatorDirection, IndicatorLevel, Prisma
 import { ECHO_INDICATOR_CAP } from './prompts/donors';
 import { FRAMEWORK_PROMPT_VERSION } from './prompts/framework';
 import { redactPersonalData } from './redact';
+import { recognisedThreshold } from './standardThresholds';
 
 /**
  * Pure helpers for the AI framework generator (BUILD_GUIDE Phase 2 task 7).
@@ -635,8 +636,9 @@ const DIGIT = /\d/;
  * Arabic-Indic digits, the Arabic decimal separator (٫) as ".", the Arabic thousands separator (٬)
  * and the Arabic comma (،) as ",", the Arabic percent sign (٪) as "%", typographic quotes and dashes
  * as ASCII, single spaces, no space before "%", lower case. "١٢٬٠٠٠" and "12,000" then compare equal.
+ * Exported for the KPI Assistant (validate.ts finds cue positions in the same normalised text; design 4.2).
  */
-function normaliseForMatch(value: string): string {
+export function normaliseForMatch(value: string): string {
   return value
     .normalize('NFKC')
     .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660)) // Arabic-Indic digits
@@ -756,6 +758,43 @@ function isDateOrRangePart(haystack: string, start: number, end: number): boolea
   return false;
 }
 
+/**
+ * A percent marker right after a number in normalised text: "%" ("٪" and " %" are normalised to it), or the words
+ * "percent", "per cent", "بالمئة", "بالمائة", "في المئة", "في المائة" after one optional space.
+ */
+const PERCENT_MARKER_AFTER = /^(?:%| ?(?:percent|per cent)(?![\p{L}\p{N}])| ?(?:بالمئة|بالمائة|في المئة|في المائة)(?!\p{L}))/u;
+
+/**
+ * Every place where `value` stands alone in `text` (KPI Assistant rules 8–9, D14; me-foundations §6): the text is
+ * compared after normaliseForMatch with the text after the AI analysis marker ignored (stripAiAnalysis), and an
+ * occurrence counts only when it is not part of a larger number ("4" in "42", "22" in "22.5%", "1" in "1.200") and
+ * not part of a date or a range (isDateOrRangePart). `start`/`end` are offsets in normaliseForMatch(stripAiAnalysis(text));
+ * `percent` is true when a percent marker follows the number (PERCENT_MARKER_AFTER) or the value itself ends with "%".
+ * [] for values without a digit.
+ */
+export function standaloneValueOffsets(text: string, value: string): Array<{ start: number; end: number; percent: boolean }> {
+  const needle = matchNeedle(value);
+  if (needle === null) return [];
+  const haystack = normaliseForMatch(stripAiAnalysis(text));
+  const valueIsPercent = needle.endsWith('%');
+  const out: Array<{ start: number; end: number; percent: boolean }> = [];
+  for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + 1)) {
+    const end = i + needle.length;
+    if (partOfLargerNumber(haystack, i, end) || isDateOrRangePart(haystack, i, end)) continue;
+    out.push({ start: i, end, percent: valueIsPercent || PERCENT_MARKER_AFTER.test(haystack.slice(end)) });
+  }
+  return out;
+}
+
+/**
+ * True when `value` stands alone in the excerpt (standaloneValueOffsets); with `unitIsPercent` given, at an occurrence
+ * whose `percent` equals it: a percent indicator needs a percent marker after the number, any other unit must not have
+ * one (KPI Assistant rules 8–9, D14: "900 youth" never supports a percentage, "60% employed" never a count).
+ */
+export function excerptSupportsValue(excerpt: string, value: string, unitIsPercent?: boolean): boolean {
+  return standaloneValueOffsets(excerpt, value).some(o => unitIsPercent === undefined || o.percent === unitIsPercent);
+}
+
 /** Quote marks, brackets and final punctuation around a quote, which the model may add or drop. */
 const QUOTE_EDGES = /^[\s"'«»()[\]]+|[\s"'«»()[\].,;:!?]+$/g;
 /** A quote may skip text with an ellipsis ("…" becomes "..." under NFKC). */
@@ -817,7 +856,7 @@ export function matchingFigure(value: string, kind: DocumentFigure['kind'], figu
 }
 
 // "officials" only in the plural: "official" is usually an adjective ("official records").
-const PEOPLE_WORDS_EN = /\b(people|persons?|individuals?|households?|women|woman|men|man|girls?|boys?|children|child|youths?|young people|students?|pupils?|learners?|teachers?|staff|employees?|workers?|officials|members?|residents?|citizens?|parents?|caregivers?|entrepreneurs?|owners?|farmers?|participants?|beneficiar(?:y|ies)|trainees?|graduates?|patients?|refugees?|survivors?)\b/i;
+const PEOPLE_WORDS_EN = /\b(people|persons?|individuals?|households?|famil(?:y|ies)|women|woman|men|man|girls?|boys?|children|child|adolescents?|infants?|newborns?|babies|mothers?|fathers?|youths?|young people|students?|pupils?|learners?|apprentices?|teachers?|staff|employees?|workers?|volunteers?|officials|members?|residents?|citizens?|parents?|caregivers?|entrepreneurs?|owners?|farmers?|smallholders?|herders?|fishers?|participants?|beneficiar(?:y|ies)|recipients?|trainees?|graduates?|patients?|refugees?|idps?|displaced|returnees?|migrants?|survivors?|orphans?|widows?)\b/i;
 
 const normaliseArabic = (word: string) => word
   .replace(/[ً-ْـ]/g, '') // diacritics and tatweel
@@ -834,6 +873,9 @@ const PEOPLE_WORDS_AR = new Set([
   'مزارعين', 'مزارعون', 'مزارعات', 'مشاركين', 'مشاركون', 'مشاركات',
   'مستفيدين', 'مستفيدون', 'مستفيدات', 'متدربين', 'متدربون', 'متدربات', 'خريجين', 'خريجون', 'خريجات', 'مرضى',
   'لاجئين', 'لاجئون', 'لاجئات', 'ناجين', 'ناجون', 'ناجيات',
+  'عائلة', 'عائلات', 'مراهق', 'مراهقين', 'مراهقون', 'مراهقات', 'رضع', 'رضيع', 'مواليد', 'أمهات', 'آباء', 'حوامل',
+  'نازح', 'نازحين', 'نازحون', 'نازحات', 'عائدين', 'عائدون', 'عائدات', 'مهاجرين', 'مهاجرون', 'متطوعين', 'متطوعون', 'متطوعات',
+  'أيتام', 'أرامل', 'مربي', 'مربو', 'صيادين', 'صيادون',
 ].map(normaliseArabic));
 
 function arabicWordCandidates(token: string): string[] {
@@ -852,14 +894,101 @@ function arabicWordCandidates(token: string): string[] {
   return Array.from(out);
 }
 
-/** True when an indicator counts or measures people (me-foundations.md §2 rule 7), in English or Arabic. */
+/** "Number of", "% of", "Percentage/Proportion/Share of": what follows is the counted noun phrase. */
+const COUNT_HEAD_EN = /^\s*(?:(?:total|average|mean|cumulative)\s+)?(?:number|no\.|#|%|per\s*cent(?:age)?|proportion|share|count)\s+of\s+(?:the\s+)?/i;
+/** Words that end the counted noun phrase (prepositions, relatives, conjunctions of clauses). */
+const PHRASE_STOP_EN = new Set([
+  'with', 'in', 'at', 'on', 'from', 'for', 'to', 'by', 'of', 'among', 'per', 'under', 'over', 'above', 'below', 'within', 'across',
+  'through', 'after', 'before', 'during', 'who', 'that', 'which', 'whose', 'where', 'when', 'whom', 'aged', 'into', 'than', 'as',
+  'via', 'using', 'having', 'is', 'are', 'was', 'were', 'has', 'have', 'had',
+]);
+/** Adverbs: before the noun a modifier ("newly enrolled children"), after it the start of the verb ("children fully immunised"). */
+const ADVERBS_EN = new Set([
+  'fully', 'newly', 'partially', 'regularly', 'directly', 'indirectly', 'successfully', 'safely', 'correctly', 'properly', 'actively',
+  'consistently', 'exclusively', 'effectively', 'appropriately', 'adequately', 'currently', 'still', 'also', 'now', 'meaningfully',
+]);
+/** Units after a number in a counted noun phrase ("children 6-59 months", "children 5 years old"). */
+const AGE_UNITS_EN = new Set(['months', 'month', 'years', 'year', 'yrs', 'old', 'weeks', 'week', 'days', 'day']);
+/** "… among target households", "… amongst the displaced population's children": the measure is taken over people. */
+const AMONG_PEOPLE_EN = /\bamong(?:st)?\s+(?:the\s+)?((?:[\p{L}'’-]+\s+){0,2}[\p{L}'’-]+)/iu;
+/** "Heads of household(s)" counts people although its head noun is "heads". */
+const HEADS_OF_HOUSEHOLD = /\bheads?\s+of\s+(?:the\s+)?households?\b/i;
+/** Arabic count heads ("عدد", "نسبة", "النسبة المئوية ل/من", "متوسط عدد"), after normaliseArabic. */
+const COUNT_HEAD_AR = /^\s*(?:متوسط\s+)?(?:عدد|نسبه|نسبة|النسبه\s+المئويه|النسبة\s+المئوية)\s+(?:من\s+)?/;
+
+/**
+ * The head nouns of the counted noun phrase of an English name ("Number of displaced families receiving kits" →
+ * ["families"]; "Number of family tents distributed" → ["tents"]; "Number of boys and girls enrolled" → ["boys",
+ * "girls"]), or null when the name has no count head. The phrase ends at a preposition, a relative or a verb form
+ * ("receiving", "trained") after its first word; adjectives before the noun ("displaced", "trained") stay modifiers.
+ */
+function countedHeadsEn(name: string): string[] | null {
+  const head = COUNT_HEAD_EN.exec(name);
+  if (!head) return null;
+  const words = name.slice(head[0].length).split(/[\s,;:()]+/).filter(Boolean);
+  const heads: string[] = [];
+  let current: string | null = null;
+  let afterNumber = false;
+  for (const raw of words) {
+    const word = raw.toLowerCase().replace(/['’]s$/, '');
+    // An age range or a number ("youth (15-29)", "children 6-59 months", "women 15-49") and the unit after it qualify the
+    // noun; an acronym after the noun ("youth NEET") describes it. Neither is the counted noun (finisher re-check AI-5).
+    if (/\d/.test(word)) {
+      afterNumber = true;
+      continue;
+    }
+    if (afterNumber && AGE_UNITS_EN.has(word)) continue;
+    afterNumber = false;
+    if (current !== null && /^[A-Z]{2,}$/.test(raw)) continue;
+    if (PHRASE_STOP_EN.has(word)) break;
+    if (word === 'and' || word === 'or' || word === 'and/or' || word === '&') {
+      if (current) heads.push(current);
+      current = null;
+      continue;
+    }
+    // An adverb or a verb form after the noun ends the phrase; before the noun ("newly enrolled", "displaced", "trained")
+    // it is a modifier.
+    const afterNoun = current !== null && !ADVERBS_EN.has(current);
+    if (afterNoun && (ADVERBS_EN.has(word) || /^\p{L}{3,}(?:ing|ed)$/u.test(word))) break;
+    current = word;
+  }
+  if (current) heads.push(current);
+  return heads;
+}
+
+/** The first word of the counted noun phrase of an Arabic name (idafa: "عدد الخيام العائلية" → "الخيام"), or null. */
+function countedHeadAr(nameAr: string): string | null {
+  const text = normaliseArabic(nameAr);
+  const head = COUNT_HEAD_AR.exec(text);
+  if (!head) return null;
+  return text.slice(head[0].length).split(/[^ء-ي]+/).filter(Boolean)[0] ?? null;
+}
+
+const isPeopleWordAr = (token: string) => arabicWordCandidates(token).some(w => PEOPLE_WORDS_AR.has(w));
+
+/**
+ * True when an indicator counts or measures people (me-foundations.md §2 rule 7), in English or Arabic. When the name
+ * has a count head ("Number of", "% of", "عدد", "نسبة"), the counted noun decides (AI-5 side effect: "Number of family
+ * tents distributed", "Number of IDP sites with latrines", "Number of water points serving displaced communities" count
+ * things, not people; "Number of displaced families receiving kits" counts people; "heads of household" are people; a
+ * measure "among" people is about people; the Arabic name's counted noun counts too); otherwise any people word of the
+ * English name, then the Arabic name's counted noun (or, without a count head, any Arabic people word).
+ */
 export function isPeopleLevelIndicator(nameEn: string, nameAr?: string | null): boolean {
+  const heads = countedHeadsEn(nameEn ?? '');
+  const headAr = nameAr ? countedHeadAr(nameAr) : null;
+  if (heads !== null) {
+    const among = AMONG_PEOPLE_EN.exec(nameEn);
+    return HEADS_OF_HOUSEHOLD.test(nameEn) || heads.some(h => PEOPLE_WORDS_EN.test(h)) || (among !== null && PEOPLE_WORDS_EN.test(among[1]))
+      || (headAr !== null && isPeopleWordAr(headAr));
+  }
   if (PEOPLE_WORDS_EN.test(nameEn)) return true;
   if (!nameAr) return false;
+  if (headAr !== null) return isPeopleWordAr(headAr);
   return normaliseArabic(nameAr)
     .split(/[^ء-ي]+/)
     .filter(Boolean)
-    .some(token => arabicWordCandidates(token).some(w => PEOPLE_WORDS_AR.has(w)));
+    .some(isPeopleWordAr);
 }
 
 const DISAGGREGATION_SYNONYMS: Record<string, string> = {
@@ -922,13 +1051,36 @@ const GENERIC_MEANS_OF_VERIFICATION = new Set([
   'records', 'project documents', 'documents', 'n/a', 'na', 'none', 'tbd', 'to be determined', 'm&e reports',
 ]);
 
-/** "Project reports" and similar are not acceptable means of verification (me-foundations.md §1). */
+/** Nouns that name only a kind of paperwork, not a source or tool. */
+const MOV_PAPER_NOUNS = new Set(['report', 'reports', 'reporting', 'record', 'records', 'data', 'document', 'documents', 'documentation', 'file', 'files']);
+/** Qualifiers that do not make paperwork specific (who or how often, not which source or tool). */
+const MOV_QUALIFIERS = new Set([
+  'project', 'projects', 'progress', 'monitoring', 'quarterly', 'annual', 'monthly', 'weekly', 'biannual', 'semi-annual',
+  'periodic', 'regular', 'routine', 'interim', 'final', 'narrative', 'technical', 'internal', 'partner', 'partners',
+  'field', 'm&e', 'me', 'distribution', 'distributions', 'activity', 'activities', 'programme', 'program', 'implementation',
+  'situation', 'staff', 'team', 'donor', 'organisation', 'organization', 'ngo', 'and', 'or', 'of', 'the', '&',
+]);
+
+/**
+ * "Project reports" and similar are not acceptable means of verification (me-foundations.md §1; ECHO: specific sources
+ * only): the exact list above, or any text made only of paperwork nouns (report, record, data, document, file) and
+ * qualifiers that name no source or tool (project, progress, monitoring, quarterly, partner, field, M&E, internal,
+ * distribution, …): "Quarterly project reports", "Partner reports", "Monitoring data", "Project M&E records". A text that
+ * names a tool or source ("Distribution lists signed by recipients", "Facility immunisation registers", "Household
+ * survey (KoboToolbox)") is specific.
+ */
 export function isGenericMeansOfVerification(value: string): boolean {
   const key = value.toLowerCase().replace(/[.\s]+$/g, '').replace(/\s+/g, ' ').trim();
-  return GENERIC_MEANS_OF_VERIFICATION.has(key);
+  if (GENERIC_MEANS_OF_VERIFICATION.has(key)) return true;
+  const words = key.replace(/['’]s\b/g, '').split(/[\s,;/()+]+/).filter(Boolean);
+  return words.length > 0 && words.some(w => MOV_PAPER_NOUNS.has(w)) && words.every(w => MOV_PAPER_NOUNS.has(w) || MOV_QUALIFIERS.has(w));
 }
 
-function isPercentUnit(unit: string, name: string): boolean {
+/**
+ * True for a percentage indicator: the unit starts with "%" or "percent", or the name starts with "%", "percentage" or
+ * "proportion" (me-foundations §2 rule 3; KPI Assistant rule 5 and rules 8–9). Exported for the KPI Assistant (design 4.2).
+ */
+export function isPercentUnit(unit: string, name: string): boolean {
   const u = unit.trim().toLowerCase();
   return u.startsWith('%') || u.startsWith('percent') || /^(%|percentage\b|proportion\b)/i.test(name.trim());
 }
@@ -957,6 +1109,8 @@ export interface BaselineTargetInput {
   standardReferenceCode: string | null;
   /** The linked library entry: its own text is the only evidence for a standard threshold. */
   libraryEntry?: LibraryEntryReference | null;
+  /** The indicator's unit: a standard threshold must be one of the entry's recognised thresholds in this unit. */
+  unit?: string | null;
 }
 
 export interface BaselineTargetResult {
@@ -1049,9 +1203,10 @@ function resolveIntermediateTargets(raw: unknown, figures: readonly VerifiedFigu
  *   the planned date); it is dropped with a rejected document baseline. When it is unknown,
  *   baselineMethod ends with "Baseline date: to be confirmed.";
  * - a target is kept with basis 'document' when it equals a verified figure of kind 'target' (cited
- *   in targetJustification), or with basis 'standard_threshold' when it appears in the linked library
- *   entry's own text (see libraryEntryTexts; a standardReferenceCode written by the model is not
- *   enough); it is cleared for 'method_only', 'none', unknown bases and unverified values;
+ *   in targetJustification), or with basis 'standard_threshold' when it is a recognised threshold of the
+ *   linked library entry (recognisedThreshold: listed in STANDARD_THRESHOLDS, in the indicator's unit) and
+ *   appears in the entry's own text (see libraryEntryTexts; a standardReferenceCode written by the model is
+ *   not enough); it is cleared for 'method_only', 'none', unknown bases and unverified values;
  * - whenever the target is cleared, targetJustification holds the proposed method: "Proposed
  *   method: … — confirm after baseline." The model's text is used only when it sets the target
  *   from the baseline (so a removed target's justification cannot carry the invented number),
@@ -1092,8 +1247,11 @@ export function resolveBaselineAndTarget(input: BaselineTargetInput, figures: re
   let targetValue: string | null = null;
   let justification: string;
   const targetFigure = targetBasis === 'document' && input.targetValue !== '' ? matchingFigure(input.targetValue, 'target', figures) : null;
+  // A recognised threshold of the linked entry (STANDARD_THRESHOLDS, in the indicator's unit) that the entry's own text
+  // states: recall periods, cut-offs, durations, years and codes in the entry's text are never thresholds.
   const standardEntry = targetBasis === 'standard_threshold' && input.targetValue !== '' && input.libraryEntry
     && appearsInDocuments(input.targetValue, libraryEntryTexts(input.libraryEntry))
+    && recognisedThreshold(input.libraryEntry.id, input.targetValue, input.unit) !== null
     ? input.libraryEntry : null;
 
   if (targetFigure) {
@@ -1170,7 +1328,13 @@ export type IndicatorCreatePayload = Prisma.IndicatorCreateManyInput & {
   frequency: Frequency;
 };
 
-const codeKey = (code: string) => code.trim().toUpperCase().replace(/\s+/g, '');
+/**
+ * Result-code key: trimmed, upper case, no spaces ("o 1.2" → "O1.2"). Exported for the KPI Assistant (rule x1 and code
+ * collisions, design 4.2 and 4.3).
+ */
+export function codeKey(code: string): string {
+  return code.trim().toUpperCase().replace(/\s+/g, '');
+}
 const GOAL_ALIASES = new Set(['G', 'GOAL', 'IMPACT']);
 
 /**
@@ -1263,9 +1427,12 @@ export function normalizeIndicator(raw: unknown, sortOrder: number, ctx: Normali
   const libraryIdRaw = rawLibraryId(raw);
   const libraryId = libraryIdRaw && ctx.knownLibraryIds.has(libraryIdRaw) ? clip(libraryIdRaw, LIMITS.libraryId) : null;
   const libraryEntry = libraryId ? ctx.libraryEntries?.get(libraryId) ?? null : null;
-  // The linked entry's standard reference is authoritative; the model's code is kept only when there is none.
-  const standardReferenceCode = (libraryEntry ? standardReferenceLabel(libraryEntry.standardReference) : null)
-    ?? orNull(clip(pick(raw, 'standardReferenceCode'), LIMITS.standardReferenceCode));
+  // A linked entry's own standard reference is the only code it carries: an entry without one (isStandard false, e.g.
+  // FS-06) is not donor-standard, whatever code the model wrote (SPEC-4). Without a linked entry the model's code is
+  // kept here; the KPI Assistant clears it before (validateSuggestion), so a custom indicator is never shown as standard.
+  const standardReferenceCode = libraryEntry
+    ? standardReferenceLabel(libraryEntry.standardReference)
+    : orNull(clip(pick(raw, 'standardReferenceCode'), LIMITS.standardReferenceCode));
 
   const unit = clip(pick(raw, 'unit'), LIMITS.unit);
   const percent = isPercentUnit(unit, indicatorText);
@@ -1286,6 +1453,7 @@ export function normalizeIndicator(raw: unknown, sortOrder: number, ctx: Normali
     intermediateTargets: raw.intermediateTargets,
     standardReferenceCode,
     libraryEntry,
+    unit,
   }, ctx.verifiedFigures);
 
   const phases = textList(raw.phases, LIMITS.phases).map(p => clip(p, LIMITS.phase));
@@ -1346,7 +1514,7 @@ export function extractIndicatorList(parsed: unknown): unknown[] {
  *   back to the level's usual choice; level 'activity' or unknown → output;
  * - resultCode → ResultNode id (else the first node of the same level, else null);
  * - libraryId kept only when it is a known library id; the linked entry's standard
- *   reference replaces the model's standardReferenceCode;
+ *   reference (or none, for an entry without one) replaces the model's standardReferenceCode;
  * - the linked entry's sex keys (sex, sex_of_household_head) are kept, and 'sex' is
  *   added to people-level indicators that lack sex / sex_of_household_head;
  * - baselines, baseline dates, targets and intermediate targets per resolveBaselineAndTarget

@@ -291,6 +291,8 @@ model Project {
   beneficiaries       Beneficiary[]
   beneficiaryServices BeneficiaryService[]
   aiCalls             AiCall[]
+  kpiSuggestions      KpiSuggestion[]
+  kpiSuggestionRuns   KpiSuggestionRun[]
 }
 
 model Document {
@@ -313,38 +315,42 @@ model Document {
 }
 
 model Framework {
-  id              String          @id @default(uuid())
-  projectId       String
-  project         Project         @relation(fields: [projectId], references: [id])
-  version         Int             @default(1)
-  status          FrameworkStatus @default(draft)
-  name            String?
-  aiModelUsed     String?
+  id                String             @id @default(uuid())
+  projectId         String
+  project           Project            @relation(fields: [projectId], references: [id])
+  version           Int                @default(1)
+  status            FrameworkStatus    @default(draft)
+  name              String?
+  aiModelUsed       String?
   // Set when AI generation of this version failed (a safe message, never model output); such a
   // version is not used as the project's current framework.
-  generationError String?
-  generatedAt     DateTime        @default(now())
-  approvedAt      DateTime?
-  approvedBy      String?
-  indicators      Indicator[]
-  resultNodes     ResultNode[]
+  generationError   String?
+  generatedAt       DateTime           @default(now())
+  approvedAt        DateTime?
+  approvedBy        String?
+  indicators        Indicator[]
+  resultNodes       ResultNode[]
+  kpiSuggestions    KpiSuggestion[]
+  kpiSuggestionRuns KpiSuggestionRun[]
 }
 
 // Results chain node: goal/impact → outcome → output (→ activity).
 model ResultNode {
-  id          String         @id @default(uuid())
-  frameworkId String
-  framework   Framework      @relation(fields: [frameworkId], references: [id], onDelete: Cascade)
-  parentId    String?
-  parent      ResultNode?    @relation("ResultTree", fields: [parentId], references: [id], onDelete: Restrict)
-  children    ResultNode[]   @relation("ResultTree")
-  level       IndicatorLevel
-  code        String // "Goal", "O1", "O1.1"
-  text        String
-  textAr      String?
-  sortOrder   Int            @default(0)
-  createdAt   DateTime       @default(now())
-  indicators  Indicator[]
+  id                String             @id @default(uuid())
+  frameworkId       String
+  framework         Framework          @relation(fields: [frameworkId], references: [id], onDelete: Cascade)
+  parentId          String?
+  parent            ResultNode?        @relation("ResultTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children          ResultNode[]       @relation("ResultTree")
+  level             IndicatorLevel
+  code              String // "Goal", "O1", "O1.1"
+  text              String
+  textAr            String?
+  sortOrder         Int                @default(0)
+  createdAt         DateTime           @default(now())
+  indicators        Indicator[]
+  kpiSuggestions    KpiSuggestion[]
+  kpiSuggestionRuns KpiSuggestionRun[]
 
   @@unique([frameworkId, code])
   @@index([frameworkId])
@@ -399,6 +405,11 @@ model Indicator {
 
   dataPoints          DataPoint[]
   beneficiaryServices BeneficiaryService[]
+
+  // KPI Assistant (Phase 4)
+  kpiRunsAsSource        KpiSuggestionRun[] @relation("KpiRunSourceIndicator")
+  kpiAlternatives        KpiSuggestion[]    @relation("KpiAlternativeOfIndicator")
+  acceptedFromSuggestion KpiSuggestion?     @relation("KpiAcceptedIndicator")
 
   @@index([resultId])
 }
@@ -504,6 +515,7 @@ model IndicatorLibraryEntry {
   createdAt           DateTime                     @default(now())
   updatedAt           DateTime                     @updatedAt
   indicators          Indicator[]
+  kpiSuggestions      KpiSuggestion[]
 
   @@index([sector])
   @@index([standardFramework])
@@ -647,4 +659,119 @@ model AiCall {
   @@index([organizationId, createdAt])
   @@index([feature, createdAt])
   @@index([projectId, createdAt])
+}
+
+// ------------------------------------------------------------------ Phase 4: KPI Assistant
+
+enum SuggestionStatus {
+  pending
+  accepted
+  edited_accepted
+  rejected
+  expired
+}
+
+enum SuggestionRejectReason {
+  not_relevant
+  too_costly_to_measure
+  donor_not_required
+  duplicate
+  wording
+  other
+}
+
+enum KpiRunScope {
+  framework
+  result
+  alternatives
+}
+
+enum KpiRunStatus {
+  running
+  completed
+  failed
+}
+
+/// One "Suggest KPIs" request (kpi-assistant-spec §A6): status, progress step, run-level warnings, cost. Polled by the UI.
+/// Runs are never pruned: their suggestions (feedback history) reference them.
+model KpiSuggestionRun {
+  id                 String          @id @default(uuid())
+  projectId          String
+  project            Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  frameworkId        String
+  framework          Framework       @relation(fields: [frameworkId], references: [id], onDelete: Cascade)
+  scope              KpiRunScope
+  resultId           String?
+  result             ResultNode?     @relation(fields: [resultId], references: [id], onDelete: SetNull)
+  sourceIndicatorId  String?
+  sourceIndicator    Indicator?      @relation("KpiRunSourceIndicator", fields: [sourceIndicatorId], references: [id], onDelete: SetNull)
+  sourceSuggestionId String?
+  sourceSuggestion   KpiSuggestion?  @relation("KpiRunSourceSuggestion", fields: [sourceSuggestionId], references: [id], onDelete: SetNull)
+  status             KpiRunStatus    @default(running)
+  step               String          @default("context") // context | retrieval | model | validation | saving | done
+  errorCode          String? // KpiErrorCode
+  error              String? // safe message, never model or document text
+  frameworkWarnings  Json            @default("[]") // KpiWarning[]
+  suggestionCount    Int             @default(0)
+  retrieval          String? // vector | keyword
+  model              String?
+  promptVersion      String?
+  modelCalls         Int             @default(0)
+  embeddingCalls     Int             @default(0)
+  inputTokens        Int             @default(0)
+  outputTokens       Int             @default(0)
+  estimatedCostUsd   Decimal?        @db.Decimal(12, 6)
+  latencyMs          Int?
+  requestedBy        String? // user id; no foreign key (users are deleted), like Framework.approvedBy
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt // heartbeat (no database default: raw SQL inserts must set it)
+  finishedAt         DateTime?
+  suggestions        KpiSuggestion[] @relation("KpiRunSuggestions")
+
+  @@index([projectId, createdAt])
+  @@index([frameworkId, status])
+}
+
+/// A suggested indicator (kpi-assistant-spec §A5). Rejected rows are feedback history (orgPreferences): never delete them.
+model KpiSuggestion {
+  id                        String                  @id @default(uuid())
+  projectId                 String
+  project                   Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  frameworkId               String
+  framework                 Framework               @relation(fields: [frameworkId], references: [id], onDelete: Cascade)
+  runId                     String
+  run                       KpiSuggestionRun        @relation("KpiRunSuggestions", fields: [runId], references: [id], onDelete: NoAction)
+  resultId                  String?
+  result                    ResultNode?             @relation(fields: [resultId], references: [id], onDelete: SetNull)
+  level                     IndicatorLevel
+  sortOrder                 Int                     @default(0)
+  payload                   Json // ValidatedSuggestion without warnings/qualityScore/qualityBand (src/services/kpi/types.ts), with `draft`
+  qualityScore              Int
+  warnings                  Json                    @default("[]") // KpiWarning[]
+  libraryId                 String?
+  library                   IndicatorLibraryEntry?  @relation(fields: [libraryId], references: [id], onDelete: SetNull)
+  isCustom                  Boolean                 @default(false)
+  method                    CollectionMethod
+  alternativeOfIndicatorId  String?
+  alternativeOfIndicator    Indicator?              @relation("KpiAlternativeOfIndicator", fields: [alternativeOfIndicatorId], references: [id], onDelete: SetNull)
+  alternativeOfSuggestionId String?
+  alternativeOfSuggestion   KpiSuggestion?          @relation("KpiAlternativeOfSuggestion", fields: [alternativeOfSuggestionId], references: [id], onDelete: SetNull)
+  alternatives              KpiSuggestion[]         @relation("KpiAlternativeOfSuggestion")
+  sourceOfRuns              KpiSuggestionRun[]      @relation("KpiRunSourceSuggestion")
+  status                    SuggestionStatus        @default(pending)
+  model                     String
+  promptVersion             String
+  createdAt                 DateTime                @default(now())
+  decidedAt                 DateTime?
+  decidedBy                 String? // user id; no foreign key
+  rejectReason              SuggestionRejectReason?
+  rejectNote                String? // redacted when saved
+  indicatorId               String?                 @unique
+  indicator                 Indicator?              @relation("KpiAcceptedIndicator", fields: [indicatorId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, status])
+  @@index([frameworkId, status])
+  @@index([resultId])
+  @@index([runId])
+  @@index([libraryId, status])
 }

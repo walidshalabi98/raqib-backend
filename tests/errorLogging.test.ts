@@ -55,6 +55,15 @@ describe('errorHandler', () => {
   it.each([
     ['a Prisma validation error', prismaValidationError, 400],
     ['a Prisma unique constraint error', prismaKnownError, 409],
+    // CC-03: a deadlock or write conflict with a simultaneous request is a 409 the client can repeat, never a 500.
+    ['a Prisma write conflict (P2034)', () => new Prisma.PrismaClientKnownRequestError(`Transaction failed due to a write conflict or a deadlock (${NAME})`, {
+      code: 'P2034', clientVersion: Prisma.prismaVersion.client,
+    }), 409],
+    ['a deadlock reported as an unknown request error (40P01)', () => new Prisma.PrismaClientUnknownRequestError(
+      `Invalid \`prisma.kpiSuggestion.updateMany()\` invocation: Error occurred during query execution: ConnectorError(... code: "40P01", message: "deadlock detected" ... ${NAME})`,
+      { clientVersion: Prisma.prismaVersion.client },
+    ), 409],
+    ['any other unknown request error', () => new Prisma.PrismaClientUnknownRequestError(`Something odd for ${NAME}`, { clientVersion: Prisma.prismaVersion.client }), 500],
     ['any other error', () => new Error(`Something failed for ${NAME}`), 500],
   ])('answers %s without logging what it quotes', async (_label, make, status) => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);

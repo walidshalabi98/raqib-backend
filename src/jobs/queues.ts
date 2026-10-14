@@ -11,7 +11,6 @@ function createQueue(name: string): Queue {
 
 let documentParsingQueue: Queue;
 let frameworkQueue: Queue;
-let indicatorQueue: Queue;
 let reportQueue: Queue;
 let qualitativeQueue: Queue;
 let maintenanceQueue: Queue;
@@ -28,13 +27,6 @@ export function getFrameworkQueue(): Queue {
     frameworkQueue = createQueue('framework-generation');
   }
   return frameworkQueue;
-}
-
-export function getIndicatorQueue(): Queue {
-  if (!indicatorQueue) {
-    indicatorQueue = createQueue('indicator-alternatives');
-  }
-  return indicatorQueue;
 }
 
 export function getReportQueue(): Queue {

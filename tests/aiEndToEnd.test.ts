@@ -7,8 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * Anthropic SDK replaced by a fake (configureAiClientForTests). Nothing here mocks client.ts, so the
  * request each service builds, the parsing and validation of the raw Messages API JSON, the cost and
  * served-model bookkeeping and the AiCall rows are all the production code (review finding R6).
- * Covered: generateFramework (main tier, server-side fallback), parseDocument on a stored .xlsx
- * (fast tier) and risk analysis (fast tier). No network: tests/setup.ts points the real SDK at a
+ * Covered: generateFramework (main tier, server-side fallback; its indicator step runs the KPI pipeline, design
+ * section 4.6), parseDocument on a stored .xlsx (fast tier) and risk analysis (fast tier). No network: tests/setup.ts points the real SDK at a
  * closed port, and the fake replaces it.
  */
 
@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.unmock('../src/services/ai/frameworkGenerator');
 vi.unmock('../src/services/ai/documentParser');
 vi.unmock('../src/services/ai/riskAnalyzer');
+vi.unmock('../src/services/kpi/pipeline');
 
 import app from '../src/app';
 import { prisma } from '../src/config/prisma';
@@ -26,11 +27,11 @@ import { generateFramework } from '../src/services/ai/frameworkGenerator';
 import { DOCUMENT_ANALYSIS_SYSTEM, DOCUMENT_TYPES } from '../src/services/ai/prompts/documentAnalysis';
 import {
   FRAMEWORK_INDICATOR_LEVELS,
-  FRAMEWORK_INDICATORS_SYSTEM,
   FRAMEWORK_PROMPT_VERSION,
   FRAMEWORK_STRUCTURE_SYSTEM,
   INDICATOR_UNITS,
 } from '../src/services/ai/prompts/framework';
+import { KPI_CALLS, KPI_PROMPT_VERSION, KPI_SYSTEM, type KpiRawSuggestion } from '../src/services/ai/prompts/kpi';
 import { RISK_LEVELS, RISK_SYSTEM } from '../src/services/ai/prompts/risk';
 import { loadSharedSystemPrompt } from '../src/services/ai/prompts/system';
 import { analyzeProjectRisks } from '../src/services/ai/riskAnalyzer';
@@ -185,47 +186,51 @@ const STRUCTURE_ANSWER = {
   ],
 };
 
-function indicatorAnswer(overrides: Record<string, unknown>): Record<string, unknown> {
+/** One suggestion of the KPI answer (KPI_SUGGESTION_SCHEMA): the indicator step runs the KPI pipeline (design 4.6, D19). */
+function suggestion(overrides: Partial<KpiRawSuggestion>): KpiRawSuggestion {
   return {
-    resultCode: 'O1', level: 'outcome', indicatorText: '', indicatorTextAr: '', libraryId: '', standardReferenceCode: '', definition: '',
-    unit: 'number', calculation: { numerator: '', denominator: '', formula: '', rounding: '' }, direction: 'increase', disaggregation: [],
-    dataCollectionMethod: 'document_review', frequency: 'quarterly', meansOfVerification: '', baselineValue: '', baselineBasis: 'none',
-    baselineDate: '', baselineMethod: '', targetValue: '', targetBasis: 'none', targetJustification: '', intermediateTargets: [], assumptions: '',
-    responsibility: '', phases: ['baseline', 'midterm', 'endline'], startDate: '2026-01-15', endDate: '2026-12-31',
-    milestones: [{ label: 'Baseline data collection', date: '2026-02-15', completed: false }], aiRationale: 'Measures the result with a verifiable source.',
+    resultCode: 'O1', level: 'outcome', libraryId: null, isCustom: true, customReason: 'No library candidate fits this result.', name: '', nameAr: '',
+    definition: '', unit: 'number', numerator: '', denominator: '', direction: 'increase', disaggregation: [], method: 'document_review',
+    frequency: 'quarterly', meansOfVerification: '', baselineSuggestion: '', baselineBasis: 'none', targetSuggestion: '', targetBasis: 'method_only',
+    standardReferenceCode: null, rationale: 'Measures the result with a verifiable source.', qualityNotes: [], confidence: 'medium',
     ...overrides,
   };
 }
 
+/** The answer to the one KPI batch of the four results (G, O1, O1.1, O1.2): every result gets one (no AI-2 retry). */
 const INDICATORS_ANSWER = {
-  indicators: [
-    indicatorAnswer({
-      resultCode: 'O1', indicatorText: 'Average volume of water available per person per day in target households', libraryId: 'WA-01',
-      indicatorTextAr: 'متوسط كمية المياه المتاحة للفرد يوميًا في الأسر المستهدفة', standardReferenceCode: 'Sphere',
-      definition: 'Litres of water available for drinking, cooking and hygiene per person per day, from all sources.', unit: 'litres_per_person_per_day',
-      disaggregation: ['location', 'displacement_status'], dataCollectionMethod: 'hh_survey', meansOfVerification: 'Household survey water module',
-      baselineValue: '6', baselineBasis: 'document', baselineDate: '2025-12-01', baselineMethod: 'Rapid needs assessment, December 2025',
-      targetValue: '15', targetBasis: 'standard_threshold', targetJustification: 'Sphere minimum for drinking, cooking and hygiene',
-      assumptions: 'Water sources remain accessible.', responsibility: 'WASH Officer',
+  suggestions: [
+    suggestion({
+      resultCode: 'G', level: 'impact', name: 'Incidence of acute watery diarrhoea among children under five in the governorate',
+      nameAr: 'معدل الإصابة بالإسهال المائي الحاد بين الأطفال دون سن الخامسة في المحافظة', unit: 'ratio', method: 'secondary_data', frequency: 'annual',
+      definition: 'New cases of acute watery diarrhoea per 1,000 children under five per year, from the health surveillance system.',
+      meansOfVerification: 'Ministry of Health disease surveillance bulletins',
     }),
-    indicatorAnswer({
-      resultCode: 'O1.1', level: 'output', indicatorText: 'Number of people receiving trucked drinking water', libraryId: 'WA-04',
-      indicatorTextAr: 'عدد الأشخاص الذين يحصلون على مياه الشرب المنقولة بالصهاريج',
+    suggestion({
+      resultCode: 'O1', name: 'Average volume of water available per person per day in target households', libraryId: 'WA-01', isCustom: false, customReason: '',
+      nameAr: 'متوسط كمية المياه المتاحة للفرد يوميًا في الأسر المستهدفة', standardReferenceCode: 'Sphere',
+      definition: 'Litres of water available for drinking, cooking and hygiene per person per day, from all sources.', unit: 'litres_per_person_per_day',
+      disaggregation: ['location', 'displacement_status'], method: 'hh_survey', meansOfVerification: 'Household survey water module',
+      baselineSuggestion: '6', baselineBasis: 'document', targetSuggestion: '15', targetBasis: 'standard_threshold', confidence: 'high',
+    }),
+    suggestion({
+      resultCode: 'O1.1', level: 'output', name: 'Number of people receiving trucked drinking water', libraryId: 'WA-04', isCustom: false, customReason: '',
+      nameAr: 'عدد الأشخاص الذين يحصلون على مياه الشرب المنقولة بالصهاريج',
       definition: 'People in households registered at a served delivery point who received water at least once in the month.',
-      disaggregation: ['age'], frequency: 'monthly', meansOfVerification: 'Water-trucking delivery logs', baselineDate: '2026-01-01',
-      baselineMethod: 'Zero at start: new service', targetValue: '12,000', targetBasis: 'document', targetJustification: 'Result 1.1 of the proposal',
-      intermediateTargets: [{ date: '2026-03-31', value: '6,000' }], assumptions: 'Crossings remain open for fuel.', responsibility: 'Field Team',
+      disaggregation: ['age'], frequency: 'monthly', meansOfVerification: 'Water-trucking delivery logs', targetSuggestion: '12,000', targetBasis: 'document',
     }),
     // An invented target that only matches a budget cell ("80 ILS per interview"): removed in code.
-    indicatorAnswer({
-      resultCode: 'O1.2', level: 'output', indicatorText: '% of target households with a handwashing facility with soap and water', unit: 'percent',
-      dataCollectionMethod: 'observation', frequency: 'biannual', meansOfVerification: 'Household observation checklist',
-      targetValue: '80', targetBasis: 'document', targetJustification: 'Target of 80 agreed by the team', responsibility: 'WASH Officer',
+    suggestion({
+      resultCode: 'O1.2', level: 'output', name: '% of target households with a handwashing facility with soap and water', unit: 'percent',
+      nameAr: 'نسبة الأسر المستهدفة التي لديها مرفق لغسل اليدين بالماء والصابون',
+      numerator: 'Households with a handwashing facility with soap and water', denominator: 'Households observed',
+      method: 'observation', frequency: 'biannual', meansOfVerification: 'Household observation checklist', targetSuggestion: '80', targetBasis: 'document',
     }),
   ],
+  frameworkWarnings: [],
 };
 
-/** Tokens of each framework attempt. The indicator request is declined by Sonnet 5.5 before any output and served by Sonnet 5. */
+/** Tokens of each framework attempt. The indicator (KPI batch) request is declined by Sonnet 5.5 before any output and served by Sonnet 5. */
 const STRUCTURE_TOKENS: Tokens = { input: 2210, output: 3180, cacheWrite: 9814, cacheRead: 0 };
 const DECLINED_TOKENS: Tokens = { input: 4020, output: 0, cacheWrite: 0, cacheRead: 9814 };
 const SERVED_TOKENS: Tokens = { input: 4020, output: 7410, cacheWrite: 9814, cacheRead: 0 };
@@ -276,7 +281,7 @@ describe.skipIf(!hasTestDatabase)('AI services through the real client (fake SDK
     return { project, framework };
   }
 
-  it('generateFramework: structure + indicators with a server-side fallback, stored rows, request shape and AiCall rows', async () => {
+  it('generateFramework: structure + one KPI batch with a server-side fallback, stored rows, request shape and AiCall rows', async () => {
     const { project, framework } = await frameworkProject();
     const sdk = fakeSdk([
       rawMessage(MAIN, STRUCTURE_ANSWER, STRUCTURE_TOKENS),
@@ -299,7 +304,6 @@ describe.skipIf(!hasTestDatabase)('AI services through the real client (fake SDK
       expect(req.body.betas).toEqual([REFUSAL_FALLBACK_BETA]);
       expect(req.body.betas).toEqual(['server-side-fallback-2026-07-01']);
       expect(req.body.fallbacks).toBe('default');
-      expect(req.body.output_config.effort).toBe('medium');
       expect(req.body.output_config.format.type).toBe('json_schema');
       expectStrictObjects(req.body.output_config.format.schema);
       expect(req.body.messages).toHaveLength(1);
@@ -308,21 +312,25 @@ describe.skipIf(!hasTestDatabase)('AI services through the real client (fake SDK
       expect(req.body.messages[0].content).not.toContain('FGD transcript');
     }
     expectSystemBlocks(structureReq.body, FRAMEWORK_STRUCTURE_SYSTEM);
-    expectSystemBlocks(indicatorsReq.body, FRAMEWORK_INDICATORS_SYSTEM);
+    expectSystemBlocks(indicatorsReq.body, KPI_SYSTEM);
+    expect(structureReq.body.output_config.effort).toBe('medium');
+    expect(indicatorsReq.body.output_config.effort).toBe('low');
     expect(structureReq.body.max_tokens).toBe(12_000);
-    expect(indicatorsReq.body.max_tokens).toBe(32_000);
+    expect(indicatorsReq.body.max_tokens).toBe(KPI_CALLS.batch.maxTokens);
     expect(structureReq.options).toEqual({ timeout: 180_000, maxRetries: 0 });
-    expect(indicatorsReq.options).toEqual({ timeout: 300_000, maxRetries: 0 });
+    expect(indicatorsReq.options).toEqual({ timeout: KPI_CALLS.batch.timeoutMs, maxRetries: 0 });
     // Enums survive the zod → JSON schema conversion.
     const structureSchema = structureReq.body.output_config.format.schema;
     expect(structureSchema.properties.documentFigures.items.properties.kind.enum).toEqual(['baseline', 'target']);
-    const indicatorItem = indicatorsReq.body.output_config.format.schema.properties.indicators.items.properties;
-    expect(indicatorItem.unit.enum).toEqual([...INDICATOR_UNITS]);
-    expect(indicatorItem.level.enum).toEqual([...FRAMEWORK_INDICATOR_LEVELS]);
-    expect(indicatorItem.intermediateTargets.items.properties.date.type).toBe('string');
-    // The project description was redacted; only checked document figures reach the indicator step.
+    const suggestionItem = indicatorsReq.body.output_config.format.schema.properties.suggestions.items.properties;
+    expect(suggestionItem.unit.enum).toEqual([...INDICATOR_UNITS]);
+    expect(suggestionItem.level.enum).toEqual([...FRAMEWORK_INDICATOR_LEVELS]);
+    // The project description was redacted; only checked document figures reach the indicator step, as DOCUMENT FACTS.
     expect(structureReq.body.messages[0].content).toContain('[phone removed]');
-    expect(indicatorsReq.body.messages[0].content).toContain('"value": "12,000"');
+    const indicatorPrompt: string = indicatorsReq.body.messages[0].content;
+    expect(indicatorPrompt).toContain('SUGGEST FOR\nG [impact]');
+    expect(indicatorPrompt).toMatch(/\[F\d+ target O1\.1\] proposal\.pdf: target "12,000" — "Result 1\.1: 12,000 people receive trucked drinking water for nine months"/);
+    expect(indicatorPrompt).not.toContain('80 ILS');
 
     // --- stored rows
     const stored = await prisma.framework.findUniqueOrThrow({
@@ -332,31 +340,32 @@ describe.skipIf(!hasTestDatabase)('AI services through the real client (fake SDK
     expect(stored).toMatchObject({ status: 'expert_review', aiModelUsed: MAIN_FALLBACK, generationError: null });
     // Goal, outcome, outputs and their activities.
     expect(stored.resultNodes.map(n => n.code).sort()).toEqual(['A1.1.1', 'A1.2.1', 'G', 'O1', 'O1.1', 'O1.2']);
-    expect(stored.indicators).toHaveLength(3);
+    // The four answered indicators plus AC-01, appended for this humanitarian project (rule 19).
+    expect(stored.indicators).toHaveLength(5);
+    expect(stored.indicators.every(i => i.provenance === 'ai_generated' && i.aiModel === MAIN_FALLBACK && i.promptVersion === KPI_PROMPT_VERSION)).toBe(true);
     const byText = (text: string) => stored.indicators.find(i => i.indicatorText.startsWith(text))!;
-    expect(byText('Average volume')).toMatchObject({
-      baselineValue: '6', baselineDate: new Date('2025-12-01'), targetValue: '15', unit: 'litres_per_person_per_day',
-      provenance: 'ai_generated', aiModel: MAIN_FALLBACK, promptVersion: FRAMEWORK_PROMPT_VERSION,
-    });
-    expect(byText('Number of people')).toMatchObject({ targetValue: '12,000', intermediateTargets: [expect.objectContaining({ date: '2026-03-31', value: '6,000' })] });
+    expect(byText('Average volume')).toMatchObject({ baselineValue: '6', baselineDate: null, targetValue: '15', unit: 'litres_per_person_per_day', libraryId: 'WA-01' });
+    expect(byText('Average volume').baselineMethod).toContain('(source: proposal.pdf)');
+    expect(byText('Number of people')).toMatchObject({ targetValue: '12,000', libraryId: 'WA-04', intermediateTargets: [] });
     // The invented 80 (a budget cell) is not kept.
     expect(byText('% of target households').targetValue).toBeNull();
     expect(byText('% of target households').targetJustification).toContain('was not found as a target in the project documents and was removed');
+    expect(stored.indicators.map(i => i.libraryId)).toContain('AC-01');
     expect((await prisma.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('framework_review');
 
     // --- AiCall rows: one per call, every attempt counted and priced at its own model
     const rows = await aiCalls(project.id);
     expect(rows).toHaveLength(2);
     const common = {
-      model: MAIN, promptVersion: FRAMEWORK_PROMPT_VERSION, systemPromptVersion: SHARED.version, status: 'success', stopReason: 'end_turn',
+      model: MAIN, systemPromptVersion: SHARED.version, status: 'success', stopReason: 'end_turn',
       errorType: null, attempts: 1, organizationId: fx.org.id, projectId: project.id,
     };
     expect(rows[0]).toMatchObject({
-      ...common, feature: 'framework.structure', servedModel: MAIN,
+      ...common, feature: 'framework.structure', promptVersion: FRAMEWORK_PROMPT_VERSION, servedModel: MAIN,
       inputTokens: 2210, outputTokens: 3180, cacheReadTokens: 0, cacheWriteTokens: 9814, estimatedCostUsd: STRUCTURE_COST,
     });
     expect(rows[1]).toMatchObject({
-      ...common, feature: 'framework.indicators', servedModel: MAIN_FALLBACK,
+      ...common, feature: 'framework.indicators', promptVersion: KPI_PROMPT_VERSION, servedModel: MAIN_FALLBACK,
       inputTokens: 8040, outputTokens: 7410, cacheReadTokens: 9814, cacheWriteTokens: 9814, estimatedCostUsd: INDICATORS_COST,
     });
   });
@@ -369,16 +378,20 @@ describe.skipIf(!hasTestDatabase)('AI services through the real client (fake SDK
       stop_reason: 'refusal',
       stop_details: { type: 'refusal', category: 'general_harms', explanation: null },
     };
-    const sdk = fakeSdk([rawMessage(MAIN, STRUCTURE_ANSWER, STRUCTURE_TOKENS), refusal]);
+    // The refused batch of four results is retried result by result (design 4.4); every retry is refused too.
+    const sdk = fakeSdk([rawMessage(MAIN, STRUCTURE_ANSWER, STRUCTURE_TOKENS), refusal, refusal, refusal, refusal, refusal]);
     configureAiClientForTests({ anthropic: sdk.client });
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
     await expect(generateFramework(framework.id, project.id)).rejects.toBeInstanceOf(AiRefusalError);
+    expect(sdk.sent).toHaveLength(6);
+    expect(sdk.sent.slice(2).every(req => req.body.max_tokens === KPI_CALLS.result.maxTokens)).toBe(true);
 
     const stored = await prisma.framework.findUniqueOrThrow({ where: { id: framework.id }, include: { indicators: true, resultNodes: true } });
     expect(stored.indicators).toEqual([]);
     expect(stored.resultNodes).toEqual([]);
-    expect(stored.generationError).toMatch(/declined/i);
+    expect(stored.generationError).toBe('The AI model declined the request (framework.indicators, category general_harms).');
 
     const status = await request(app).get(`/api/frameworks/${framework.id}/status`).set('Authorization', fx.adminAuth);
     expect(status.body).toEqual({ frameworkId: framework.id, status: 'failed', message: stored.generationError });
@@ -389,9 +402,9 @@ describe.skipIf(!hasTestDatabase)('AI services through the real client (fake SDK
     const rows = await aiCalls(project.id);
     expect(rows.map(r => [r.feature, r.status, r.stopReason, r.servedModel])).toEqual([
       ['framework.structure', 'success', 'end_turn', MAIN],
-      ['framework.indicators', 'refusal', 'refusal', MAIN],
+      ...Array.from({ length: 5 }, () => ['framework.indicators', 'refusal', 'refusal', MAIN]),
     ]);
-    // The declined request is still counted: 4020×2 + 9814×0.2 → $0.010003.
+    // A declined request is still counted: 4020×2 + 9814×0.2 → $0.010003.
     expect(rows[1]).toMatchObject({ errorType: 'AiRefusalError', inputTokens: 4020, outputTokens: 0, cacheReadTokens: 9814, estimatedCostUsd: 0.010003 });
   });
 

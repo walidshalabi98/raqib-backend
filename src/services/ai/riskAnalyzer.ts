@@ -37,10 +37,11 @@ export interface AtRiskIndicator {
 
 /**
  * Risk assessment of the at-risk and off-track indicators of the project's current reviewed
- * framework. The model (fast tier) adds a risk level, an analysis and actions; the trend comes from
- * the data whenever there are two comparable data points, and texts with numbers that were not sent
- * are replaced by the deterministic text. On any AI error every indicator gets the deterministic
- * assessment instead.
+ * framework, approved or not: a staff tool (GET /api/dashboard/projects/:id/risks refuses donor viewers;
+ * docs/SECURITY_SETUP.md §8.2), so it has no donor option. The model (fast tier) adds a risk
+ * level, an analysis and actions; the trend comes from the data whenever there are two comparable data
+ * points, and texts with numbers that were not sent are replaced by the deterministic text. On any AI
+ * error every indicator gets the deterministic assessment instead.
  */
 export async function analyzeProjectRisks(projectId: string): Promise<RiskAlert[]> {
   const project = await prisma.project.findUnique({

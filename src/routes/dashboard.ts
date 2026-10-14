@@ -6,6 +6,8 @@ import { hasStaffRole, STAFF_ROLES } from '../middleware/roles';
 import { AppError , asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { analyzeProjectRisks } from '../services/ai/riskAnalyzer';
+import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
+import { dataPointVisibilityWhere, indicatorVisibilityWhere } from '../services/indicators/visibility';
 import {
   donorDataPointWhere, donorReportWhere, isRespondentLevel, mergeDonorAreas, NOT_RESPONDENT_LEVEL_WHERE, RESPONDENT_LEVEL_WHERE,
   toDonorDataPoint, toDonorSurveyAggregates,
@@ -14,17 +16,20 @@ import {
 const router = Router();
 
 // The current framework of a project: the newest version whose AI generation did not fail.
-const CURRENT_FRAMEWORK = { where: { generationError: null }, orderBy: { version: 'desc' }, take: 1 } as const;
+const CURRENT_VERSION = { where: CURRENT_FRAMEWORK, orderBy: { version: 'desc' }, take: 1 } as const;
 
-// GET /api/projects/:id/dashboard — Aggregated dashboard data
+// GET /api/projects/:id/dashboard — Aggregated dashboard data. For donor viewers every figure (status and level
+// counts, trends, geographic counts, recent activity) comes from approved indicators and their data points only
+// (spec §A1; design section 4.7).
 router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
     include: {
       frameworks: {
-        ...CURRENT_FRAMEWORK,
+        ...CURRENT_VERSION,
         include: {
           indicators: {
+            where: indicatorVisibilityWhere(req.user),
             include: {
               // The 10 most recent rows the caller is shown one by one (donors: never KoboToolbox rows).
               dataPoints: {
@@ -91,14 +96,17 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
   // Geographic data (donors: rows they are shown one by one only, grouped by listed place)
   const geoData = await prisma.dataPoint.groupBy({
     by: ['geographicArea'],
-    where: { projectId: req.params.id, geographicArea: { not: null }, ...donorDataPointWhere(req.user) },
+    where: {
+      projectId: req.params.id, geographicArea: { not: null },
+      AND: [donorDataPointWhere(req.user), dataPointVisibilityWhere(req.user)],
+    },
     _count: { id: true },
   });
   const geographic = geoData.map(g => ({ area: g.geographicArea, dataPointCount: g._count.id }));
 
-  // Recent data points (donors: never respondent-level rows)
+  // Recent data points (donors: never respondent-level rows, and of approved indicators only)
   const recentData = await prisma.dataPoint.findMany({
-    where: { projectId: req.params.id, ...(!staff && NOT_RESPONDENT_LEVEL_WHERE) },
+    where: { projectId: req.params.id, AND: [staff ? {} : NOT_RESPONDENT_LEVEL_WHERE, dataPointVisibilityWhere(req.user)] },
     orderBy: { createdAt: 'desc' },
     take: 10,
     include: {
@@ -145,7 +153,9 @@ router.get('/projects/:id/dashboard', authenticate, asyncHandler(async (req: Req
 }));
 
 // GET /api/dashboard/overview — Org-level overview of the projects that are not archived (like GET /api/projects:
-// an archived project is hidden from the lists, and its indicators raise no alerts).
+// an archived project is hidden from the lists, and its indicators raise no alerts). Donor viewers: indicator counts
+// and off-track alerts from approved indicators only (spec §A1); the record counts (`dataPointCount` etc.) are not
+// filtered by approval, but count what donors can see (SECURITY_SETUP §8.3).
 router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const orgId = req.user!.organizationId;
 
@@ -153,9 +163,9 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
     where: { organizationId: orgId, status: { not: 'archived' } },
     include: {
       frameworks: {
-        ...CURRENT_FRAMEWORK,
+        ...CURRENT_VERSION,
         include: {
-          indicators: { select: { id: true, indicatorText: true, status: true } },
+          indicators: { where: indicatorVisibilityWhere(req.user), select: { id: true, indicatorText: true, status: true } },
         },
       },
       // Counts of what the caller can see: donors count published reports only and no KoboToolbox rows.
@@ -211,7 +221,8 @@ router.get('/overview', authenticate, asyncHandler(async (req: Request, res: Res
 }));
 
 // GET /api/dashboard/projects/:id/risks — AI Risk Analysis (staff only: it runs a model on every request, and its
-// output is not reviewed; staff share their conclusions in reports)
+// output is not reviewed; staff share their conclusions in reports). Donor viewers get 403, which supersedes the
+// Phase 4 approved-only donor analysis (design SDA-06); staff analyse every indicator of the current framework.
 router.get('/projects/:id/risks', authenticate, authorize(...STAFF_ROLES), aiLimiter, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 

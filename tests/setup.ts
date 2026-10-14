@@ -26,3 +26,10 @@ vi.mock('../src/services/ai/qualitativeCoder', () => ({ codeQualitativeEntry: vi
 vi.mock('../src/services/ai/reportNarrative', () => ({ generateReportNarrative: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('../src/services/ai/assessmentGenerator', () => ({ generateAutoAssessment: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('../src/services/ai/riskAnalyzer', () => ({ analyzeProjectRisks: vi.fn().mockResolvedValue([]) }));
+// The KPI pipeline (design 7.5): route tests never run it; runKpiPipeline answers an empty result unless a test overrides
+// it (mockResolvedValueOnce / mockImplementationOnce). importOriginal keeps KpiPipelineError, emptyPipelineResult and every
+// other export, so instanceof checks keep working. Tests that run the real pipeline call vi.unmock on this module.
+vi.mock('../src/services/kpi/pipeline', async importOriginal => {
+  const original = await importOriginal<typeof import('../src/services/kpi/pipeline')>();
+  return { ...original, runKpiPipeline: vi.fn(async () => original.emptyPipelineResult()) };
+});

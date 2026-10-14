@@ -12,12 +12,8 @@ import {
   isPeopleLevelIndicator,
   referenceSheetGaps,
 } from '../src/services/ai/frameworkNormalize';
-import {
-  FRAMEWORK_INDICATORS_SCHEMA,
-  FRAMEWORK_INDICATORS_SYSTEM,
-  FRAMEWORK_STRUCTURE_SYSTEM,
-  PROJECT_STRUCTURE_SCHEMA,
-} from '../src/services/ai/prompts/framework';
+import { FRAMEWORK_STRUCTURE_SYSTEM, PROJECT_STRUCTURE_SCHEMA } from '../src/services/ai/prompts/framework';
+import { KPI_CALLS, KPI_PROMPT_VERSION, KPI_SUGGESTIONS_SCHEMA, KPI_SYSTEM, type KpiRawSuggestion } from '../src/services/ai/prompts/kpi';
 import { redactPersonalData } from '../src/services/ai/redact';
 import { seedLibrary } from '../src/services/library/seed';
 import {
@@ -43,13 +39,15 @@ import { createOrgFixture, hasTestDatabase, OrgFixture, resetDatabase } from './
  * The project and the library match the dev seed (prisma/seed.ts: the DG ECHO project without a
  * framework, and knowledge/indicator-library.json). The dev seed has no document, so this test adds a
  * made-up proposal to also run the structure step; `npm run ai:smoke` on the seed project runs the
- * indicator step only. The AI client is mocked with realistic, schema-valid answers in which some fields
- * are deliberately empty and some figures invented; everything after the model call (normalisation,
- * rules, storage) is the real code. The real-API run is scripts/ai-smoke.ts.
+ * indicator step only. Since Phase 4 the indicator step is the KPI pipeline (design section 4.6, D19): its
+ * batches get realistic, schema-valid KPI answers in which some fields are deliberately empty and some
+ * figures invented; everything after the model call (retrieval, validation, drafts, storage) is the real
+ * code. The real-API run is scripts/ai-smoke.ts.
  */
 
-// tests/setup.ts mocks the generator for route tests; this file runs the real one.
+// tests/setup.ts mocks the generator and the KPI pipeline for route tests; this file runs the real ones.
 vi.unmock('../src/services/ai/frameworkGenerator');
+vi.unmock('../src/services/kpi/pipeline');
 
 const { generateStructured } = vi.hoisted(() => ({ generateStructured: vi.fn() }));
 vi.mock('../src/services/ai/client', () => ({
@@ -72,9 +70,7 @@ const PROPOSAL = [
 ].join('\n\n');
 const PERSONAL_DATA = ['0599 123 456', 'coordinator@example.org', '401234567'];
 
-const EMPTY_CALCULATION = { numerator: '', denominator: '', formula: '', rounding: '' };
 const PERCENT = 'numerator ÷ denominator × 100';
-const PERCENT_CALCULATION = { formula: PERCENT, rounding: '1 decimal place' };
 
 const STRUCTURE_ANSWER = {
   goal: {
@@ -119,101 +115,107 @@ const STRUCTURE_ANSWER = {
   ],
 };
 
-/** A complete indicator answer; each test indicator overrides what it needs. */
-function indicator(overrides: Record<string, unknown>): Record<string, unknown> {
+/** One suggestion of a KPI answer (KPI_SUGGESTION_SCHEMA: the spec's fields only, D22); each test suggestion overrides what it needs. */
+function suggestion(overrides: Partial<KpiRawSuggestion>): KpiRawSuggestion {
   return {
-    resultCode: 'O1', level: 'outcome', indicatorText: '', indicatorTextAr: '', libraryId: '', standardReferenceCode: '', definition: '',
-    unit: 'number', calculation: EMPTY_CALCULATION, direction: 'increase', disaggregation: [], dataCollectionMethod: 'document_review',
-    frequency: 'quarterly', meansOfVerification: '', baselineValue: '', baselineBasis: 'none', baselineDate: '', baselineMethod: '', targetValue: '',
-    targetBasis: 'none', targetJustification: '', intermediateTargets: [], assumptions: '', responsibility: '', phases: ['baseline', 'midterm', 'endline'],
-    startDate: '2026-01-15', endDate: '2026-12-31', milestones: [{ label: 'Baseline data collection', date: '2026-02-15', completed: false }],
-    aiRationale: 'Measures the result with a standard, verifiable source.',
+    resultCode: 'O1', level: 'outcome', libraryId: null, isCustom: true, customReason: 'No library candidate measures this result.', name: '', nameAr: '',
+    definition: '', unit: 'number', numerator: '', denominator: '', direction: 'increase', disaggregation: [], method: 'document_review',
+    frequency: 'quarterly', meansOfVerification: '', baselineSuggestion: '', baselineBasis: 'none', targetSuggestion: '', targetBasis: 'method_only',
+    standardReferenceCode: null, rationale: 'Measures the result with a standard, verifiable source.', qualityNotes: [], confidence: 'medium',
     ...overrides,
   };
 }
 
-const INDICATORS_ANSWER = {
-  indicators: [
-    // 0. Impact, from secondary data; target only as a method; a planned baseline date.
-    indicator({
-      resultCode: 'G', level: 'impact', indicatorText: 'Prevalence of acute watery diarrhoea among children under five in target areas',
-      indicatorTextAr: 'معدل انتشار الإسهال المائي الحاد بين الأطفال دون سن الخامسة في المناطق المستهدفة',
-      definition: 'Children under five reported with acute watery diarrhoea in the two weeks before data collection.', unit: 'percent',
-      calculation: { numerator: 'Children under five with acute watery diarrhoea in the past two weeks', denominator: 'Children under five in surveyed households', ...PERCENT_CALCULATION },
-      direction: 'decrease', disaggregation: ['sex', 'age', 'location'], dataCollectionMethod: 'secondary_data', frequency: 'baseline_endline',
-      meansOfVerification: 'Health cluster surveillance data and Ministry of Health reports for Khan Younis and Deir al-Balah',
-      baselineDate: '2026-01-31', baselineMethod: 'Health cluster surveillance at project start (January 2026)', targetBasis: 'method_only',
-      targetJustification: 'baseline − 20%, set once the baseline is known', assumptions: 'Surveillance data remain available for the target areas.',
-      responsibility: 'M&E Manager',
-    }),
-    // 1. Library entry with a document baseline (measured in December 2025) and the Sphere threshold of the linked entry.
-    indicator({
-      resultCode: 'O1', indicatorText: 'Average volume of water available per person per day in target households', libraryId: 'WA-01',
-      indicatorTextAr: 'متوسط كمية المياه المتاحة للفرد يوميًا في الأسر المستهدفة', standardReferenceCode: 'Sphere',
-      definition: 'Litres of water available for drinking, cooking and hygiene per person per day, from all sources.', unit: 'litres_per_person_per_day',
-      disaggregation: ['location', 'displacement_status'], dataCollectionMethod: 'hh_survey', frequency: 'quarterly',
-      meansOfVerification: 'Household survey water module (n≈380) and water-trucking delivery logs',
-      baselineValue: '6', baselineBasis: 'document', baselineDate: '2025-12-01', baselineMethod: 'Rapid needs assessment, December 2025',
-      targetValue: '15', targetBasis: 'standard_threshold', targetJustification: 'Sphere minimum for drinking, cooking and hygiene',
-      assumptions: 'Water sources and fuel for trucking remain accessible; remote phone survey if field access is restricted.', responsibility: 'WASH Officer',
-    }),
-    // 2. Deliberately incomplete: no Arabic name, definition, calculation parts, baseline date or method, or assumptions;
-    //    an invented target that only matches a budget cell ("80 ILS per interview").
-    indicator({
-      resultCode: 'O1', indicatorText: '% of target households with a handwashing facility with soap and water observed', libraryId: 'WA-05',
-      unit: 'percent', calculation: EMPTY_CALCULATION, dataCollectionMethod: 'observation', frequency: 'biannual',
-      meansOfVerification: 'Household observation checklist during the post-distribution monitoring survey',
-      targetValue: '80', targetBasis: 'document', targetJustification: 'Target of 80 agreed by the team', responsibility: 'WASH Officer',
-    }),
-    // 3. Output count from the document, with the document's intermediate target; the library entry adds sex disaggregation. Complete.
-    indicator({
-      resultCode: 'O1.1', level: 'output', indicatorText: 'Number of people receiving trucked drinking water', libraryId: 'WA-04',
-      indicatorTextAr: 'عدد الأشخاص الذين يحصلون على مياه الشرب المنقولة بالصهاريج',
-      definition: 'People in households registered at a served delivery point who received water at least once in the month.',
-      disaggregation: ['age', 'displacement_status'], frequency: 'monthly', meansOfVerification: 'Water-trucking delivery logs and delivery-point registers',
-      baselineDate: '2026-01-01', baselineMethod: 'Zero at start: new service', targetValue: '12,000', targetBasis: 'document',
-      targetJustification: 'Result 1.1 of the proposal', intermediateTargets: [{ date: '2026-03-31', value: '6,000' }],
-      assumptions: 'Crossings remain open for fuel and spare parts.', responsibility: 'Field Team',
-    }),
-    // 4. No Arabic name, a generic means of verification, no responsibility and an invented intermediate target.
-    indicator({
-      resultCode: 'O1.2', level: 'output', indicatorText: 'Number of hygiene kits distributed to displaced households',
-      definition: 'Kits signed for by the receiving household.', meansOfVerification: 'Project reports', baselineDate: '2026-01-01',
-      baselineMethod: 'Zero at start: new activity', targetValue: '2,400', targetBasis: 'document', targetJustification: 'Result 1.2 of the proposal',
-      intermediateTargets: [{ date: '2026-06-30', value: '1,200' }], assumptions: 'Kits clear customs on time.',
-    }),
-    // 5. Unknown library id and an invented baseline (its date goes with it); the target is a method.
-    indicator({
-      resultCode: 'O2', indicatorText: '% of assisted households reporting they can meet their basic needs', libraryId: 'CA-99',
-      indicatorTextAr: 'نسبة الأسر المستفيدة التي تفيد بقدرتها على تلبية احتياجاتها الأساسية',
-      definition: 'Households reporting they can meet all or most of their basic needs as they define them.', unit: 'percent',
-      calculation: { numerator: 'Households reporting they meet all or most basic needs', denominator: 'Households surveyed', ...PERCENT_CALCULATION },
-      disaggregation: ['sex_of_household_head', 'displacement_status'], dataCollectionMethod: 'hh_survey', frequency: 'per_cohort',
-      meansOfVerification: 'Post-distribution monitoring survey (phone), sample of assisted households',
-      baselineValue: '35%', baselineBasis: 'document', baselineDate: '2026-02-01', baselineMethod: 'Baseline phone survey before the first cash round',
-      targetBasis: 'method_only', targetJustification: 'baseline + 15 percentage points', assumptions: 'Market prices stay within the transfer value.',
-      responsibility: 'Cash Officer',
-    }),
-    // 6. Linked to an activity code: it measures the activity's output. A target figure used as a baseline (wrong kind).
-    indicator({
-      resultCode: 'A2.1.2', level: 'output', indicatorText: 'Number of households receiving multipurpose cash transfers',
-      indicatorTextAr: 'عدد الأسر التي تتلقى تحويلات نقدية متعددة الأغراض',
-      definition: 'Households that received at least one full transfer.', disaggregation: ['sex_of_household_head'],
-      meansOfVerification: 'Financial service provider payment reconciliation reports', baselineValue: '1,800', baselineBasis: 'document',
-      baselineMethod: 'Zero at start: new activity', targetValue: '1,800', targetBasis: 'document', targetJustification: 'Result 2.1 of the proposal',
-      assumptions: 'The payment network stays operational.', responsibility: 'Cash Officer',
-    }),
-    // 7. Accountability to affected people (humanitarian project); the model left the Arabic name empty.
-    indicator({
-      resultCode: 'O2', indicatorText: '% of assisted people who know how to give feedback or make a complaint', libraryId: 'AC-01', standardReferenceCode: 'CHS 5',
-      definition: 'Assisted people who can name at least one feedback or complaint channel of the project.', unit: 'percent',
-      calculation: { numerator: 'Respondents naming at least one channel', denominator: 'Respondents surveyed', ...PERCENT_CALCULATION },
-      disaggregation: ['sex', 'age', 'disability'], dataCollectionMethod: 'hh_survey', frequency: 'biannual',
-      meansOfVerification: 'Post-distribution monitoring survey, accountability module', baselineDate: '2026-04-15',
-      baselineMethod: 'First post-distribution monitoring round', targetBasis: 'none', assumptions: 'Respondents feel safe answering by phone.',
-      responsibility: 'MEAL Officer',
-    }),
-  ],
+/** A library-linked suggestion. */
+const library = (libraryId: string, overrides: Partial<KpiRawSuggestion>) => suggestion({ libraryId, isCustom: false, customReason: '', ...overrides });
+
+/** The model's suggestions for every result; each KPI batch gets those of its own results (see mockAi). */
+const SUGGESTIONS: KpiRawSuggestion[] = [
+  // 0. Impact, from secondary data; target only as a method.
+  suggestion({
+    resultCode: 'G', level: 'impact', name: 'Prevalence of acute watery diarrhoea among children under five in target areas',
+    nameAr: 'معدل انتشار الإسهال المائي الحاد بين الأطفال دون سن الخامسة في المناطق المستهدفة',
+    definition: 'Children under five reported with acute watery diarrhoea in the two weeks before data collection.', unit: 'percent',
+    numerator: 'Children under five with acute watery diarrhoea in the past two weeks', denominator: 'Children under five in surveyed households',
+    direction: 'decrease', disaggregation: ['sex', 'age', 'location'], method: 'secondary_data', frequency: 'baseline_endline',
+    meansOfVerification: 'Health cluster surveillance data and Ministry of Health reports for Khan Younis and Deir al-Balah',
+    targetSuggestion: 'baseline - 20 percentage points, set once the baseline is known', targetBasis: 'method_only', confidence: 'high',
+  }),
+  // 1. Library entry with a document baseline and the Sphere threshold of the linked entry.
+  library('WA-01', {
+    name: 'Average volume of water available per person per day in target households',
+    nameAr: 'متوسط كمية المياه المتاحة للفرد يوميًا في الأسر المستهدفة', standardReferenceCode: 'Sphere',
+    definition: 'Litres of water available for drinking, cooking and hygiene per person per day, from all sources.', unit: 'litres_per_person_per_day',
+    disaggregation: ['location', 'displacement_status'], method: 'hh_survey', frequency: 'quarterly',
+    meansOfVerification: 'Household survey water module and water-trucking delivery logs',
+    baselineSuggestion: '6', baselineBasis: 'document', targetSuggestion: '15', targetBasis: 'standard_threshold', confidence: 'high',
+  }),
+  // 2. Deliberately incomplete: no Arabic name (the linked entry's is used), definition or calculation parts; an invented
+  //    target that only matches a budget cell ("80 ILS per interview").
+  library('WA-05', {
+    name: '% of target households with a handwashing facility with soap and water observed', unit: 'percent',
+    method: 'observation', frequency: 'biannual', meansOfVerification: 'Household observation checklist during the post-distribution monitoring survey',
+    targetSuggestion: '80', targetBasis: 'document',
+  }),
+  // 3. Output count from the document; the library entry adds sex disaggregation.
+  library('WA-04', {
+    resultCode: 'O1.1', level: 'output', name: 'Number of people receiving trucked drinking water',
+    nameAr: 'عدد الأشخاص الذين يحصلون على مياه الشرب المنقولة بالصهاريج',
+    definition: 'People in households registered at a served delivery point who received water at least once in the month.',
+    disaggregation: ['age', 'displacement_status'], frequency: 'monthly', meansOfVerification: 'Water-trucking delivery logs and delivery-point registers',
+    targetSuggestion: '12,000', targetBasis: 'document', confidence: 'high',
+  }),
+  // 4. A custom indicator without an Arabic name and with a generic means of verification.
+  suggestion({
+    resultCode: 'O1.2', level: 'output', name: 'Number of hygiene kits distributed to displaced households',
+    definition: 'Kits signed for by the receiving household.', meansOfVerification: 'Project reports', targetSuggestion: '2,400', targetBasis: 'document',
+  }),
+  // 5. Unknown library id and an invented baseline; the target is a method.
+  library('CA-99', {
+    resultCode: 'O2', name: '% of assisted households reporting they can meet their basic needs',
+    nameAr: 'نسبة الأسر المستفيدة التي تفيد بقدرتها على تلبية احتياجاتها الأساسية',
+    definition: 'Households reporting they can meet all or most of their basic needs as they define them.', unit: 'percent',
+    numerator: 'Households reporting they meet all or most basic needs', denominator: 'Households surveyed',
+    disaggregation: ['sex_of_household_head', 'displacement_status'], method: 'hh_survey', frequency: 'per_cohort',
+    meansOfVerification: 'Post-distribution monitoring survey (phone), sample of assisted households',
+    baselineSuggestion: '35%', baselineBasis: 'document', targetSuggestion: 'baseline + 15 percentage points', targetBasis: 'method_only',
+  }),
+  // 6. A target figure used as a baseline (wrong kind): the target is kept, the baseline removed.
+  suggestion({
+    resultCode: 'O2.1', level: 'output', name: 'Number of households receiving multipurpose cash transfers',
+    nameAr: 'عدد الأسر التي تتلقى تحويلات نقدية متعددة الأغراض',
+    definition: 'Households that received at least one full transfer.', disaggregation: ['sex_of_household_head'],
+    meansOfVerification: 'Financial service provider payment reconciliation reports', baselineSuggestion: '1,800', baselineBasis: 'document',
+    targetSuggestion: '1,800', targetBasis: 'document',
+  }),
+  // 7. Accountability to affected people (humanitarian project); the model left the Arabic name empty.
+  library('AC-01', {
+    resultCode: 'O2', name: '% of assisted people who know how to give feedback or make a complaint', standardReferenceCode: 'CHS 5',
+    definition: 'Assisted people who can name at least one feedback or complaint channel of the project.', unit: 'percent',
+    numerator: 'Respondents naming at least one channel', denominator: 'Respondents surveyed',
+    disaggregation: ['sex', 'age', 'disability'], method: 'hh_survey', frequency: 'biannual',
+    meansOfVerification: 'Post-distribution monitoring survey, accountability module', targetBasis: 'none',
+  }),
+  // 8. Linked to an activity code: no result of the run, so it is dropped (rule x1).
+  suggestion({
+    resultCode: 'A2.1.2', level: 'output', name: 'Number of cash rounds delivered', nameAr: 'عدد جولات المساعدات النقدية المنفذة',
+    meansOfVerification: 'Payment reconciliation reports',
+  }),
+];
+
+/** The result codes of a KPI call: the lines of its SUGGEST FOR section. */
+function suggestForCodes(prompt: string): string[] {
+  const section = prompt.split('\n\n').find(part => part.startsWith('SUGGEST FOR\n')) ?? '';
+  return section.split('\n').slice(1).flatMap(line => {
+    const match = /^(.+?) \[(impact|outcome|output)\]:/.exec(line);
+    return match ? [match[1]] : [];
+  });
+}
+
+/** The KPI answer for one indicator-step call: the suggestions of the call's own results. */
+const INDICATORS_ANSWER = (params: AnyParams) => {
+  const codes = new Set(suggestForCodes(params.messages[0].content));
+  return { suggestions: SUGGESTIONS.filter(s => codes.has(s.resultCode)), frameworkWarnings: [] };
 };
 
 type AnyParams = GenerateStructuredParams<any>;
@@ -222,7 +224,7 @@ type AnyParams = GenerateStructuredParams<any>;
  * Mocks generateStructured per feature. Like the real client, answers are validated with the call's
  * schema, and each call writes one AiCall row (numbers and ids only), which the smoke report reads.
  */
-function mockAi(replies: Record<string, (() => Promise<unknown>) | unknown>) {
+function mockAi(replies: Record<string, ((params: AnyParams) => unknown) | unknown>) {
   generateStructured.mockImplementation(async (params: AnyParams): Promise<StructuredResult<unknown>> => {
     if (!(params.feature in replies)) throw new Error(`unexpected AI call: ${params.feature}`);
     const reply = replies[params.feature];
@@ -237,7 +239,7 @@ function mockAi(replies: Record<string, (() => Promise<unknown>) | unknown>) {
       });
     let data: unknown;
     try {
-      data = typeof reply === 'function' ? await (reply as () => Promise<unknown>)() : reply;
+      data = typeof reply === 'function' ? await (reply as (params: AnyParams) => unknown)(params) : reply;
     } catch (err) {
       if (err instanceof AiRefusalError) await log('refusal', { inputTokens: 4200, outputTokens: 12, cacheReadTokens: 9800, cacheWriteTokens: 0 });
       throw err;
@@ -257,6 +259,8 @@ function mockAi(replies: Record<string, (() => Promise<unknown>) | unknown>) {
 
 const calls = () => generateStructured.mock.calls.map(c => c[0] as AnyParams);
 const promptOf = (feature: string) => calls().find(p => p.feature === feature)!.messages[0].content;
+/** Every indicator-step prompt (one per KPI batch), joined. */
+const indicatorPrompts = () => calls().filter(p => p.feature === 'framework.indicators').map(p => p.messages[0].content).join('\n\n');
 
 /** Resets the database and creates an organisation, the seed library and the dev seed's generation project with its proposal. */
 async function seedProject(): Promise<{ fx: OrgFixture; projectId: string }> {
@@ -308,32 +312,35 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
     const { generateFramework } = await vi.importActual<typeof import('../src/services/ai/frameworkGenerator')>('../src/services/ai/frameworkGenerator');
     await generateFramework(framework.id, projectId);
 
-    // Two main-tier structured calls with the framework prompt version and ids for cost attribution.
-    expect(calls().map(c => c.feature)).toEqual(['framework.structure', 'framework.indicators']);
+    // The structure call, then the KPI pipeline's two batches: G with O1 and its outputs, then O2 with its output.
+    expect(calls().map(c => c.feature)).toEqual(['framework.structure', 'framework.indicators', 'framework.indicators']);
+    expect(calls().slice(1).map(c => suggestForCodes(c.messages[0].content))).toEqual([['G', 'O1', 'O1.1', 'O1.2'], ['O2', 'O2.1']]);
     const context = { organizationId: fx.org.id, projectId };
     expect(calls()[0]).toMatchObject({
       model: 'main', effort: 'medium', maxTokens: 12_000, timeoutMs: 180_000, schema: PROJECT_STRUCTURE_SCHEMA,
       system: FRAMEWORK_STRUCTURE_SYSTEM, promptVersion: 'framework-v4', context,
     });
-    expect(calls()[1]).toMatchObject({
-      model: 'main', effort: 'medium', maxTokens: 32_000, timeoutMs: 300_000, schema: FRAMEWORK_INDICATORS_SCHEMA,
-      system: FRAMEWORK_INDICATORS_SYSTEM, promptVersion: 'framework-v4', context,
-    });
+    for (const call of calls().slice(1)) {
+      expect(call).toMatchObject({
+        model: 'main', effort: 'low', maxTokens: KPI_CALLS.batch.maxTokens, timeoutMs: KPI_CALLS.batch.timeoutMs, schema: KPI_SUGGESTIONS_SCHEMA,
+        system: KPI_SYSTEM, promptVersion: KPI_PROMPT_VERSION, context,
+      });
+    }
 
     // Privacy: the legacy document is redacted before it reaches any prompt.
     for (const value of PERSONAL_DATA) {
       expect(promptOf('framework.structure')).not.toContain(value);
-      expect(promptOf('framework.indicators')).not.toContain(value);
+      expect(indicatorPrompts()).not.toContain(value);
     }
     expect(promptOf('framework.structure')).toContain('[phone removed]');
-    // Invented figures and dates are dropped before the indicator step; the documented ones are passed on.
-    expect(promptOf('framework.indicators')).toContain('"value": "12,000"');
-    expect(promptOf('framework.indicators')).toContain('"value": "6,000"');
-    expect(promptOf('framework.indicators')).not.toContain('70%');
-    expect(promptOf('framework.indicators')).not.toContain('"value": "15"');
-    expect(promptOf('framework.indicators')).not.toContain('documentFigures is empty');
-    expect(promptOf('framework.indicators')).toContain('WA-01 [outcome]');
-    expect(promptOf('framework.indicators')).toContain('AC-01 [outcome]');
+    // Invented figures and dates are dropped before the indicator step; the documented ones are passed on as DOCUMENT FACTS.
+    expect(indicatorPrompts()).toContain('Result 1.1: 12,000 people receive trucked drinking water for nine months');
+    expect(indicatorPrompts()).toContain('(6,000 by the end of March 2026)');
+    expect(indicatorPrompts()).not.toContain('70%');
+    expect(indicatorPrompts()).not.toContain('the first on 15 March 2026');
+    expect(indicatorPrompts()).not.toContain('none: no document values are available');
+    expect(indicatorPrompts()).toContain('WA-01 [outcome]');
+    expect(indicatorPrompts()).toContain('AC-01 [outcome]');
 
     // Results chain: goal, outcomes, outputs and activities (the blank activity is dropped).
     const nodes = await prisma.resultNode.findMany({ where: { frameworkId: framework.id } });
@@ -349,7 +356,7 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
       const label = i.indicatorText;
       const gaps = referenceSheetGaps(i);
       // Provenance
-      expect(i, label).toMatchObject({ provenance: 'ai_generated', aiModel: SERVED_MODEL, promptVersion: 'framework-v4', isApproved: false });
+      expect(i, label).toMatchObject({ provenance: 'ai_generated', aiModel: SERVED_MODEL, promptVersion: KPI_PROMPT_VERSION, isApproved: false });
       expect(i.level, label).not.toBe('activity');
       expect(i.resultId, label).not.toBeNull();
       // Every new reference-sheet field is filled or explicitly "to be confirmed".
@@ -368,78 +375,79 @@ describe.skipIf(!hasTestDatabase)('Phase 3 acceptance: framework generation on t
       }
       // The Arabic name is never invented: an empty one is a listed gap.
       expect(Boolean(i.indicatorTextAr) || gaps.includes('indicatorTextAr'), `${label}: Arabic name`).toBe(true);
-      // Baseline date: a date, or "Baseline date: to be confirmed." at the end of the baseline method.
-      expect(i.baselineDate !== null || i.baselineMethod!.endsWith(BASELINE_DATE_TO_BE_CONFIRMED), `${label}: baseline date`).toBe(true);
-      // Intermediate targets: document values, or "to be confirmed" at the end of the justification.
-      const intermediate = (i.intermediateTargets ?? []) as Array<{ date: string; value: string }>;
-      expect(intermediate.length > 0 || i.targetJustification!.endsWith(INTERMEDIATE_TARGETS_TO_BE_CONFIRMED), `${label}: intermediate targets`).toBe(true);
+      // D22: the model proposes no baseline date, intermediate targets, assumptions or responsibility; the server marks them.
+      expect(i.baselineDate, label).toBeNull();
+      expect(i.baselineMethod!.endsWith(BASELINE_DATE_TO_BE_CONFIRMED), `${label}: baseline date`).toBe(true);
+      expect(i.targetJustification!.endsWith(INTERMEDIATE_TARGETS_TO_BE_CONFIRMED), `${label}: intermediate targets`).toBe(true);
+      expect(i, label).toMatchObject({ assumptions: TO_BE_CONFIRMED, responsibility: TO_BE_CONFIRMED });
+      // The indicator dates are the project dates (m15).
+      expect(i, label).toMatchObject({ startDate: new Date('2026-01-01'), endDate: new Date('2026-12-31') });
       // Never invented: every kept value is written in the document or in the linked library entry.
       if (i.baselineValue) expect(appearsInDocuments(i.baselineValue, [redacted]), `${label}: baseline`).toBe(true);
       if (i.targetValue && i.libraryId !== 'WA-01') expect(appearsInDocuments(i.targetValue, [redacted]), `${label}: target`).toBe(true);
-      for (const t of intermediate) expect(appearsInDocuments(t.value, [redacted]), `${label}: intermediate target`).toBe(true);
     }
 
-    const [impact, water, handwashing, trucked, kits, basicNeeds, cash, feedback] = indicators;
+    // Chain order (level, then sibling order): the goal, the outcomes O1 and O2, then the outputs.
+    const codeOf = (resultId: string | null) => nodes.find(n => n.id === resultId)?.code;
+    expect(indicators.map(i => [codeOf(i.resultId), i.libraryId])).toEqual([
+      ['G', null], ['O1', 'WA-01'], ['O1', 'WA-05'], ['O2', 'AC-01'], ['O2', null], ['O1.1', 'WA-04'], ['O2.1', null], ['O1.2', null],
+    ]);
+    const [impact, water, handwashing, feedback, basicNeeds, trucked, cash, kits] = indicators;
     const gaps = Object.fromEntries(indicators.map(i => [i.indicatorText, referenceSheetGaps(i)]));
-
-    // Only the indicator with a documented intermediate target is complete; the rest are marked "to be confirmed".
+    // What the officer still has to fill or confirm. Since Phase 4 the model no longer proposes assumptions, responsibility,
+    // baseline method or date, intermediate targets or a percentage's rounding (D19, D22): the server marks them.
+    const serverMarked = ['intermediateTargets', 'assumptions', 'responsibility'];
     expect(gaps).toEqual({
-      [impact.indicatorText]: ['intermediateTargets'],
-      [water.indicatorText]: ['intermediateTargets'],
-      [handwashing.indicatorText]: ['indicatorTextAr', 'definition', 'calculation', 'baselineDate', 'baselineMethod', 'intermediateTargets', 'assumptions'],
-      [trucked.indicatorText]: [],
-      [kits.indicatorText]: ['indicatorTextAr', 'meansOfVerification', 'intermediateTargets', 'responsibility'],
-      [basicNeeds.indicatorText]: ['baselineDate', 'intermediateTargets'],
-      [cash.indicatorText]: ['intermediateTargets'],
-      [feedback.indicatorText]: ['indicatorTextAr', 'intermediateTargets'],
+      [impact.indicatorText]: ['calculation', 'baselineDate', 'baselineMethod', ...serverMarked],
+      [water.indicatorText]: ['baselineDate', ...serverMarked],
+      [handwashing.indicatorText]: ['definition', 'calculation', 'baselineDate', 'baselineMethod', ...serverMarked],
+      [feedback.indicatorText]: ['calculation', 'baselineDate', 'baselineMethod', ...serverMarked],
+      [basicNeeds.indicatorText]: ['calculation', 'baselineDate', 'baselineMethod', ...serverMarked],
+      [trucked.indicatorText]: ['baselineMethod', ...serverMarked],
+      [cash.indicatorText]: ['baselineMethod', ...serverMarked],
+      [kits.indicatorText]: ['indicatorTextAr', 'meansOfVerification', 'baselineMethod', ...serverMarked],
     });
+    // An empty Arabic name is taken from the linked library entry (rule x3), never invented for a custom indicator.
+    expect(handwashing.indicatorTextAr).toMatch(/[\u0600-\u06FF]/);
+    expect(feedback.indicatorTextAr).toMatch(/[\u0600-\u06FF]/);
     expect(handwashing).toMatchObject({
-      indicatorTextAr: null, definition: TO_BE_CONFIRMED, assumptions: TO_BE_CONFIRMED, baselineDate: null,
-      baselineMethod: `${TO_BE_CONFIRMED}. ${BASELINE_DATE_TO_BE_CONFIRMED}`,
+      definition: TO_BE_CONFIRMED, baselineMethod: `${TO_BE_CONFIRMED}. ${BASELINE_DATE_TO_BE_CONFIRMED}`,
       calculation: { numerator: TO_BE_CONFIRMED, denominator: TO_BE_CONFIRMED, formula: PERCENT, rounding: TO_BE_CONFIRMED },
     });
-    expect(kits).toMatchObject({ indicatorTextAr: null, meansOfVerification: TO_BE_CONFIRMED, responsibility: TO_BE_CONFIRMED, disaggregation: ['sex'] });
-    expect(impact).toMatchObject({ baselineDate: new Date('2026-01-31'), baselineMethod: 'Health cluster surveillance at project start (January 2026)' });
-    expect(impact.calculation).toMatchObject({ rounding: '1 decimal place' });
+    // Kits are counted, not people: rule 7 adds sex only when the counted noun is people (AI-5 re-check).
+    expect(kits).toMatchObject({ indicatorTextAr: null, meansOfVerification: TO_BE_CONFIRMED, disaggregation: [] });
 
     // Document values are kept when they are verified figures of the same kind, and cited; the standard threshold comes from the linked entry.
     expect(water).toMatchObject({
-      baselineValue: '6', baselineDate: new Date('2025-12-01'), baselineMethod: `Rapid needs assessment, December 2025 (source: ${DOCUMENT_NAME})`,
-      targetValue: '15', libraryId: 'WA-01', intermediateTargets: null,
+      baselineValue: '6', baselineMethod: `Baseline taken from the project documents (source: ${DOCUMENT_NAME}). ${BASELINE_DATE_TO_BE_CONFIRMED}`,
+      targetValue: '15', libraryId: 'WA-01', intermediateTargets: [],
       standardReferenceCode: 'Sphere Water supply standard — minimum 15 l/p/d (aim for 20)', disaggregation: ['sex', 'location', 'displacement_status'],
     });
     expect(water.targetJustification).toMatch(/^Proposed standard threshold \(Sphere Water supply standard.* — confirm it applies to this project\. Intermediate targets: to be confirmed after the baseline\.$/);
     expect(trucked).toMatchObject({
-      targetValue: '12,000', libraryId: 'WA-04', baselineDate: new Date('2026-01-01'), intermediateTargets: [{ date: '2026-03-31', value: '6,000' }],
-      targetJustification: `Result 1.1 of the proposal (source: ${DOCUMENT_NAME}). Intermediate targets taken from the project documents (source: ${DOCUMENT_NAME}).`,
+      targetValue: '12,000', libraryId: 'WA-04', intermediateTargets: [],
+      targetJustification: `Target taken from the project documents (source: ${DOCUMENT_NAME}). ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}`,
       standardReferenceCode: 'EU GERF 2.38', disaggregation: ['sex', 'age', 'displacement_status'],
     });
-    expect(kits).toMatchObject({
-      targetValue: '2,400', intermediateTargets: null,
-      targetJustification: `Result 1.2 of the proposal (source: ${DOCUMENT_NAME}). Intermediate targets proposed by the AI without a target value of the project documents or a valid date were removed. ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}`,
-    });
-    expect(cash).toMatchObject({ targetValue: '1,800', baselineValue: null, resultId: byCode['O2.1'].id, level: 'output' });
+    expect(kits).toMatchObject({ targetValue: '2,400', targetJustification: `Target taken from the project documents (source: ${DOCUMENT_NAME}). ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}` });
+    expect(cash).toMatchObject({ targetValue: '1,800', baselineValue: null, level: 'output' });
     // 1,800 is a target of the proposal, not a baseline.
-    expect(cash.targetJustification).toBe(`Result 2.1 of the proposal (source: ${DOCUMENT_NAME}). `
+    expect(cash.targetJustification).toBe(`Target taken from the project documents (source: ${DOCUMENT_NAME}). `
       + `The baseline proposed by the AI was not found as a baseline in the project documents and was removed (pending baseline). ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}`);
-    expect(cash.baselineMethod).toBe(`Zero at start: new activity. ${BASELINE_DATE_TO_BE_CONFIRMED}`);
 
     // Invented numbers are removed, and the justification does not repeat them: 80 is only a budget cell.
     expect(handwashing.targetValue).toBeNull();
     expect(handwashing.targetJustification).toMatch(/^Proposed method: .* — confirm after baseline\. The target proposed by the AI was not found as a target/);
     expect(handwashing.targetJustification).not.toContain('80');
-    expect(basicNeeds).toMatchObject({
-      baselineValue: null, baselineDate: null, libraryId: null,
-      baselineMethod: `Baseline phone survey before the first cash round. ${BASELINE_DATE_TO_BE_CONFIRMED}`,
-    });
+    // An unknown library id becomes a custom indicator; an invented baseline is removed.
+    expect(basicNeeds).toMatchObject({ baselineValue: null, libraryId: null });
     expect(basicNeeds.targetJustification).toMatch(/^Proposed method: baseline \+ 15 percentage points — confirm after baseline\. The baseline proposed by the AI was not found/);
     expect(impact).toMatchObject({
-      targetValue: null,
-      targetJustification: `Proposed method: baseline − 20%, set once the baseline is known — confirm after baseline. ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}`,
+      targetValue: null, dataCollectionMethod: 'secondary_data', direction: 'decrease',
+      targetJustification: `Proposed method: baseline - 20 percentage points, set once the baseline is known — confirm after baseline. ${INTERMEDIATE_TARGETS_TO_BE_CONFIRMED}`,
     });
     expect(feedback).toMatchObject({
-      libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)', targetValue: null, indicatorTextAr: null,
-      baselineDate: new Date('2026-04-15'),
+      libraryId: 'AC-01', standardReferenceCode: 'Core Humanitarian Standard (2024) Commitment 5 (aligned)', targetValue: null,
     });
 
     // Framework and project status, the served model, and the admin notification.
@@ -585,11 +593,12 @@ describe('scripts/ai-smoke: helpers', () => {
     ];
     expect(levelRows(rows)).toEqual([['impact', '1'], ['output', '2'], ['total', '3']]);
     const gaps = gapRows(rows);
-    expect(gaps[0]).toEqual(['G', 'impact', 'Water points functional', 'none']);
+    // Columns: result, level, indicator, fields still "to be confirmed", missing fields.
+    expect(gaps[0]).toEqual(['G', 'impact', 'Water points functional', 'none', 'none']);
     expect(gaps[1][2]).toHaveLength(70);
     expect(gaps[1][2].endsWith('…')).toBe(true);
-    expect(gaps[1][3]).toBe('assumptions');
-    expect(gaps[2]).toEqual(['—', 'output', 'Kits', 'definition']);
+    expect(gaps[1].slice(3)).toEqual(['assumptions', 'none']);
+    expect(gaps[2]).toEqual(['—', 'output', 'Kits', 'none', 'definition']);
 
     const call = {
       feature: 'framework.structure', status: 'success' as const, model: 'm', servedModel: 's', attempts: 1, inputTokens: 10, outputTokens: 5,
@@ -649,18 +658,20 @@ describe.skipIf(!hasTestDatabase)('scripts/ai-smoke: run (AI client mocked)', ()
     expect(report).toContain(`Framework: version 2 (${created.id})`);
     expect(report).toContain('Model:     configured-main-model (AI_MODEL_MAIN)');
     expect(report).toContain('Documents: 1 parsed');
-    expect(report).toContain(`served model: ${SERVED_MODEL}; 11 results; prompt version framework-v4`);
+    expect(report).toContain(`served model: ${SERVED_MODEL}; 11 results; prompt version ${KPI_PROMPT_VERSION}`);
     expect(report).toMatch(/^impact\s+1$/m);
     expect(report).toMatch(/^outcome\s+4$/m);
     expect(report).toMatch(/^output\s+3$/m);
     expect(report).toMatch(/^total\s+8$/m);
-    expect(report).toContain('1 of 8 indicators complete');
-    expect(report).toMatch(/^O1\s+outcome\s+% of target households with a handwashing facility.*\s{2}indicatorTextAr, definition, calculation, baselineDate, baselineMethod, intermediateTargets, assumptions$/m);
-    expect(report).toMatch(/^O1\.2\s+output\s+Number of hygiene kits distributed to displaced households\s+indicatorTextAr, meansOfVerification, intermediateTargets, responsibility$/m);
-    expect(report).toMatch(/^O1\.1\s+output\s+Number of people receiving trucked drinking water\s+none$/m);
+    // D22: the model no longer writes assumptions, responsibility or intermediate targets, so no sheet is complete yet.
+    expect(report).toContain('Reference sheets: 0 of 8 indicators complete (every field filled); 8 with fields still "to be confirmed"; 1 with missing fields');
+    expect(report).toMatch(/^O1\s+outcome\s+% of target households with a handwashing facility.*\s{2}definition, calculation, baselineDate, baselineMethod, intermediateTargets, targetJustification, assumptions, responsibility\s+none$/m);
+    expect(report).toMatch(/^O1\.2\s+output\s+Number of hygiene kits distributed to displaced households\s+meansOfVerification, baselineMethod, intermediateTargets, assumptions, responsibility\s+indicatorTextAr$/m);
+    expect(report).toMatch(/^O1\.1\s+output\s+Number of people receiving trucked drinking water\s+baselineMethod, intermediateTargets, assumptions, responsibility\s+none$/m);
     expect(report).toMatch(/^framework\.structure\s+success\s+configured-main-model\s+claude-sonnet-5-5-20261001\s+1\s+4200\s+7600/m);
-    expect(report).toMatch(/^framework\.indicators\s+success/m);
-    expect(report).toMatch(/^total\s+2\s+8400\s+15200\s+19600\s+0\s+82000\s+0\.1704$/m);
+    // The KPI pipeline's two batches (design 4.6, D19).
+    expect(report.match(/^framework\.indicators\s+success/gm)).toHaveLength(2);
+    expect(report).toMatch(/^total\s+3\s+12600\s+22800\s+29400\s+0\s+123000\s+0\.2556$/m);
     // Never document text or personal data.
     for (const value of [...PERSONAL_DATA, 'trucked drinking water for nine months']) expect(report).not.toContain(value);
   });
@@ -685,7 +696,9 @@ describe.skipIf(!hasTestDatabase)('scripts/ai-smoke: run (AI client mocked)', ()
     mockAi({ 'framework.indicators': INDICATORS_ANSWER });
     expect(await runAiSmoke(['--yes', '--project', fx.project.id], { ...io(), apiKey: FAKE_KEY, nodeEnv: 'development' })).toBe(0);
     expect(out.join('\n')).toContain('Documents: none parsed; the results chain comes from the project metadata');
-    expect(calls().map(c => c.feature)).toEqual(['framework.indicators']);
+    // No documents: no structure call, only the KPI pipeline's indicator batches.
+    expect(calls().length).toBeGreaterThan(0);
+    expect(calls().every(c => c.feature === 'framework.indicators')).toBe(true);
     expect(await prisma.framework.findFirstOrThrow({ where: { projectId: fx.project.id, version: 2 } })).toMatchObject({ status: 'expert_review' });
   });
 

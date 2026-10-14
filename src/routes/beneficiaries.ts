@@ -79,7 +79,8 @@ router.post('/projects/:id/beneficiaries', authenticate, authorize(...STAFF_ROLE
   res.status(201).json(beneficiary);
 }));
 
-// GET /api/beneficiaries/:id - Get single with full service history
+// GET /api/beneficiaries/:id - Get single with full service history (staff only). Each service names its indicator
+// (id and text only).
 router.get('/beneficiaries/:id', authenticate, authorize(...STAFF_ROLES), asyncHandler(async (req: Request, res: Response) => {
   await assertBeneficiaryAccess(req, req.params.id);
   const beneficiary = await prisma.beneficiary.findUniqueOrThrow({
@@ -88,8 +89,8 @@ router.get('/beneficiaries/:id', authenticate, authorize(...STAFF_ROLES), asyncH
       project: true,
       services: {
         orderBy: { dateProvided: 'desc' },
-        include: { indicator: true }
-      }
+        include: { indicator: { select: { id: true, indicatorText: true } } },
+      },
     },
   });
   res.json(beneficiary);

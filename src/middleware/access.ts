@@ -1,5 +1,5 @@
 import { Request } from 'express';
-import type { ProjectStatus } from '@prisma/client';
+import type { KpiSuggestion, KpiSuggestionRun, Prisma, Project, ProjectStatus } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { AppError } from './errorHandler';
 
@@ -11,7 +11,7 @@ import { AppError } from './errorHandler';
  *
  * They are also where an archived project becomes read-only (owner decision of 13 October 2026): a write
  * request (POST, PUT, PATCH, DELETE) that reaches a resource of an archived project through any of these
- * helpers answers 409 `project_archived`; reads are unaffected. Only the routes that act on the archive state
+ * helpers (KPI suggestions and suggestion runs included) answers 409 `project_archived`; reads are unaffected. Only the routes that act on the archive state
  * itself pass `{ allowArchived: true }` to assertProjectAccess: restore and permanent delete (and archive, which
  * answers its own 409 `project_already_archived`). The webhooks resolve a project from the token's organisation
  * and apply the same rule with assertProjectWritable.
@@ -35,6 +35,21 @@ export function assertProjectWritable(req: Pick<Request, 'method'>, project: { s
   if (project.status !== 'archived') return;
   const method = typeof req.method === 'string' ? req.method.toUpperCase() : '';
   if (!READ_METHODS.has(method)) throw new AppError(409, PROJECT_ARCHIVED_MESSAGE, PROJECT_ARCHIVED_CODE);
+}
+
+/**
+ * The archived rule again, inside a transaction that adds to or decides something in a project after its access
+ * check (a KPI suggestion run starting, a KPI suggestion accepted or rejected): reads the project row under a share
+ * lock (SELECT … FOR SHARE) and answers 409 `project_archived` when it is archived, 404 when it no longer exists.
+ * An archive or a permanent delete (both lock the row FOR UPDATE) waits for this transaction, and one that committed
+ * first is seen here, so a write that passed its access check just before an archive never lands in the archived
+ * project. The share lock does not block other writes to the project's rows (their key-share locks).
+ */
+export async function assertProjectWritableLocked(tx: Prisma.TransactionClient, projectId: string): Promise<void> {
+  const rows = await tx.$queryRaw<{ status: ProjectStatus }[]>`
+    SELECT "status"::text AS "status" FROM "Project" WHERE "id" = ${projectId} FOR SHARE`;
+  if (!rows[0]) throw new AppError(404, 'Project not found');
+  if (rows[0].status === 'archived') throw new AppError(409, PROJECT_ARCHIVED_MESSAGE, PROJECT_ARCHIVED_CODE);
 }
 
 export interface ProjectAccessOptions {
@@ -152,4 +167,35 @@ export async function assertResultAccess(req: Request, resultId: string) {
   if (!result) throw new AppError(404, 'Result not found');
   assertProjectWritable(req, result.framework.project);
   return result;
+}
+
+/**
+ * A KPI suggestion run of the caller's organisation, with its project (GET /api/kpi-suggestion-runs/:id;
+ * knowledge/kpi-assistant-spec.md §A6 "All routes check that the project belongs to req.user.organizationId").
+ * 404 "Run not found" for another organisation's run, as for every other resource. A write to a run of an archived
+ * project answers 409 project_archived (no such route today; reads are unaffected).
+ */
+export async function assertKpiRunAccess(req: Request, runId: string): Promise<KpiSuggestionRun & { project: Project }> {
+  const run = await prisma.kpiSuggestionRun.findFirst({
+    where: { id: runId, project: { organizationId: orgId(req) } },
+    include: { project: true },
+  });
+  if (!run) throw new AppError(404, 'Run not found');
+  assertProjectWritable(req, run.project);
+  return run;
+}
+
+/**
+ * A KPI suggestion of the caller's organisation, with its project (POST /api/kpi-suggestions/:id/accept|reject;
+ * spec §A6). 404 "Suggestion not found" for another organisation's suggestion; accepting or rejecting a suggestion of
+ * an archived project answers 409 project_archived (the suggestion stays pending until the project is restored).
+ */
+export async function assertKpiSuggestionAccess(req: Request, suggestionId: string): Promise<KpiSuggestion & { project: Project }> {
+  const suggestion = await prisma.kpiSuggestion.findFirst({
+    where: { id: suggestionId, project: { organizationId: orgId(req) } },
+    include: { project: true },
+  });
+  if (!suggestion) throw new AppError(404, 'Suggestion not found');
+  assertProjectWritable(req, suggestion.project);
+  return suggestion;
 }

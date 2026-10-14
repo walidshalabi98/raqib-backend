@@ -7,8 +7,11 @@
  *   npm run ai:smoke -- --yes --project <projectId>
  *
  * It creates a new framework version (like POST /api/projects/:id/framework/generate), runs the
- * generator inline, then prints the indicators per level, the reference-sheet gaps of every indicator
- * and the AiCall rows of the run. Nothing is deleted: a failed run leaves an empty version marked
+ * generator inline, then prints the indicators per level, the reference-sheet status of every indicator
+ * (fields still "to be confirmed" and missing fields, reported separately; neither counts as filled)
+ * and the AiCall rows of the run. AI calls (main tier): one "framework.structure" call when the project
+ * has parsed documents, then the indicator calls of the KPI pipeline (one per batch of results; see
+ * AI_CALLS_TEXT). Nothing is deleted: a failed run leaves an empty version marked
  * with its generationError, which is never the project's current framework.
  * Refuses in production, with a placeholder ANTHROPIC_API_KEY, and unless DATABASE_URL points at a
  * development database (localhost, or a database name containing "dev" or "test"; for any other
@@ -22,7 +25,20 @@ import { prisma } from '../src/config/prisma';
 import { resolveModel } from '../src/services/ai/client';
 import { safeErrorSummary } from '../src/services/ai/errors';
 import { generateFramework } from '../src/services/ai/frameworkGenerator';
-import { ReferenceSheetFields, referenceSheetGaps } from '../src/services/ai/frameworkNormalize';
+import {
+  BASELINE_DATE_TO_BE_CONFIRMED, INTERMEDIATE_TARGETS_TO_BE_CONFIRMED, REFERENCE_SHEET_FIELDS, ReferenceSheetField, ReferenceSheetFields,
+  referenceSheetGaps,
+} from '../src/services/ai/frameworkNormalize';
+import { apiKeyProblem } from '../src/services/ai/keyCheck';
+import { KPI_BATCH_MAX_RESULTS, KPI_MAX_CALLS_PER_RUN } from '../src/services/kpi/callModel';
+
+export { apiKeyProblem };
+
+/**
+ * The AI calls one run makes, for the help text and the --yes prompt (design D19: framework generation's indicator step
+ * runs the KPI pipeline in batches; the client may retry a call, which the AiCall table shows as attempts).
+ */
+export const AI_CALLS_TEXT = `main-tier calls: one for the results chain when the project has parsed documents, then one per batch of up to ${KPI_BATCH_MAX_RESULTS} results for the indicators (at most ${KPI_MAX_CALLS_PER_RUN})`;
 
 /** The dev seed's project without a framework (prisma/seed.ts: "try framework generation here"). */
 export const SEED_PROJECT_NAME = 'Gaza Emergency WASH and Cash Response';
@@ -79,17 +95,6 @@ export function databaseProblem(databaseUrl: string | undefined): string | null 
   return `DATABASE_URL points at database "${database || '(none)'}" on ${url.hostname}, which does not look like a development database (localhost, or a name containing "dev" or "test"). The run adds a framework version to a real project. If this database is not shared, re-run with ${NOT_SHARED_FLAG}.`;
 }
 
-const PLACEHOLDER_WORD = /(^|[-_.])(test|placeholder|your|example|changeme|change-me|dummy|fake|xxx+|not-a-real)([-_.]|$)/i;
-
-/** Why the key cannot be a real Anthropic API key, or null when it looks like one. */
-export function apiKeyProblem(key: string | undefined): string | null {
-  const value = (key ?? '').trim();
-  if (!value) return 'ANTHROPIC_API_KEY is not set.';
-  if (PLACEHOLDER_WORD.test(value)) return 'ANTHROPIC_API_KEY looks like a placeholder; set a real key in .env.';
-  if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(value)) return 'ANTHROPIC_API_KEY does not look like an Anthropic API key (sk-ant-…); set a real key in .env.';
-  return null;
-}
-
 /** Why the smoke test must not run, or null. */
 export function smokeRefusal(opts: {
   nodeEnv: string;
@@ -103,7 +108,7 @@ export function smokeRefusal(opts: {
   if (keyProblem) return `Refusing to run: ${keyProblem}`;
   const dbProblem = opts.notShared ? null : databaseProblem(opts.databaseUrl);
   if (dbProblem) return `Refusing to run: ${dbProblem}`;
-  if (!opts.yes) return 'This calls the real Anthropic API (two main-tier calls; it costs a little money) and adds a framework version. Re-run with --yes to continue.';
+  if (!opts.yes) return `This calls the real Anthropic API (${AI_CALLS_TEXT}; it costs a little money) and adds a framework version. Re-run with --yes to continue.`;
   return null;
 }
 
@@ -128,12 +133,81 @@ export function levelRows(indicators: readonly SmokeIndicator[]): string[][] {
   return [...rows, ['total', String(indicators.length)]];
 }
 
-/** Rows "result, level, indicator, gaps" (gaps from referenceSheetGaps; "none" when complete). */
+/** Text that marks a reference-sheet field as still to be confirmed by the M&E officer (me-foundations §3). */
+const TO_BE_CONFIRMED_MARK = /to be confirmed|confirm after baseline/i;
+
+const fieldText = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
+const withoutTail = (value: string, tail: string): string => (value.endsWith(tail) ? value.slice(0, -tail.length).trim() : value);
+const marked = (value: unknown): boolean => TO_BE_CONFIRMED_MARK.test(fieldText(value));
+
+/** Reference-sheet fields of one indicator that are not filled: still "to be confirmed", or missing. */
+export interface ReferenceSheetStatus {
+  toBeConfirmed: ReferenceSheetField[];
+  missing: ReferenceSheetField[];
+}
+
+/**
+ * Which reference-sheet fields are still "to be confirmed" and which are missing (BUILD_GUIDE Phase 3 acceptance: every
+ * field filled or explicitly marked "to be confirmed"; me-foundations §3). A field counts as filled only when it holds
+ * a value without a "to be confirmed" marker: a field whose text says "To be confirmed by the M&E officer" or "— confirm
+ * after baseline" is to be confirmed even when referenceSheetGaps accepts it (e.g. a proposed target-setting method).
+ * The baseline date and the intermediate targets have no text of their own: an open one is to be confirmed when the
+ * baseline method or the target justification carries its marker ("Baseline date: to be confirmed.", "Intermediate
+ * targets: to be confirmed after the baseline."), else missing. Every other open field (empty, a generic means of
+ * verification, no sex disaggregation) is missing. Pure.
+ */
+export function referenceSheetStatus(indicator: ReferenceSheetFields): ReferenceSheetStatus {
+  const gaps = new Set(referenceSheetGaps(indicator));
+  const baselineMethod = fieldText(indicator.baselineMethod);
+  const justification = fieldText(indicator.targetJustification);
+  const calculation = indicator.calculation && typeof indicator.calculation === 'object' ? indicator.calculation as Record<string, unknown> : {};
+  const markers: Record<ReferenceSheetField, boolean> = {
+    indicatorTextAr: marked(indicator.indicatorTextAr),
+    definition: marked(indicator.definition),
+    unit: false,
+    calculation: ['numerator', 'denominator', 'formula', 'rounding'].some(key => marked(calculation[key])),
+    direction: false,
+    disaggregation: false,
+    meansOfVerification: marked(indicator.meansOfVerification),
+    baselineDate: gaps.has('baselineDate') && baselineMethod.includes(BASELINE_DATE_TO_BE_CONFIRMED),
+    baselineMethod: marked(withoutTail(baselineMethod, BASELINE_DATE_TO_BE_CONFIRMED)),
+    intermediateTargets: gaps.has('intermediateTargets') && justification.includes(INTERMEDIATE_TARGETS_TO_BE_CONFIRMED),
+    targetJustification: marked(withoutTail(justification, INTERMEDIATE_TARGETS_TO_BE_CONFIRMED)),
+    assumptions: marked(indicator.assumptions),
+    responsibility: marked(indicator.responsibility),
+  };
+  const toBeConfirmed = REFERENCE_SHEET_FIELDS.filter(field => markers[field]);
+  const missing = REFERENCE_SHEET_FIELDS.filter(field => gaps.has(field) && !markers[field]);
+  return { toBeConfirmed, missing };
+}
+
+/** Header of the reference-sheet table. */
+export const SHEET_HEADER = ['result', 'level', 'indicator', 'to be confirmed', 'missing'];
+
+/** Rows "result, level, indicator, to be confirmed, missing" (referenceSheetStatus; "none" when a list is empty). */
 export function gapRows(indicators: readonly SmokeIndicator[]): string[][] {
   return indicators.map(i => {
-    const gaps = referenceSheetGaps(i);
-    return [i.resultCode ?? '—', i.level, shorten(i.indicatorText, 70), gaps.length > 0 ? gaps.join(', ') : 'none'];
+    const status = referenceSheetStatus(i);
+    const list = (fields: ReferenceSheetField[]) => (fields.length > 0 ? fields.join(', ') : 'none');
+    return [i.resultCode ?? '—', i.level, shorten(i.indicatorText, 70), list(status.toBeConfirmed), list(status.missing)];
   });
+}
+
+/** Counts for the report line: complete (every field filled), with fields to be confirmed, with missing fields. */
+export function sheetSummary(indicators: readonly ReferenceSheetFields[]): { total: number; complete: number; withToBeConfirmed: number; withMissing: number } {
+  const statuses = indicators.map(referenceSheetStatus);
+  return {
+    total: indicators.length,
+    complete: statuses.filter(s => s.toBeConfirmed.length === 0 && s.missing.length === 0).length,
+    withToBeConfirmed: statuses.filter(s => s.toBeConfirmed.length > 0).length,
+    withMissing: statuses.filter(s => s.missing.length > 0).length,
+  };
+}
+
+/** The report line above the reference-sheet table. */
+export function sheetSummaryLine(summary: ReturnType<typeof sheetSummary>): string {
+  return `Reference sheets: ${summary.complete} of ${summary.total} indicators complete (every field filled); `
+    + `${summary.withToBeConfirmed} with fields still "to be confirmed"; ${summary.withMissing} with missing fields`;
 }
 
 export const AI_CALL_HEADER = ['feature', 'status', 'model', 'served model', 'attempts', 'input', 'output', 'cache read', 'cache write', 'latency ms', 'cost USD'];
@@ -158,7 +232,8 @@ export function aiCallRows(calls: readonly AiCallRow[]): string[][] {
 }
 
 const USAGE = `Usage: npm run ai:smoke -- --yes [--project <projectId>] [${NOT_SHARED_FLAG}]
-Generates a new framework version with the real Anthropic API and prints a report.
+Generates a new framework version with the real Anthropic API and prints a report
+(${AI_CALLS_TEXT}).
 Without --project, uses the dev seed's project "${SEED_PROJECT_NAME}".
 Runs only against a development database (DATABASE_URL on localhost, or a database name
 containing "dev" or "test"), unless ${NOT_SHARED_FLAG} is passed.`;
@@ -246,12 +321,11 @@ export async function runAiSmoke(argv: string[], options: SmokeOptions = {}): Pr
     });
     const rows: SmokeIndicator[] = indicators.map(i => ({ ...i, resultCode: i.result?.code ?? null }));
     const results = await prisma.resultNode.count({ where: { frameworkId: framework.id } });
-    const complete = rows.filter(i => referenceSheetGaps(i).length === 0).length;
 
     log(`Framework status: ${stored.status}; served model: ${stored.aiModelUsed}; ${results} results; prompt version ${indicators[0]?.promptVersion ?? '—'}\n`);
     log(formatTable(['level', 'indicators'], levelRows(rows)));
-    log(`\nReference-sheet gaps (fields still "to be confirmed"): ${complete} of ${rows.length} indicators complete\n`);
-    log(formatTable(['result', 'level', 'indicator', 'gaps'], gapRows(rows)));
+    log(`\n${sheetSummaryLine(sheetSummary(rows))}\n`);
+    log(formatTable(SHEET_HEADER, gapRows(rows)));
   }
 
   const calls = await prisma.aiCall.findMany({

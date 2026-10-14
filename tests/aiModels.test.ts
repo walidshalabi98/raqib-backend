@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { estimateCostUsd, getModelInfo, MODELS, roundUsd, supportsEffort, supportsServerFallback, type TokenUsage } from '../src/services/ai/models';
+import { HIGHEST_KNOWN_PRICE, budgetCostUsd, estimateCostUsd, getModelInfo, MODELS, roundUsd, supportsEffort, supportsServerFallback, type TokenUsage } from '../src/services/ai/models';
+import { budgetPricingWarning, unpricedBudgetModels } from '../src/services/kpi/availability';
 
 const MILLION: TokenUsage = { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
@@ -85,5 +86,26 @@ describe('model table', () => {
   it('matches a dated snapshot id to its alias', () => {
     expect(getModelInfo('claude-sonnet-5-5-20261001')).toBe(MODELS['claude-sonnet-5-5']);
     expect(estimateCostUsd('claude-opus-5-20260101', MILLION)).toBe(5);
+  });
+});
+
+describe('the daily AI budget and unpriced models (CC-07)', () => {
+  it('names the configured models the budget cannot count, only when a budget is set', () => {
+    expect(unpricedBudgetModels(20, ['claude-sonnet-5-5', 'claude-haiku-5-5'])).toEqual([]);
+    expect(unpricedBudgetModels(20, ['claude-sonnet-9-9', 'claude-haiku-5-5', 'claude-sonnet-9-9'])).toEqual(['claude-sonnet-9-9']);
+    expect(unpricedBudgetModels(0, ['claude-sonnet-9-9'])).toEqual([]);
+    expect(budgetPricingWarning(20, ['claude-sonnet-5-5', 'claude-haiku-5-5'])).toBeNull();
+    const warning = budgetPricingWarning(20, ['claude-sonnet-9-9', 'claude-haiku-5-5']);
+    expect(warning).toMatch(/^\[KpiBudget\] WARNING: AI_ORG_DAILY_BUDGET_USD is 20 but claude-sonnet-9-9 has no price/);
+    expect(warning).toContain('the daily budget counts them at the highest known rates');
+  });
+
+  it('prices an unpriced call at the highest known rate of each token kind (fail closed, never stored)', () => {
+    expect(HIGHEST_KNOWN_PRICE).toEqual({ input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 });
+    expect(budgetCostUsd({ inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })).toBe(5);
+    expect(budgetCostUsd({ inputTokens: 100_000, outputTokens: 200_000, cacheReadTokens: 1_000_000, cacheWriteTokens: 40_000 })).toBe(6.25);
+    // Never below a priced model's own estimate for the same usage.
+    const usage = { inputTokens: 300_000, outputTokens: 50_000, cacheReadTokens: 20_000, cacheWriteTokens: 10_000 };
+    for (const model of Object.keys(MODELS)) expect(budgetCostUsd(usage)).toBeGreaterThanOrEqual(estimateCostUsd(model, usage) ?? 0);
   });
 });

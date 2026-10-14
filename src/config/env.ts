@@ -20,6 +20,9 @@ const wholeNumber = z.coerce
  */
 export const AI_REQUEST_TIMEOUT_MAX_MS = 3_600_000;
 
+/** Default of AI_ORG_DAILY_BUDGET_USD (US$ per organisation per 24 hours; set by the owner on 13 October 2026, design §12.9). */
+export const AI_ORG_DAILY_BUDGET_DEFAULT_USD = 20;
+
 /** The sender of every email (EMAIL_FROM), on a domain verified in Resend. */
 export const DEFAULT_EMAIL_FROM = 'Raqib by Momentum Labs <noreply@raqib.momentumlabs.ps>';
 
@@ -70,6 +73,16 @@ const envSchema = z.object({
   AI_CALL_RETENTION_MONTHS: withDefault(AI_CALL_RETENTION_MONTHS_SCHEMA, AI_CALL_RETENTION_DEFAULT_MONTHS),
   VOYAGE_API_KEY: optionalString,
   VOYAGE_MODEL: withDefault(z.string(), 'voyage-4'),
+  // Organisation daily AI budget in US$ (sum of AiCall.estimatedCostUsd over the last 24 hours, every AI feature).
+  // KPI suggestion requests answer 429 budget_reached once it is spent; 0 turns the check off (design D20).
+  AI_ORG_DAILY_BUDGET_USD: withDefault(
+    z.coerce.number({ invalid_type_error: 'must be a number' })
+      .finite('must be a number')
+      .min(0, 'must be 0 (no budget) or more'),
+    AI_ORG_DAILY_BUDGET_DEFAULT_USD,
+  ),
+  // "1" logs every SQL statement Prisma sends (local debugging only); warnings are always logged.
+  PRISMA_LOG_QUERIES: withDefault(z.enum(['0', '1'], { errorMap: () => ({ message: 'must be 1 (on) or 0 (off)' }) }), '0'),
 
   // Optional HMAC secret: when set, webhook requests carrying X-Raqib-Signature are verified with it.
   WEBHOOK_SECRET: optionalString,
@@ -96,6 +109,9 @@ const envSchema = z.object({
   API_URL: optionalString,
   CORS_ORIGINS: optionalString,
 });
+
+/** Every environment variable the configuration reads (the documentation tests check that the README lists the AI ones). */
+export const ENV_VARIABLE_NAMES: readonly string[] = Object.keys(envSchema.shape);
 
 export type EnvInput = Record<string, string | undefined>;
 
@@ -146,6 +162,9 @@ export function parseEnv(source: EnvInput) {
     aiCallRetentionMonths: e.AI_CALL_RETENTION_MONTHS,
     voyageApiKey: e.VOYAGE_API_KEY,
     voyageModel: e.VOYAGE_MODEL,
+    /** 0 = no budget check. */
+    aiOrgDailyBudgetUsd: e.AI_ORG_DAILY_BUDGET_USD,
+    prismaLogQueries: e.PRISMA_LOG_QUERIES === '1',
     webhookSecret: e.WEBHOOK_SECRET,
     supabaseUrl: e.SUPABASE_URL || '',
     supabaseServiceKey: e.SUPABASE_SERVICE_KEY || '',

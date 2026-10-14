@@ -81,14 +81,17 @@ describe('Redis error listeners', () => {
 
   it('every queue has a listener that names the queue and never logs the password', async () => {
     const queues = await import('../src/jobs/queues');
+    // Phase 4 removed the 'indicator-alternatives' queue (KPI suggestion runs execute in the API process).
     const getters = [
       queues.getDocumentParsingQueue,
       queues.getFrameworkQueue,
-      queues.getIndicatorQueue,
       queues.getReportQueue,
       queues.getQualitativeQueue,
       queues.getMaintenanceQueue,
     ];
+    // Every queue getter the module exports is in the list above, so a new queue is checked too.
+    const exported = Object.entries(queues).filter(([name, value]) => /^get\w+Queue$/.test(name) && typeof value === 'function').map(([, value]) => value);
+    expect(new Set(exported)).toEqual(new Set(getters));
     for (const get of getters) {
       const queue = get();
       expect(queue.listenerCount('error'), queue.name).toBe(1);

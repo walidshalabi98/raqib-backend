@@ -7,10 +7,12 @@ import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { aiLimiter } from '../middleware/rateLimit';
 import { resolveModel } from '../services/ai/client';
 import { generateFramework } from '../services/ai/frameworkGenerator';
-import { levelForResult, sortResultNodes } from '../services/indicators/hierarchy';
-import { assertIndicatorReferences } from '../services/indicators/references';
-import { INDICATOR_INCLUDE, indicatorListInclude, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
-import { parseIndicatorCreate, toIndicatorCreateData } from '../services/indicators/validation';
+import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
+import { createIndicatorInFramework } from '../services/indicators/create';
+import { sortResultNodes } from '../services/indicators/hierarchy';
+import { indicatorListInclude, RESULT_NODE_INCLUDE } from '../services/indicators/selects';
+import { parseIndicatorCreate } from '../services/indicators/validation';
+import { canSeeIndicator, indicatorVisibilityWhere } from '../services/indicators/visibility';
 import { safeErrorSummary } from '../services/ai/errors';
 import { donorDataPointWhere } from '../services/privacy/donorView';
 import { lockProject } from '../services/projects/lifecycle';
@@ -20,26 +22,29 @@ const router = Router();
 const INDICATOR_ORDER = [{ sortOrder: 'asc' }, { createdAt: 'asc' }] satisfies Prisma.IndicatorOrderByWithRelationInput[];
 
 /**
- * A framework with its result nodes (each with counts) and its indicators (each with its result and the number
- * of data points the user can see: donor viewers never count KoboToolbox rows, SECURITY_SETUP §8.3).
+ * A framework with its result nodes (each with counts) and the indicators `user` may see: approved ones only for a
+ * donor viewer (spec §A1; design 4.7), each with its result and the number of data points the user can see (donor
+ * viewers never count KoboToolbox rows, SECURITY_SETUP §8.3). Result nodes and their `_count.indicators` are not
+ * filtered (docs/DATA_MODEL.md §12). `indicatorWhere` defaults to the indicators `user` may see; GET
+ * /frameworks/:id/status passes `{}` so its status counts every indicator, and filters the list afterwards.
  */
-function frameworkDetailInclude(user: Request['user']) {
+function frameworkDetailInclude(user: Request['user'], indicatorWhere: Prisma.IndicatorWhereInput = indicatorVisibilityWhere(user)) {
   return {
     resultNodes: { include: RESULT_NODE_INCLUDE },
-    indicators: { orderBy: INDICATOR_ORDER, include: indicatorListInclude(donorDataPointWhere(user)) },
+    indicators: {
+      where: indicatorWhere,
+      orderBy: INDICATOR_ORDER,
+      include: indicatorListInclude(donorDataPointWhere(user)),
+    },
   } satisfies Prisma.FrameworkInclude;
 }
 
 /**
- * The project's current framework: the newest version whose AI generation did not fail. A failed
- * version keeps its safe message in generationError and never replaces the previous framework.
- */
-const CURRENT_FRAMEWORK = { generationError: null } satisfies Prisma.FrameworkWhereInput;
-
-/**
  * A draft that is still empty this long after it was created belongs to an interrupted run. A normal
- * run takes a few minutes; the slowest possible run (every timeout and max_tokens retry used) takes
- * about 30, so the limit sits well above it and a slow run is never reported as failed.
+ * run takes a few minutes. Worst case since Phase 4 (design 4.6): the structure call ≈ 14 min (180 s,
+ * one timeout retry, the 2× max_tokens retry, backoff) + the KPI indicator phase, where no model call
+ * starts after the 10-minute run deadline, plus one batch call still in flight ≈ 14 min: ≈ 38 min.
+ * The limit sits above that, so a slow run is never reported as failed.
  */
 export const INTERRUPTED_GENERATION_MS = 45 * 60 * 1000;
 
@@ -51,6 +56,7 @@ function withOrderedResults<T extends { resultNodes: Parameters<typeof sortResul
 }
 
 // GET /api/projects/:id/framework — Current framework with its results chain and indicators
+// (donor viewers: approved indicators only, spec §A1)
 router.get('/projects/:id/framework', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertProjectAccess(req, req.params.id);
 
@@ -114,12 +120,15 @@ export function generationFailure(
   return null;
 }
 
-// GET /api/frameworks/:id/status — Check generation status: processing, completed or failed (with a safe message)
+// GET /api/frameworks/:id/status — Check generation status: processing, completed or failed (with a safe message).
+// The status is the same for every role (it counts every indicator); a donor viewer's framework lists approved
+// indicators only (spec §A1; design 4.7).
 router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertFrameworkAccess(req, req.params.id);
+  // Every indicator, so the status is the same for every role; the donor filter is applied to the list below.
   const framework = await prisma.framework.findUniqueOrThrow({
     where: { id: req.params.id },
-    include: frameworkDetailInclude(req.user),
+    include: frameworkDetailInclude(req.user, {}),
   });
 
   const hasIndicators = framework.indicators.length > 0;
@@ -131,11 +140,12 @@ router.get('/frameworks/:id/status', authenticate, asyncHandler(async (req: Requ
     return;
   }
 
+  const visible = { ...framework, indicators: framework.indicators.filter(indicator => canSeeIndicator(req.user, indicator)) };
   res.json({
     frameworkId: framework.id,
     status: hasIndicators ? 'completed' : 'processing',
     progress: hasIndicators ? 'Framework generated successfully' : 'AI is analyzing project data...',
-    framework: hasIndicators ? withOrderedResults(framework) : undefined,
+    framework: hasIndicators ? withOrderedResults(visible) : undefined,
   });
 }));
 
@@ -199,38 +209,21 @@ router.post('/projects/:id/framework/manual', authenticate, authorize('org_admin
   res.status(201).json(framework);
 }));
 
-// POST /api/frameworks/:id/indicators — Create a single indicator manually (or from the library)
+// POST /api/frameworks/:id/indicators — Create a single indicator manually (or from the library).
+// References, level fit (me-foundations.md §2 rule 5) and sort order: createIndicatorInFramework (shared with KPI accept).
 router.post('/frameworks/:id/indicators', authenticate, authorize('org_admin', 'platform_admin', 'me_officer'), asyncHandler(async (req: Request, res: Response) => {
   const framework = await assertFrameworkAccess(req, req.params.id);
   const input = parseIndicatorCreate(req.body);
-  const { result } = await assertIndicatorReferences(framework.id, input);
-  // Level fits the result (knowledge/me-foundations.md §2 rule 5): without a level it takes the result's.
-  const fit = levelForResult(input.level, result?.level);
-  if (fit.ok === false) throw new AppError(400, fit.message);
-
-  // Get next sort order
-  const lastIndicator = await prisma.indicator.findFirst({
-    where: { frameworkId: framework.id },
-    orderBy: { sortOrder: 'desc' },
-  });
-
-  const indicator = await prisma.indicator.create({
-    data: toIndicatorCreateData(framework.id, input, {
-      sortOrder: (lastIndicator?.sortOrder ?? -1) + 1,
-      resultLevel: result?.level,
-    }),
-    include: INDICATOR_INCLUDE,
-  });
-
+  const indicator = await createIndicatorInFramework(prisma, framework.id, input);
   res.status(201).json(indicator);
 }));
 
-// GET /api/frameworks/:id/indicators
+// GET /api/frameworks/:id/indicators (donor viewers: approved indicators only, spec §A1)
 router.get('/frameworks/:id/indicators', authenticate, asyncHandler(async (req: Request, res: Response) => {
   await assertFrameworkAccess(req, req.params.id);
 
   const indicators = await prisma.indicator.findMany({
-    where: { frameworkId: req.params.id },
+    where: { frameworkId: req.params.id, ...indicatorVisibilityWhere(req.user) },
     orderBy: INDICATOR_ORDER,
     include: indicatorListInclude(donorDataPointWhere(req.user)),
   });

@@ -8,7 +8,9 @@ import { hasStaffRole } from '../middleware/roles';
 import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { validationErrorBody } from '../services/dataPoints/fields';
 import { DOCUMENT_FIELDS, withTextLength } from './documents';
+import { CURRENT_FRAMEWORK } from '../services/frameworks/current';
 import { sortResultNodes } from '../services/indicators/hierarchy';
+import { indicatorVisibilityWhere } from '../services/indicators/visibility';
 import { parseProjectCreate, parseProjectUpdate } from '../services/projects/validation';
 import {
   ALREADY_ARCHIVED, CONFIRM_NAME_MISMATCH, confirmNameMatches, DELETE_BLOCKED_MESSAGE, DELETE_TRANSACTION_OPTIONS, deleteProjectRows, lockProject,
@@ -61,7 +63,8 @@ router.post('/', authenticate, authorize('org_admin', 'platform_admin'), asyncHa
   res.status(201).json(project);
 }));
 
-// GET /api/projects/:id — also for an archived project (read-only view)
+// GET /api/projects/:id — also for an archived project (read-only view); donor viewers get the current framework's
+// approved indicators only (spec §A1)
 router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response) => {
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, organizationId: req.user!.organizationId },
@@ -70,10 +73,10 @@ router.get('/:id', authenticate, asyncHandler(async (req: Request, res: Response
       documents: { select: DOCUMENT_FIELDS, where: donorDocumentWhere(req.user), orderBy: { uploadedAt: 'desc' } },
       // The current framework: the newest version whose AI generation did not fail.
       frameworks: {
-        where: { generationError: null },
+        where: CURRENT_FRAMEWORK,
         orderBy: { version: 'desc' },
         take: 1,
-        include: { indicators: { orderBy: { sortOrder: 'asc' } } },
+        include: { indicators: { where: indicatorVisibilityWhere(req.user), orderBy: { sortOrder: 'asc' } } },
       },
       // Counts of what the caller can see: donors count no KoboToolbox rows and published reports only.
       _count: {
@@ -119,7 +122,8 @@ router.patch('/:id', authenticate, authorize('org_admin', 'platform_admin', 'me_
   res.json(outcome.project);
 }));
 
-// GET /api/projects/:id/export - Export project data as JSON (for Excel conversion).
+// GET /api/projects/:id/export - Export project data as JSON (for Excel conversion). Donor viewers (and any caller
+// without a staff role) get approved indicators only, with their data points (spec §A1).
 // Staff (audience 'staff'): everything, beneficiaries included. Everyone else (audience 'donor',
 // personalData 'excluded'): every part built from an explicit field list (SECURITY_SETUP §8.3): no
 // beneficiaries key, a beneficiary summary (small counts hidden, other counts rounded), data points without
@@ -137,6 +141,7 @@ router.get('/:id/export', authenticate, asyncHandler(async (req: Request, res: R
             select: { id: true, code: true, level: true, text: true, textAr: true, parentId: true, sortOrder: true },
           },
           indicators: {
+            where: indicatorVisibilityWhere(req.user),
             orderBy: { sortOrder: 'asc' },
             include: {
               result: { select: { code: true } },

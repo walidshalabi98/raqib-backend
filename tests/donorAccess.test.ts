@@ -65,6 +65,9 @@ async function storeFile(projectId: string, name: string) {
 /** Adds made-up personal data to organisation A: project A then has 12 beneficiaries (9 female, 3 male). */
 async function seedPersonalData(fx: OrgFixture) {
   const projectId = fx.project.id;
+  // Donor viewers see approved indicators only (Phase 4, src/services/indicators/visibility.ts; covered by
+  // tests/donorVisibility.test.ts): the fixture indicator is approved so its data reaches the donor projections tested here.
+  await prisma.indicator.update({ where: { id: fx.indicator.id }, data: { isApproved: true } });
   const rasha = await prisma.beneficiary.create({
     data: {
       projectId, fullName: 'Rasha Testperson', fullNameAr: 'رشا اختبار', gender: 'female', age: 34, ageGroup: 'adult_25_59',
@@ -547,7 +550,7 @@ describe.skipIf(!hasTestDatabase)('donor viewers: results without identities', (
       const indicator = await prisma.indicator.create({
         data: {
           frameworkId: framework.id, indicatorText: '% of households with safe water', level: 'outcome', unit: '%',
-          dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: ['baseline'],
+          dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: ['baseline'], isApproved: true,
         },
       });
       for (const [collectionDate, value] of [['2026-03-31', '48'], ['2026-06-30', '55'], ['2026-09-30', '62']]) {
@@ -687,7 +690,7 @@ describe.skipIf(!hasTestDatabase)('donor viewers: results without identities', (
       const indicator = await prisma.indicator.create({
         data: {
           frameworkId: framework.id, indicatorText: 'Average monthly household income', level: 'outcome', unit: 'ILS',
-          dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: ['baseline'],
+          dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: ['baseline'], isApproved: true,
         },
       });
       /** A KoboToolbox submission as the webhook stores it (createdAt: when it was received). */

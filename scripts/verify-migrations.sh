@@ -5,14 +5,21 @@
 #   prisma/sql/2026-10-11_phase2_data_model.sql     (Phase 2: results chain, reference sheet, library)
 #   prisma/sql/2026-10-12_phase3_ai_foundation.sql  (Phase 3: AiCall, Document.aiAnalysis and qualitativeSource,
 #                                                    Framework.generationError, IndicatorLibraryEntry.embeddingModel)
+#   prisma/sql/2026-10-12_phase4_kpi_assistant.sql  (Phase 4: KpiSuggestionRun, KpiSuggestion and their four enums)
 #
-#   0. STATIC     no file contains a DROP statement; the Phase 3 file is one transaction that sets lock_timeout first.
-#   1. FRESH      create a database and `prisma db push` the current schema: no drift, the Phase 3 SQL is refused there
-#                 ("already applied") without changes, and the app's Prisma client creates and reads AiCall rows.
+#   0. STATIC     no file contains a DROP statement; the Phase 3 and Phase 4 files are each one transaction that sets
+#                 lock_timeout first.
+#   1. FRESH      create a database and `prisma db push` the current schema: no drift, the Phase 3 and Phase 4 SQL are
+#                 refused there ("already applied") without changes, and the app's Prisma client creates and reads
+#                 AiCall rows and KPI runs and suggestions.
 #   2. EMPTY      the Phase 3 SQL on a database without the Phase 0 schema is refused and creates nothing; with a
-#                 leftover AiCallStatus type it is refused as "already partly applied".
+#                 leftover AiCallStatus type it is refused as "already partly applied". The Phase 4 SQL there is refused
+#                 ("needs the Phase 3 SQL first") and creates nothing; with a leftover SuggestionStatus type it is
+#                 refused as "already partly applied".
 #   2b. PARTIAL   on copies of a database at the Phase 2 schema, each column the Phase 3 SQL adds, left over alone
-#                 (e.g. Document.aiAnalysis without AiCall), makes it refuse as "already partly applied", unchanged.
+#                 (e.g. Document.aiAnalysis without AiCall), makes it refuse as "already partly applied", unchanged; on
+#                 copies of a database at the Phase 3 schema, each type or the run table the Phase 4 SQL creates, left
+#                 over alone, makes the Phase 4 SQL refuse the same way, unchanged.
 #   3. SEED COPY  create a database with the schema at BASE_REV (022e09a: today's shared schema plus the Phase 0 SQL),
 #                 load the seed from that revision with a Prisma client generated from that schema, add edge-case
 #                 fixtures (frameworks, indicators, a beneficiary, legacy documents, qualitative entries), snapshot row
@@ -32,13 +39,26 @@
 #                 last marker; valid JSON moved as JSON, anything else as {legacyText}; documents without the marker
 #                 untouched; nothing lost), transcripts marked, counts and checksums of everything else unchanged, the
 #                 app's Prisma client creates and reads AiCall rows and reads the moved data, a second run is refused
-#                 without changes, and `prisma migrate diff` against prisma/schema.prisma reports no drift.
-#   4. CHAIN      the whole rollout order on the schema the shared Supabase database has today (PRE_PHASE0_REV,
-#                 before Phase 0): the Phase 3 SQL is refused first, then the Phase 0, Phase 2 and Phase 3 files apply
-#                 in order, RLS is on for every new table and `prisma migrate diff` reports no drift.
+#                 without changes, and `prisma migrate diff` against the schema at PHASE3_REV reports no drift.
+#      3e.    Phase 4, negative runs first: while another session holds a write lock on Framework (an open write
+#                 transaction) the file gives up after lock_timeout; copies of the file with a deliberate bug (row level
+#                 security not enabled on KpiSuggestion, KpiSuggestion.resultId ON DELETE CASCADE instead of SET NULL,
+#                 one SuggestionStatus value missing) are stopped by its self-check. Each run rolls back with every
+#                 table and the schema unchanged. Then the real file is applied with psql.
+#      3f.    checks after Phase 4: both tables (columns, types, defaults, enums, indexes, foreign keys) exactly as in
+#                 prisma/schema.prisma, the foreign keys' behaviour on fixtures (a deleted result or indicator empties
+#                 the link; a run with suggestions cannot be deleted; deleting a framework removes its runs and
+#                 suggestions in one statement; a project with frameworks cannot be deleted), RLS on both with no
+#                 policies, counts and checksums of every pre-existing table unchanged, the app's Prisma client writes
+#                 and reads KPI rows, a second run is refused without changes, and no drift against prisma/schema.prisma.
+#   4. CHAIN      the whole rollout order on the schema the shared Supabase database had before Phase 0
+#                 (PRE_PHASE0_REV): the Phase 3 SQL is refused first, the Phase 4 SQL is refused after Phase 2, then the
+#                 Phase 0, Phase 2, Phase 3 and Phase 4 files apply in order, RLS is on for every new table and
+#                 `prisma migrate diff` reports no drift.
 #   5. SUPABASE   the same rollout with pgvector in an `extensions` schema and the search_path Supabase gives its
 #                 roles: the files apply, the extension stays where it is, no drift; with search_path = public (what
-#                 a Prisma URL with ?schema=public sets) a bare ::vector cast fails and the column's own type works.
+#                 a Prisma URL with ?schema=public sets) a bare ::vector cast fails, the column's own type works and the
+#                 vector reads back as text (how Phase 4 retrieval reads library vectors).
 #   6. CLEANUP    drop the throwaway databases (set KEEP_DBS=1 to keep them for inspection).
 #
 # Usage:   scripts/verify-migrations.sh            (npm run verify:migration)
@@ -48,13 +68,15 @@
 #   BASE_REV            git revision whose schema and seed represent the shared databases after the Phase 0 SQL
 #                       (default 022e09a)
 #   PHASE2_REV          git revision whose schema is the Phase 2 schema (default 642c474)
-#   PRE_PHASE0_REV      git revision whose schema the shared Supabase database has today, before the Phase 0 SQL
+#   PHASE3_REV          git revision whose schema is the Phase 3 schema, what the Phase 4 SQL upgrades (default f010e7f)
+#   PRE_PHASE0_REV      git revision whose schema the shared Supabase database had before the Phase 0 SQL
 #                       (default df6c1f6)
 #   KEEP_DBS=1          keep the databases at the end
 #   VERIFY_ALLOW_NON_LOCAL=1  allow a server other than localhost (for example a CI service container); without it,
 #                       URLs with a host= or hostaddr= parameter or a comma-separated host list are refused too
 #
-# Needs: psql, git history containing BASE_REV, PHASE2_REV and PRE_PHASE0_REV, `npm ci` done, Postgres with pgvector. Never point it at
+# Needs: psql, git history containing BASE_REV, PHASE2_REV, PHASE3_REV and PRE_PHASE0_REV, `npm ci` done, Postgres with
+# pgvector. Never point it at
 # a shared server: it only creates and drops databases whose names it generates. The names contain "verify", a unique
 # run id (time, process id, random number) and end in "_test", so they cannot clash with anyone's test databases
 # (raqib_test, raqib_<key>_test); CREATE DATABASE fails rather than reuse an existing name, and only databases this run
@@ -66,9 +88,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHASE0_SQL="$ROOT/prisma/sql/2026-10-11_phase0_webhook_tokens.sql"
 PHASE2_SQL="$ROOT/prisma/sql/2026-10-11_phase2_data_model.sql"
 PHASE3_SQL="$ROOT/prisma/sql/2026-10-12_phase3_ai_foundation.sql"
+PHASE4_SQL="$ROOT/prisma/sql/2026-10-12_phase4_kpi_assistant.sql"
 NEW_SCHEMA="$ROOT/prisma/schema.prisma"
 BASE_REV="${BASE_REV:-022e09a}"
 PHASE2_REV="${PHASE2_REV:-642c474}"
+PHASE3_REV="${PHASE3_REV:-f010e7f}"
 PRE_PHASE0_REV="${PRE_PHASE0_REV:-df6c1f6}"
 PG_BASE_URL="${VERIFY_PG_BASE_URL:-postgresql://raqib:raqib@localhost:5432}"
 PG_BASE_URL="${PG_BASE_URL%/}"
@@ -80,16 +104,18 @@ RUN_ID="$(date +%s)_$$_${RANDOM}"
 FRESH_DB="raqib_mverify_fresh_${RUN_ID}_test"
 EMPTY_DB="raqib_mverify_empty_${RUN_ID}_test"
 PARTIAL_DB="raqib_mverify_partial_${RUN_ID}_test"
+PARTIAL4_DB="raqib_mverify_partialp4_${RUN_ID}_test"
 SEED_DB="raqib_mverify_seed_${RUN_ID}_test"
 CHAIN_DB="raqib_mverify_chain_${RUN_ID}_test"
 EXT_DB="raqib_mverify_ext_${RUN_ID}_test"
 FRESH_URL="$PG_BASE_URL/$FRESH_DB"
 EMPTY_URL="$PG_BASE_URL/$EMPTY_DB"
 PARTIAL_URL="$PG_BASE_URL/$PARTIAL_DB"
+PARTIAL4_URL="$PG_BASE_URL/$PARTIAL4_DB"
 SEED_URL="$PG_BASE_URL/$SEED_DB"
 CHAIN_URL="$PG_BASE_URL/$CHAIN_DB"
 EXT_URL="$PG_BASE_URL/$EXT_DB"
-# application_name of the session that holds a lock on Document in section 3c.
+# application_name of the session that holds a lock on Document in section 3c (and on Framework in section 3e).
 BLOCKER_APP="raqib_mverify_blocker_${RUN_ID}"
 BLOCKER_PID=""
 ADMIN_URL="$PG_BASE_URL/postgres"
@@ -163,7 +189,7 @@ create_db() {
   CREATED_DBS+=("$name")
 }
 
-# Ends the session that holds a lock on Document in section 3c, if it is still there.
+# Ends the session that holds a lock on Document (3c) or Framework (3e), if it is still there.
 stop_blocker() {
   if [[ -n "$BLOCKER_PID" ]]; then
     psql "$ADMIN_URL" -X -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '$BLOCKER_APP'" >/dev/null 2>&1 || true
@@ -290,7 +316,8 @@ fi
 [[ -f "$PHASE0_SQL" ]] || die "missing $PHASE0_SQL"
 [[ -f "$PHASE2_SQL" ]] || die "missing $PHASE2_SQL"
 [[ -f "$PHASE3_SQL" ]] || die "missing $PHASE3_SQL"
-for rev in "$BASE_REV" "$PHASE2_REV" "$PRE_PHASE0_REV"; do
+[[ -f "$PHASE4_SQL" ]] || die "missing $PHASE4_SQL"
+for rev in "$BASE_REV" "$PHASE2_REV" "$PHASE3_REV" "$PRE_PHASE0_REV"; do
   git -C "$ROOT" cat-file -e "$rev:prisma/schema.prisma" 2>/dev/null \
     || die "git revision $rev not found (in CI use actions/checkout with fetch-depth: 0)"
 done
@@ -302,12 +329,16 @@ PHASE2_SCHEMA="$WORK/schema-phase2.prisma"
 git -C "$ROOT" show "$PHASE2_REV:prisma/schema.prisma" >"$PHASE2_SCHEMA"
 grep -q '^model ResultNode' "$PHASE2_SCHEMA" && ! grep -q '^model AiCall' "$PHASE2_SCHEMA" \
   || die "the schema at $PHASE2_REV is not the Phase 2 schema (ResultNode without AiCall)"
-pass "tools, revisions $BASE_REV, $PHASE2_REV and $PRE_PHASE0_REV and database server $SHOWN_URL available"
+PHASE3_SCHEMA="$WORK/schema-phase3.prisma"
+git -C "$ROOT" show "$PHASE3_REV:prisma/schema.prisma" >"$PHASE3_SCHEMA"
+grep -q '^model AiCall' "$PHASE3_SCHEMA" && ! grep -q '^model KpiSuggestion' "$PHASE3_SCHEMA" \
+  || die "the schema at $PHASE3_REV is not the Phase 3 schema (AiCall without KpiSuggestion)"
+pass "tools, revisions $BASE_REV, $PHASE2_REV, $PHASE3_REV and $PRE_PHASE0_REV and database server $SHOWN_URL available"
 
 # --- 0. static checks --------------------------------------------------------------------------------------------
 
 section "0. Static checks of the SQL files"
-for f in "$PHASE0_SQL" "$PHASE2_SQL" "$PHASE3_SQL"; do
+for f in "$PHASE0_SQL" "$PHASE2_SQL" "$PHASE3_SQL" "$PHASE4_SQL"; do
   if sed 's/--.*$//' "$f" | grep -Eiq '(^|[^[:alnum:]_])DROP([^[:alnum:]_]|$)'; then
     fail "no DROP statement in $(basename "$f")"
     sed 's/--.*$//' "$f" | grep -Ein '(^|[^[:alnum:]_])DROP([^[:alnum:]_]|$)' | sed 's/^/        /'
@@ -315,18 +346,24 @@ for f in "$PHASE0_SQL" "$PHASE2_SQL" "$PHASE3_SQL"; do
     pass "no DROP statement in $(basename "$f")"
   fi
 done
-if [[ "$(grep -Ec '^BEGIN;$' "$PHASE3_SQL")" == "1" && "$(grep -Ec '^COMMIT;$' "$PHASE3_SQL")" == "1" ]] \
-  && [[ "$(sed 's/--.*$//' "$PHASE3_SQL" | grep -v '^[[:space:]]*$' | head -n 1)" == "BEGIN;" ]] \
-  && [[ "$(sed 's/--.*$//' "$PHASE3_SQL" | grep -v '^[[:space:]]*$' | tail -n 1)" == "COMMIT;" ]]; then
-  pass "$(basename "$PHASE3_SQL") is one transaction (first statement BEGIN, last COMMIT)"
-else
-  fail "$(basename "$PHASE3_SQL") is not exactly one transaction"
-fi
-if [[ "$(sed 's/--.*$//' "$PHASE3_SQL" | grep -v '^[[:space:]]*$' | sed -n 2p)" == "SET LOCAL lock_timeout = '5s';" ]]; then
-  pass "$(basename "$PHASE3_SQL") sets lock_timeout right after BEGIN (fails fast on a busy table; checked in 3c)"
-else
-  fail "$(basename "$PHASE3_SQL") does not start with BEGIN; SET LOCAL lock_timeout = '5s';"
-fi
+# Outside comments: exactly one BEGIN and one COMMIT (and no other transaction control), BEGIN first and COMMIT last,
+# so a failure anywhere rolls back everything.
+for f in "$PHASE3_SQL" "$PHASE4_SQL"; do
+  code_lines="$(sed 's/--.*$//' "$f" | grep -v '^[[:space:]]*$')"
+  if [[ "$(grep -Ec '^BEGIN;$' "$f")" == "1" && "$(grep -Ec '^COMMIT;$' "$f")" == "1" ]] \
+    && ! printf '%s\n' "$code_lines" | grep -Eiv '^(BEGIN|COMMIT);$' | grep -Eiq '(^|[^[:alnum:]_"])(COMMIT|ROLLBACK|END[[:space:]]+TRANSACTION|START[[:space:]]+TRANSACTION)([^[:alnum:]_"]|$)' \
+    && [[ "$(printf '%s\n' "$code_lines" | head -n 1)" == "BEGIN;" ]] \
+    && [[ "$(printf '%s\n' "$code_lines" | tail -n 1)" == "COMMIT;" ]]; then
+    pass "$(basename "$f") is one transaction (first statement BEGIN, last COMMIT, no other transaction control)"
+  else
+    fail "$(basename "$f") is not exactly one transaction"
+  fi
+  if [[ "$(printf '%s\n' "$code_lines" | sed -n 2p)" == "SET LOCAL lock_timeout = '5s';" ]]; then
+    pass "$(basename "$f") sets lock_timeout right after BEGIN (fails fast on a busy table; checked in 3c and 3e)"
+  else
+    fail "$(basename "$f") does not start with BEGIN; SET LOCAL lock_timeout = '5s';"
+  fi
+done
 
 # The app's Prisma client creates, reads and deletes AiCall rows; with EXPECT_LEGACY_DOCS=1 it also reads the moved
 # document analyses of the fixtures below.
@@ -436,6 +473,153 @@ main().catch((err) => {
 });
 TS
 
+# The app's Prisma client writes, reads and deletes KPI runs and suggestions (Phase 4) as the application does, on a
+# fixture organisation it creates and removes again: defaults, the heartbeat (updatedAt), a conditional update, accept
+# and reject, the one-suggestion-per-indicator rule, the relations both ways, the queries the indexes serve, and a run
+# with suggestions that cannot be deleted. All values are synthetic.
+cat >"$WORK/kpi-check.ts" <<'TS'
+import { Prisma, PrismaClient } from '@prisma/client';
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function knownError(err: unknown, code: string): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === code;
+}
+
+async function main() {
+  const prisma = new PrismaClient();
+  const problems: string[] = [];
+  let orgId: string | null = null;
+  const before = { runs: await prisma.kpiSuggestionRun.count(), suggestions: await prisma.kpiSuggestion.count() };
+  try {
+    const org = await prisma.organization.create({
+      data: { name: 'Verify KPI organisation (fixture)', type: 'local_ngo', country: 'Palestine', city: 'Hebron', contactEmail: 'verify-kpi@example.org' },
+    });
+    orgId = org.id;
+    const project = await prisma.project.create({
+      data: {
+        organizationId: org.id, name: 'Verify KPI project (fixture)', sector: 'wash', donor: 'Verify donor', donorType: 'echo',
+        startDate: new Date('2026-01-01'), endDate: new Date('2026-12-31'), humanitarian: true,
+      },
+    });
+    const framework = await prisma.framework.create({ data: { projectId: project.id, version: 1 } });
+    const result = await prisma.resultNode.create({ data: { frameworkId: framework.id, level: 'outcome', code: 'O1', text: 'Verify outcome (fixture)' } });
+    const indicator = await prisma.indicator.create({
+      data: {
+        frameworkId: framework.id, resultId: result.id, indicatorText: 'Verify indicator (fixture)', level: 'outcome',
+        dataCollectionMethod: 'hh_survey', frequency: 'quarterly', phases: [], provenance: 'ai_suggested',
+      },
+    });
+
+    const run = await prisma.kpiSuggestionRun.create({
+      data: { projectId: project.id, frameworkId: framework.id, scope: 'result', resultId: result.id, requestedBy: 'verify-user' },
+    });
+    if (!UUID.test(run.id)) problems.push('run id is not a uuid');
+    if (run.status !== 'running' || run.step !== 'context' || run.suggestionCount !== 0 || run.modelCalls !== 0 || run.embeddingCalls !== 0
+      || run.inputTokens !== 0 || run.outputTokens !== 0) problems.push('run defaults not applied');
+    if (!Array.isArray(run.frameworkWarnings) || run.frameworkWarnings.length !== 0) problems.push('frameworkWarnings default is not []');
+    if (run.estimatedCostUsd !== null || run.finishedAt !== null || run.errorCode !== null || run.error !== null || run.latencyMs !== null) problems.push('run optional columns not empty');
+    if (Math.abs(Date.now() - run.updatedAt.getTime()) > 10 * 60_000 || Math.abs(Date.now() - run.createdAt.getTime()) > 10 * 60_000) problems.push('createdAt/updatedAt not set to the current time');
+
+    const base = {
+      projectId: project.id, frameworkId: framework.id, runId: run.id, resultId: result.id, level: 'outcome' as const,
+      method: 'hh_survey' as const, model: 'claude-sonnet-5-5', promptVersion: 'kpi-v1',
+    };
+    const first = await prisma.kpiSuggestion.create({
+      data: { ...base, payload: { name: 'Verify suggestion (fixture)', draft: { indicatorText: 'Verify suggestion (fixture)' } }, qualityScore: 85,
+        warnings: [{ code: 'target_in_name', severity: 'warning', penalty: 15 }] },
+    });
+    if (!UUID.test(first.id)) problems.push('suggestion id is not a uuid');
+    if (first.status !== 'pending' || first.sortOrder !== 0 || first.isCustom !== false || first.decidedAt !== null || first.indicatorId !== null) problems.push('suggestion defaults not applied');
+    const alternative = await prisma.kpiSuggestion.create({
+      data: { ...base, payload: { name: 'Verify alternative (fixture)' }, qualityScore: 100, isCustom: true, sortOrder: 1,
+        alternativeOfSuggestionId: first.id, alternativeOfIndicatorId: indicator.id },
+    });
+    const plain = await prisma.kpiSuggestion.findUniqueOrThrow({ where: { id: alternative.id } });
+    if (!Array.isArray(plain.warnings) || plain.warnings.length !== 0) problems.push('warnings default is not []');
+
+    // Heartbeat and completion: every executor write is conditional on status running.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const done = await prisma.kpiSuggestionRun.update({
+      where: { id: run.id, status: 'running' },
+      data: { status: 'completed', step: 'done', suggestionCount: 2, estimatedCostUsd: new Prisma.Decimal('0.004321'), finishedAt: new Date(),
+        frameworkWarnings: [{ code: 'result_cap', params: { cap: 3 } }], retrieval: 'keyword', model: 'claude-sonnet-5-5', promptVersion: 'kpi-v1' },
+    });
+    if (done.updatedAt.getTime() <= run.updatedAt.getTime()) problems.push('updatedAt did not move on update (heartbeat)');
+    if (done.estimatedCostUsd?.toString() !== '0.004321') problems.push(`estimatedCostUsd read back as ${String(done.estimatedCostUsd)}`);
+    const late = await prisma.kpiSuggestionRun.updateMany({ where: { id: run.id, status: 'running' }, data: { status: 'failed', errorCode: 'interrupted' } });
+    if (late.count !== 0) problems.push('a conditional write changed a finished run');
+
+    // Accept the first (it becomes the indicator), reject the alternative with a reason.
+    await prisma.kpiSuggestion.update({ where: { id: first.id }, data: { status: 'accepted', decidedAt: new Date(), decidedBy: 'verify-user', indicatorId: indicator.id } });
+    await prisma.kpiSuggestion.update({
+      where: { id: alternative.id },
+      data: { status: 'rejected', decidedAt: new Date(), decidedBy: 'verify-user', rejectReason: 'too_costly_to_measure', rejectNote: 'Verify note (fixture)' },
+    });
+    try {
+      await prisma.kpiSuggestion.update({ where: { id: alternative.id }, data: { indicatorId: indicator.id } });
+      problems.push('two suggestions were linked to one indicator');
+    } catch (err) {
+      if (!knownError(err, 'P2002')) problems.push(`linking a second suggestion to the indicator failed unexpectedly: ${err instanceof Error ? err.name : 'unknown'}`);
+    }
+
+    const read = await prisma.kpiSuggestionRun.findUniqueOrThrow({
+      where: { id: run.id },
+      include: { suggestions: { orderBy: { sortOrder: 'asc' }, include: { alternatives: true, alternativeOfSuggestion: true, indicator: true } }, result: true, framework: true, project: true },
+    });
+    if (read.suggestions.map(sg => sg.id).join(',') !== `${first.id},${alternative.id}`) problems.push('run.suggestions not read back in order');
+    if (read.suggestions[0].alternatives.map(a => a.id).join(',') !== alternative.id) problems.push('alternatives relation not read back');
+    if (read.suggestions[1].alternativeOfSuggestion?.id !== first.id) problems.push('alternativeOfSuggestion not read back');
+    if (read.suggestions[0].indicator?.id !== indicator.id) problems.push('accepted indicator not linked');
+    if (read.result?.id !== result.id || read.framework.id !== framework.id || read.project.id !== project.id) problems.push('run relations not read back');
+    const json = read.frameworkWarnings as Prisma.JsonArray;
+    if (JSON.stringify(json) !== '[{"code":"result_cap","params":{"cap":3}}]') problems.push('frameworkWarnings not read back as written');
+    const fromIndicator = await prisma.indicator.findUniqueOrThrow({ where: { id: indicator.id }, include: { acceptedFromSuggestion: true, kpiAlternatives: true, kpiRunsAsSource: true } });
+    if (fromIndicator.acceptedFromSuggestion?.id !== first.id || fromIndicator.kpiAlternatives.map(a => a.id).join(',') !== alternative.id) problems.push('indicator back-relations not read back');
+
+    // The queries the indexes are for: a project's pending cards, a framework's running runs, an organisation's
+    // rejections by library id (orgPreferences), a run's suggestions, a result's suggestions.
+    const pending = await prisma.kpiSuggestion.count({ where: { projectId: project.id, status: 'pending' } });
+    const running = await prisma.kpiSuggestionRun.count({ where: { frameworkId: framework.id, status: 'running' } });
+    const rejected = await prisma.kpiSuggestion.findMany({ where: { project: { organizationId: org.id }, status: 'rejected' }, select: { libraryId: true, rejectReason: true } });
+    const byResult = await prisma.kpiSuggestion.count({ where: { resultId: result.id } });
+    const recentRuns = await prisma.kpiSuggestionRun.findMany({ where: { projectId: project.id }, orderBy: { createdAt: 'desc' }, take: 5 });
+    if (pending !== 0 || running !== 0 || rejected.length !== 1 || rejected[0].rejectReason !== 'too_costly_to_measure' || byResult !== 2 || recentRuns.length !== 1) {
+      problems.push(`index queries returned pending=${pending} running=${running} rejected=${rejected.length} byResult=${byResult} runs=${recentRuns.length}`);
+    }
+
+    // Feedback history is never lost by pruning runs: a run with suggestions cannot be deleted.
+    try {
+      await prisma.kpiSuggestionRun.delete({ where: { id: run.id } });
+      problems.push('a run with suggestions was deleted');
+    } catch (err) {
+      if (!knownError(err, 'P2003')) problems.push(`deleting a run with suggestions failed unexpectedly: ${err instanceof Error ? err.name : 'unknown'}`);
+    }
+    if (await prisma.kpiSuggestion.count({ where: { runId: run.id } }) !== 2) problems.push('suggestions lost when the run delete was refused');
+
+    await prisma.kpiSuggestion.deleteMany({ where: { runId: run.id } });
+    await prisma.kpiSuggestionRun.delete({ where: { id: run.id } });
+  } finally {
+    if (orgId) {
+      await prisma.indicator.deleteMany({ where: { framework: { project: { organizationId: orgId } } } });
+      await prisma.framework.deleteMany({ where: { project: { organizationId: orgId } } });
+      await prisma.project.deleteMany({ where: { organizationId: orgId } });
+      await prisma.organization.delete({ where: { id: orgId } });
+    }
+  }
+  const after = { runs: await prisma.kpiSuggestionRun.count(), suggestions: await prisma.kpiSuggestion.count() };
+  if (after.runs !== before.runs || after.suggestions !== before.suggestions) problems.push(`KPI rows left behind: ${JSON.stringify({ before, after })}`);
+  await prisma.$disconnect();
+  console.log(JSON.stringify({ kpiRunsWritten: 1, kpiSuggestionsWritten: 2, problems }));
+  if (problems.length > 0) process.exit(2);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+TS
+
 # --- 1. fresh database -------------------------------------------------------------------------------------------
 
 section "1. Fresh database: prisma db push of the current schema"
@@ -447,12 +631,16 @@ check_no_drift "$FRESH_URL" "no drift between the fresh database and prisma/sche
 build_snapshot_sql "$FRESH_URL" "$WORK/snapshot-fresh.sql"
 expect_refused "$FRESH_URL" "Phase 3 SQL refused on a database that already has the Phase 3 schema, nothing changed" \
   "$PHASE3_SQL" "Phase 3 migration already applied" "$WORK/snapshot-fresh.sql"
+expect_refused "$FRESH_URL" "Phase 4 SQL refused on a database that already has the Phase 4 schema, nothing changed" \
+  "$PHASE4_SQL" "Phase 4 migration already applied" "$WORK/snapshot-fresh.sql"
 run_quiet "the app's Prisma client creates, reads and deletes AiCall rows (fresh database)" \
   in_dir "$ROOT" env DATABASE_URL="$FRESH_URL" DIRECT_URL="$FRESH_URL" "$TSX" "$WORK/aicall-check.ts"
+run_quiet "the app's Prisma client writes, reads and deletes KPI runs and suggestions (fresh database)" \
+  in_dir "$ROOT" env DATABASE_URL="$FRESH_URL" DIRECT_URL="$FRESH_URL" "$TSX" "$WORK/kpi-check.ts"
 
 # --- 2. empty database -------------------------------------------------------------------------------------------
 
-section "2. Empty database: the Phase 3 SQL needs Phase 0 and Phase 2"
+section "2. Empty database: the Phase 3 SQL needs Phase 0 and Phase 2, the Phase 4 SQL needs Phase 3"
 create_db "$EMPTY_DB"
 info "created $EMPTY_DB"
 # Objects in public (whatever template1 brings along), before and after: the refused run must create none.
@@ -482,10 +670,32 @@ else
   fail "Phase 3 SQL on a database with a leftover AiCallStatus type:"
   sed 's/^/        /' "$WORK/partly.log" | tail -n 20
 fi
+# The Phase 4 file on the same database (no Phase 3 schema; the AiCallStatus leftover above is not one of its own).
+OBJECTS_BEFORE="$(q "$EMPTY_URL" "$OBJECTS_SQL")"
+if psql "$EMPTY_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE4_SQL" >"$WORK/empty4.log" 2>&1; then
+  fail "Phase 4 SQL ran on a database without the Phase 3 schema"
+elif grep -qF "ERROR:  Phase 4 migration needs the Phase 3 SQL first" "$WORK/empty4.log" \
+  && [[ "$(q "$EMPTY_URL" "$OBJECTS_SQL")" == "$OBJECTS_BEFORE" ]]; then
+  pass "Phase 4 SQL refused on a database without the Phase 3 schema (\"needs the Phase 3 SQL first\"), created nothing"
+else
+  fail "Phase 4 SQL on a database without the Phase 3 schema:"
+  sed 's/^/        /' "$WORK/empty4.log" | tail -n 20
+fi
+q "$EMPTY_URL" "CREATE TYPE \"SuggestionStatus\" AS ENUM ('pending')" >/dev/null
+OBJECTS_BEFORE="$(q "$EMPTY_URL" "$OBJECTS_SQL")"
+if psql "$EMPTY_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE4_SQL" >"$WORK/partly4.log" 2>&1; then
+  fail "Phase 4 SQL ran on a database with a leftover SuggestionStatus type"
+elif grep -qF "ERROR:  Phase 4 migration already partly applied" "$WORK/partly4.log" \
+  && [[ "$(q "$EMPTY_URL" "$OBJECTS_SQL")" == "$OBJECTS_BEFORE" ]]; then
+  pass "Phase 4 SQL refused on a database with a leftover SuggestionStatus type (\"already partly applied\"), nothing changed"
+else
+  fail "Phase 4 SQL on a database with a leftover SuggestionStatus type:"
+  sed 's/^/        /' "$WORK/partly4.log" | tail -n 20
+fi
 
 # --- 2b. partly applied ------------------------------------------------------------------------------------------
 
-section "2b. Partly applied: one leftover Phase 3 object on a database at the Phase 2 schema ($PHASE2_REV)"
+section "2b. Partly applied: one leftover Phase 3 object on a database at the Phase 2 schema ($PHASE2_REV), one leftover Phase 4 object at the Phase 3 schema ($PHASE3_REV)"
 create_db "$PARTIAL_DB"
 info "created $PARTIAL_DB"
 run_quiet "schema at $PHASE2_REV pushed (what the Phase 3 SQL upgrades)" \
@@ -514,6 +724,37 @@ for partial_case in "${PARTIAL_CASES[@]}"; do
     pass "Phase 3 SQL refused on a Phase 2 database with a leftover $leftover_name (\"already partly applied\", named), nothing changed"
   else
     fail "Phase 3 SQL on a Phase 2 database with a leftover $leftover_name:"
+    sed 's/^/        /' "$WORK/partial$PARTIAL_N.log" | tail -n 20
+  fi
+done
+
+info "Phase 4: one leftover Phase 4 object on a database at the Phase 3 schema ($PHASE3_REV)"
+create_db "$PARTIAL4_DB"
+info "created $PARTIAL4_DB"
+run_quiet "schema at $PHASE3_REV pushed (what the Phase 4 SQL upgrades)" \
+  in_dir "$WORK" env DATABASE_URL="$PARTIAL4_URL" DIRECT_URL="$PARTIAL4_URL" "$PRISMA" db push --schema "$PHASE3_SCHEMA" --skip-generate
+PARTIAL4_CASES=(
+  "CREATE TYPE \"SuggestionStatus\" AS ENUM ('pending')|type \"SuggestionStatus\""
+  "CREATE TYPE \"SuggestionRejectReason\" AS ENUM ('other')|type \"SuggestionRejectReason\""
+  "CREATE TYPE \"KpiRunScope\" AS ENUM ('framework')|type \"KpiRunScope\""
+  "CREATE TYPE \"KpiRunStatus\" AS ENUM ('running')|type \"KpiRunStatus\""
+  'CREATE TABLE "KpiSuggestionRun" ("id" TEXT NOT NULL PRIMARY KEY)|table "KpiSuggestionRun"'
+)
+for partial_case in "${PARTIAL4_CASES[@]}"; do
+  PARTIAL_N=$((PARTIAL_N + 1))
+  IFS='|' read -r leftover_sql leftover_name <<<"$partial_case"
+  copy_db="raqib_mverify_partial${PARTIAL_N}_${RUN_ID}_test"
+  create_db "$copy_db" "$PARTIAL4_DB"
+  copy_url="$PG_BASE_URL/$copy_db"
+  q "$copy_url" "$leftover_sql" >/dev/null
+  fp_before="$(q "$copy_url" "$SCHEMA_FP_SQL")"
+  if psql "$copy_url" -X -q -v ON_ERROR_STOP=1 -f "$PHASE4_SQL" >"$WORK/partial$PARTIAL_N.log" 2>&1; then
+    fail "Phase 4 SQL ran on a Phase 3 database with a leftover $leftover_name"
+  elif grep -qF "ERROR:  Phase 4 migration already partly applied: $leftover_name exist(s) without table \"KpiSuggestion\"" "$WORK/partial$PARTIAL_N.log" \
+    && [[ "$(q "$copy_url" "$SCHEMA_FP_SQL")" == "$fp_before" ]]; then
+    pass "Phase 4 SQL refused on a Phase 3 database with a leftover $leftover_name (\"already partly applied\", named), nothing changed"
+  else
+    fail "Phase 4 SQL on a Phase 3 database with a leftover $leftover_name:"
     sed 's/^/        /' "$WORK/partial$PARTIAL_N.log" | tail -n 20
   fi
 done
@@ -808,15 +1049,16 @@ new_seed_copy() {
   create_db "$name" "$SEED_DB"
   NEG_URL="$PG_BASE_URL/$name"
 }
+# The optional fifth argument is the snapshot file to compare (default: every column after Phase 2, for Phase 3).
 expect_rollback() {
-  local url="$1" label="$2" file="$3" message="$4" log before fp_before
+  local url="$1" label="$2" file="$3" message="$4" snap_sql="${5:-$SNAP3_ALL_SQL}" log before fp_before
   log="$(mktemp "$WORK/rollback.XXXXXX")"
-  before="$(snapshot "$url" "$SNAP3_ALL_SQL")"
+  before="$(snapshot "$url" "$snap_sql")"
   fp_before="$(q "$url" "$SCHEMA_FP_SQL")"
   if psql "$url" -X -q -v ON_ERROR_STOP=1 -f "$file" >"$log" 2>&1; then
     fail "$label (the file ran and committed)"
   elif grep -qF "ERROR:  $message" "$log"; then
-    if [[ "$(snapshot "$url" "$SNAP3_ALL_SQL")" == "$before" && "$(q "$url" "$SCHEMA_FP_SQL")" == "$fp_before" ]]; then
+    if [[ "$(snapshot "$url" "$snap_sql")" == "$before" && "$(q "$url" "$SCHEMA_FP_SQL")" == "$fp_before" ]]; then
       pass "$label"
     else
       fail "$label (stopped, but data or schema changed)"
@@ -1083,7 +1325,7 @@ expect_before "nothing lost: for every legacy document, the old parsedText is th
 expect_before "the document count is unchanged" \
   "SELECT abs((SELECT count(*) FROM before_docs) - (SELECT count(*) FROM \"Document\"))"
 
-check_no_drift "$S" "no drift between the migrated database and prisma/schema.prisma"
+check_no_drift "$S" "no drift between the database after the Phase 3 SQL and the Phase 3 schema ($PHASE3_REV)" "$PHASE3_SCHEMA"
 run_quiet "the app's Prisma client creates, reads and deletes AiCall rows and reads the moved analyses (seed copy)" \
   in_dir "$ROOT" env EXPECT_LEGACY_DOCS=1 DATABASE_URL="$SEED_URL" DIRECT_URL="$SEED_URL" "$TSX" "$WORK/aicall-check.ts"
 run_quiet "the app's Prisma client still reads indicators with results, projects with sectors, result nodes" \
@@ -1097,9 +1339,240 @@ expect_refused "$S" "second Phase 3 run refused (\"already applied\") and nothin
 
 info "after the Phase 3 SQL: $(q "$S" 'SELECT count(*) FROM "Document" WHERE "aiAnalysis" IS NOT NULL') documents with aiAnalysis ($(q "$S" "SELECT count(*) FROM \"Document\" WHERE \"aiAnalysis\" ? 'legacyText'") as legacyText), AiCall rows: $(q "$S" 'SELECT count(*) FROM "AiCall"')"
 
+# --- 3e/3f. Phase 4 on the same database ---------------------------------------------------------------------------
+
+section "3e. Phase 4 SQL (on the database after the Phase 3 SQL)"
+# Snapshot of every column of every table as it is after Phase 3. Phase 4 changes none of them, so the same snapshot is
+# compared after it (3f) and around every run that must roll back.
+SNAP4_SQL="$WORK/snapshot4.sql"
+build_snapshot_sql "$S" "$SNAP4_SQL"
+snapshot "$S" "$SNAP4_SQL" >"$WORK/before4.txt"
+TABLES4="$(wc -l <"$WORK/before4.txt" | tr -d ' ')"
+info "snapshot of $TABLES4 tables (row count + md5 of every column)"
+
+# lock_timeout: another session has an open write transaction on Framework (ROW EXCLUSIVE, which every INSERT, UPDATE
+# and DELETE takes). Creating KpiSuggestionRun_frameworkId_fkey needs SHARE ROW EXCLUSIVE on Framework, which conflicts
+# with it, so the file must give up after about 5 seconds instead of waiting (and making every later write to Framework
+# queue behind it). A plain read (ACCESS SHARE) does not conflict with SHARE ROW EXCLUSIVE: reads carry on meanwhile.
+new_seed_copy
+PGAPPNAME="$BLOCKER_APP" psql "$NEG_URL" -X -q -v ON_ERROR_STOP=1 \
+  -c 'BEGIN' -c 'LOCK TABLE "Framework" IN ROW EXCLUSIVE MODE' -c 'SELECT pg_sleep(300)' -c 'COMMIT' >/dev/null 2>&1 &
+BLOCKER_PID=$!
+LOCK_HELD=0
+for _ in $(seq 1 100); do
+  if [[ "$(q "$NEG_URL" "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+        WHERE a.application_name = '$BLOCKER_APP' AND l.relation = '\"Framework\"'::regclass AND l.mode = 'RowExclusiveLock' AND l.granted")" == "1" ]]; then
+    LOCK_HELD=1
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$LOCK_HELD" == "1" ]]; then
+  LOCK_STARTED=$SECONDS
+  expect_rollback "$NEG_URL" "Phase 4 SQL gives up while another session writes to Framework (\"lock timeout\"), nothing changed" \
+    "$PHASE4_SQL" "canceling statement due to lock timeout" "$SNAP4_SQL"
+  LOCK_ELAPSED=$((SECONDS - LOCK_STARTED))
+  if [[ $LOCK_ELAPSED -ge 4 && $LOCK_ELAPSED -le 60 ]]; then
+    pass "it waited about lock_timeout (${LOCK_ELAPSED}s), not until the other session ended"
+  else
+    fail "it took ${LOCK_ELAPSED}s on a Framework table with an open write transaction (expected about 5s)"
+  fi
+else
+  fail "could not take a write lock on Framework in a second session"
+fi
+stop_blocker
+
+# Copies of the file with one deliberate bug each: its self-check must stop them.
+mutate "$PHASE4_SQL" "$WORK/mutant4-rls.sql" \
+  'ALTER TABLE "KpiSuggestion" ENABLE ROW LEVEL SECURITY;' '-- (mutant: row level security not enabled on KpiSuggestion)'
+new_seed_copy
+expect_rollback "$NEG_URL" "self-check stops a file that leaves row level security off on KpiSuggestion, nothing changed" \
+  "$WORK/mutant4-rls.sql" "Phase 4 self-check failed: row level security is not enabled on KpiSuggestion" "$SNAP4_SQL"
+mutate "$PHASE4_SQL" "$WORK/mutant4-cascade.sql" \
+  '"KpiSuggestion_resultId_fkey" FOREIGN KEY ("resultId") REFERENCES "ResultNode"("id") ON DELETE SET NULL' \
+  '"KpiSuggestion_resultId_fkey" FOREIGN KEY ("resultId") REFERENCES "ResultNode"("id") ON DELETE CASCADE'
+new_seed_copy
+expect_rollback "$NEG_URL" "self-check stops a file whose KpiSuggestion.resultId cascades on delete (feedback would be lost), nothing changed" \
+  "$WORK/mutant4-cascade.sql" "Phase 4 self-check failed: foreign key(s) missing, extra or with the wrong target or behaviour: KpiSuggestion_resultId_fkey" "$SNAP4_SQL"
+mutate "$PHASE4_SQL" "$WORK/mutant4-enum.sql" \
+  "CREATE TYPE \"SuggestionStatus\" AS ENUM ('pending', 'accepted', 'edited_accepted', 'rejected', 'expired');" \
+  "CREATE TYPE \"SuggestionStatus\" AS ENUM ('pending', 'accepted', 'rejected', 'expired');"
+new_seed_copy
+expect_rollback "$NEG_URL" "self-check stops a file with a SuggestionStatus value missing, nothing changed" \
+  "$WORK/mutant4-enum.sql" "Phase 4 self-check failed: enum labels differ: SuggestionStatus is [pending,accepted,rejected,expired], expected [pending,accepted,edited_accepted,rejected,expired]" "$SNAP4_SQL"
+
+run_quiet "Phase 4 SQL applied with psql -v ON_ERROR_STOP=1" \
+  psql "$SEED_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE4_SQL"
+
+section "3f. Checks after the Phase 4 SQL"
+snapshot "$S" "$SNAP4_SQL" >"$WORK/after4.txt"
+if diff -u "$WORK/before4.txt" "$WORK/after4.txt" >"$WORK/snapshot4.diff"; then
+  pass "row counts and checksums unchanged for all $TABLES4 pre-existing tables (every column)"
+else
+  fail "row counts or checksums changed:"
+  sed 's/^/        /' "$WORK/snapshot4.diff"
+fi
+
+# Both tables exactly as prisma/schema.prisma defines them (the drift check below compares them with Prisma too).
+COLUMNS_SQL="SELECT string_agg(column_name || ' ' ||
+            CASE WHEN data_type = 'USER-DEFINED' THEN udt_name
+                 WHEN data_type = 'numeric' THEN 'numeric(' || numeric_precision || ',' || numeric_scale || ')'
+                 WHEN data_type LIKE 'timestamp%' THEN udt_name || '(' || datetime_precision || ')'
+                 ELSE udt_name END || ' ' ||
+            CASE is_nullable WHEN 'NO' THEN 'not null' ELSE 'null' END || coalesce(' default ' || column_default, ''),
+          ', ' ORDER BY ordinal_position)
+   FROM information_schema.columns WHERE table_schema = 'public' AND table_name = "
+KPI_RUN_COLUMNS="$(cat <<'TXT'
+id text not null, projectId text not null, frameworkId text not null, scope KpiRunScope not null, resultId text null, sourceIndicatorId text null, sourceSuggestionId text null, status KpiRunStatus not null default 'running'::"KpiRunStatus", step text not null default 'context'::text, errorCode text null, error text null, frameworkWarnings jsonb not null default '[]'::jsonb, suggestionCount int4 not null default 0, retrieval text null, model text null, promptVersion text null, modelCalls int4 not null default 0, embeddingCalls int4 not null default 0, inputTokens int4 not null default 0, outputTokens int4 not null default 0, estimatedCostUsd numeric(12,6) null, latencyMs int4 null, requestedBy text null, createdAt timestamp(3) not null default CURRENT_TIMESTAMP, updatedAt timestamp(3) not null, finishedAt timestamp(3) null
+TXT
+)"
+KPI_SUGGESTION_COLUMNS="$(cat <<'TXT'
+id text not null, projectId text not null, frameworkId text not null, runId text not null, resultId text null, level IndicatorLevel not null, sortOrder int4 not null default 0, payload jsonb not null, qualityScore int4 not null, warnings jsonb not null default '[]'::jsonb, libraryId text null, isCustom bool not null default false, method CollectionMethod not null, alternativeOfIndicatorId text null, alternativeOfSuggestionId text null, status SuggestionStatus not null default 'pending'::"SuggestionStatus", model text not null, promptVersion text not null, createdAt timestamp(3) not null default CURRENT_TIMESTAMP, decidedAt timestamp(3) null, decidedBy text null, rejectReason SuggestionRejectReason null, rejectNote text null, indicatorId text null
+TXT
+)"
+expect_eq "$S" "KpiSuggestionRun columns, types, nullability and defaults (updatedAt without a database default)" \
+  "$KPI_RUN_COLUMNS" "$COLUMNS_SQL'KpiSuggestionRun'"
+expect_eq "$S" "KpiSuggestion columns, types, nullability and defaults" \
+  "$KPI_SUGGESTION_COLUMNS" "$COLUMNS_SQL'KpiSuggestion'"
+expect_eq "$S" "the four Phase 4 enums with their values in order" \
+  "KpiRunScope:framework,result,alternatives; KpiRunStatus:running,completed,failed; SuggestionRejectReason:not_relevant,too_costly_to_measure,donor_not_required,duplicate,wording,other; SuggestionStatus:pending,accepted,edited_accepted,rejected,expired" \
+  "SELECT string_agg(typname || ':' || labels, '; ' ORDER BY typname) FROM (
+     SELECT t.typname::text AS typname, string_agg(e.enumlabel::text, ',' ORDER BY e.enumsortorder) AS labels
+     FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+     WHERE t.typnamespace = 'public'::regnamespace AND t.typname IN ('SuggestionStatus', 'SuggestionRejectReason', 'KpiRunScope', 'KpiRunStatus')
+     GROUP BY t.typname) s"
+INDEXES_SQL="SELECT string_agg(indexname || ':' || CASE WHEN indexdef LIKE 'CREATE UNIQUE%' THEN 'unique ' ELSE '' END || regexp_replace(indexdef, '^.* USING ', ''), ', ' ORDER BY indexname)
+   FROM pg_indexes WHERE schemaname = 'public' AND tablename = "
+expect_eq "$S" "KpiSuggestionRun indexes: primary key and the two Prisma-named indexes" \
+  'KpiSuggestionRun_frameworkId_status_idx:btree ("frameworkId", status), KpiSuggestionRun_pkey:unique btree (id), KpiSuggestionRun_projectId_createdAt_idx:btree ("projectId", "createdAt")' \
+  "$INDEXES_SQL'KpiSuggestionRun'"
+expect_eq "$S" "KpiSuggestion indexes: primary key, unique indicatorId and the five Prisma-named indexes" \
+  'KpiSuggestion_frameworkId_status_idx:btree ("frameworkId", status), KpiSuggestion_indicatorId_key:unique btree ("indicatorId"), KpiSuggestion_libraryId_status_idx:btree ("libraryId", status), KpiSuggestion_pkey:unique btree (id), KpiSuggestion_projectId_status_idx:btree ("projectId", status), KpiSuggestion_resultId_idx:btree ("resultId"), KpiSuggestion_runId_idx:btree ("runId")' \
+  "$INDEXES_SQL'KpiSuggestion'"
+FKEYS_SQL="SELECT string_agg(conname || ':' || pg_get_constraintdef(oid), ', ' ORDER BY conname) FROM pg_constraint WHERE contype = 'f' AND conrelid = "
+expect_eq "$S" "KpiSuggestionRun foreign keys: project and framework CASCADE, result and sources SET NULL, all ON UPDATE CASCADE" \
+  'KpiSuggestionRun_frameworkId_fkey:FOREIGN KEY ("frameworkId") REFERENCES "Framework"(id) ON UPDATE CASCADE ON DELETE CASCADE, KpiSuggestionRun_projectId_fkey:FOREIGN KEY ("projectId") REFERENCES "Project"(id) ON UPDATE CASCADE ON DELETE CASCADE, KpiSuggestionRun_resultId_fkey:FOREIGN KEY ("resultId") REFERENCES "ResultNode"(id) ON UPDATE CASCADE ON DELETE SET NULL, KpiSuggestionRun_sourceIndicatorId_fkey:FOREIGN KEY ("sourceIndicatorId") REFERENCES "Indicator"(id) ON UPDATE CASCADE ON DELETE SET NULL, KpiSuggestionRun_sourceSuggestionId_fkey:FOREIGN KEY ("sourceSuggestionId") REFERENCES "KpiSuggestion"(id) ON UPDATE CASCADE ON DELETE SET NULL' \
+  "$FKEYS_SQL'public.\"KpiSuggestionRun\"'::regclass"
+expect_eq "$S" "KpiSuggestion foreign keys: project and framework CASCADE, run NO ACTION, result, library, indicator and alternatives SET NULL" \
+  'KpiSuggestion_alternativeOfIndicatorId_fkey:FOREIGN KEY ("alternativeOfIndicatorId") REFERENCES "Indicator"(id) ON UPDATE CASCADE ON DELETE SET NULL, KpiSuggestion_alternativeOfSuggestionId_fkey:FOREIGN KEY ("alternativeOfSuggestionId") REFERENCES "KpiSuggestion"(id) ON UPDATE CASCADE ON DELETE SET NULL, KpiSuggestion_frameworkId_fkey:FOREIGN KEY ("frameworkId") REFERENCES "Framework"(id) ON UPDATE CASCADE ON DELETE CASCADE, KpiSuggestion_indicatorId_fkey:FOREIGN KEY ("indicatorId") REFERENCES "Indicator"(id) ON UPDATE CASCADE ON DELETE SET NULL, KpiSuggestion_libraryId_fkey:FOREIGN KEY ("libraryId") REFERENCES "IndicatorLibraryEntry"(id) ON UPDATE CASCADE ON DELETE SET NULL, KpiSuggestion_projectId_fkey:FOREIGN KEY ("projectId") REFERENCES "Project"(id) ON UPDATE CASCADE ON DELETE CASCADE, KpiSuggestion_resultId_fkey:FOREIGN KEY ("resultId") REFERENCES "ResultNode"(id) ON UPDATE CASCADE ON DELETE SET NULL, KpiSuggestion_runId_fkey:FOREIGN KEY ("runId") REFERENCES "KpiSuggestionRun"(id) ON UPDATE CASCADE' \
+  "$FKEYS_SQL'public.\"KpiSuggestion\"'::regclass"
+expect_eq "$S" "row level security enabled on KpiSuggestionRun and KpiSuggestion, with no policies (not readable with the anon key)" \
+  "KpiSuggestion:true:0, KpiSuggestionRun:true:0" \
+  "SELECT string_agg(c.relname || ':' || c.relrowsecurity || ':' || (SELECT count(*) FROM pg_policy WHERE polrelid = c.oid), ', ' ORDER BY c.relname)
+   FROM pg_class c WHERE c.oid IN ('public.\"KpiSuggestionRun\"'::regclass, 'public.\"KpiSuggestion\"'::regclass)"
+expect_zero "$S" "no KPI rows invented by the migration" \
+  'SELECT (SELECT count(*) FROM "KpiSuggestionRun") + (SELECT count(*) FROM "KpiSuggestion")'
+expect_zero "$S" "the migration's temp table did not outlive its session" \
+  "SELECT count(*) FROM pg_class WHERE relname LIKE 'raqib\\_phase4\\_%'"
+
+# Foreign key behaviour on synthetic fixtures, in a transaction that is rolled back: defaults (raw inserts set "id" and
+# "updatedAt", which have no database default), one suggestion per accepted indicator, an id rename that follows, a
+# deleted result, library entry, indicator or source suggestion that empties the link (rejected suggestions stay as
+# feedback), a run with suggestions that cannot be deleted, a project with a framework that cannot be deleted (the
+# API archives projects instead), and a framework delete that removes its runs and suggestions in one statement (the
+# NO ACTION check on runId runs at the end of that statement, when the suggestions are gone too).
+cat >"$WORK/fk4.sql" <<'SQL'
+BEGIN;
+-- Runs a statement and says whether it ran or which constraint (foreign key or unique index) refused it; a refused
+-- statement is rolled back on its own and the transaction carries on.
+CREATE FUNCTION pg_temp.p4v_try(statement text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+  refused_by text;
+BEGIN
+  EXECUTE statement;
+  RETURN 'ran';
+EXCEPTION WHEN foreign_key_violation OR unique_violation THEN
+  GET STACKED DIAGNOSTICS refused_by = CONSTRAINT_NAME;
+  RETURN 'refused by ' || refused_by;
+END
+$$;
+INSERT INTO "Organization" (id, name, type, country, city, "contactEmail")
+VALUES ('p4v-org', 'Verify organisation (fixture)', 'local_ngo', 'Palestine', 'Hebron', 'verify@example.org');
+INSERT INTO "Project" (id, "organizationId", name, sector, donor, "donorType", "startDate", "endDate")
+VALUES ('p4v-prj', 'p4v-org', 'Verify project (fixture)', 'wash', 'Verify donor', 'echo', '2026-01-01', '2026-12-31');
+INSERT INTO "Framework" (id, "projectId", version) VALUES ('p4v-fw', 'p4v-prj', 1);
+INSERT INTO "ResultNode" (id, "frameworkId", level, code, text)
+VALUES ('p4v-o1', 'p4v-fw', 'outcome', 'O1', 'Verify outcome (fixture)'), ('p4v-o2', 'p4v-fw', 'outcome', 'O2', 'Verify outcome 2 (fixture)');
+INSERT INTO "Indicator" (id, "frameworkId", "resultId", "indicatorText", level, "dataCollectionMethod", frequency, phases)
+VALUES ('p4v-ind', 'p4v-fw', 'p4v-o2', 'Verify indicator (fixture)', 'outcome', 'hh_survey', 'quarterly', '[]');
+INSERT INTO "IndicatorLibraryEntry" (id, sector, tags, level, name, "nameAr", definition, unit, direction, disaggregation,
+                                     methods, frequency, "meansOfVerification", "isStandard", version, "updatedAt")
+VALUES ('P4V-01', 'wash', '{}', 'outcome', 'Fixture entry', 'مؤشر تجريبي', 'Fixture.', 'number', 'increase', '{}', '{}',
+        'quarterly', 'Fixture.', false, 'verify', now());
+-- Raw inserts set "id" (no database default for @default(uuid())) and "updatedAt" (@updatedAt has no database default).
+INSERT INTO "KpiSuggestionRun" (id, "projectId", "frameworkId", scope, "resultId", "sourceIndicatorId", "updatedAt")
+VALUES ('p4v-run', 'p4v-prj', 'p4v-fw', 'alternatives', 'p4v-o1', 'p4v-ind', now());
+INSERT INTO "KpiSuggestion" (id, "projectId", "frameworkId", "runId", "resultId", level, payload, "qualityScore", method, model,
+                             "promptVersion", "libraryId", "alternativeOfIndicatorId")
+VALUES ('p4v-s1', 'p4v-prj', 'p4v-fw', 'p4v-run', 'p4v-o1', 'outcome', '{"name":"Verify suggestion"}', 85, 'hh_survey',
+        'claude-sonnet-5-5', 'kpi-v1', 'P4V-01', 'p4v-ind');
+INSERT INTO "KpiSuggestion" (id, "projectId", "frameworkId", "runId", "resultId", level, payload, "qualityScore", method, model,
+                             "promptVersion", status, "indicatorId", "decidedAt")
+VALUES ('p4v-s2', 'p4v-prj', 'p4v-fw', 'p4v-run', 'p4v-o1', 'outcome', '{}', 100, 'observation', 'claude-sonnet-5-5', 'kpi-v1',
+        'accepted', 'p4v-ind', now());
+INSERT INTO "KpiSuggestionRun" (id, "projectId", "frameworkId", scope, "resultId", "sourceSuggestionId", status, "updatedAt")
+VALUES ('p4v-run2', 'p4v-prj', 'p4v-fw', 'alternatives', 'p4v-o1', 'p4v-s1', 'completed', now());
+INSERT INTO "KpiSuggestion" (id, "projectId", "frameworkId", "runId", "resultId", level, payload, "qualityScore", method, model,
+                             "promptVersion", status, "rejectReason", "alternativeOfSuggestionId", "decidedAt")
+VALUES ('p4v-s3', 'p4v-prj', 'p4v-fw', 'p4v-run2', 'p4v-o1', 'outcome', '{}', 70, 'kii', 'claude-haiku-5-5', 'kpi-v1',
+        'rejected', 'not_relevant', 'p4v-s1', now());
+SELECT 'run defaults:' || status::text || ',' || step || ',' || "frameworkWarnings"::text || ',' || "suggestionCount" || ',' || "modelCalls"
+       || ',' || "embeddingCalls" || ',' || "inputTokens" || ',' || "outputTokens" || ',' || ("createdAt" IS NOT NULL)
+FROM "KpiSuggestionRun" WHERE id = 'p4v-run';
+SELECT 'suggestion defaults:' || status::text || ',' || "sortOrder" || ',' || warnings::text || ',' || "isCustom" FROM "KpiSuggestion" WHERE id = 'p4v-s1';
+SELECT 'second accepted suggestion for one indicator:' || pg_temp.p4v_try($q$UPDATE "KpiSuggestion" SET "indicatorId" = 'p4v-ind' WHERE id = 'p4v-s3'$q$);
+UPDATE "Project" SET id = 'p4v-prj2' WHERE id = 'p4v-prj';
+SELECT 'project renamed:' || string_agg(DISTINCT "projectId", ',') FROM (SELECT "projectId" FROM "KpiSuggestionRun" WHERE id LIKE 'p4v-%'
+                                                                       UNION ALL SELECT "projectId" FROM "KpiSuggestion" WHERE id LIKE 'p4v-%') x;
+DELETE FROM "ResultNode" WHERE id = 'p4v-o1';
+SELECT 'result deleted:' || count(*) FILTER (WHERE "resultId" IS NULL) || '/' || count(*) FROM (SELECT "resultId" FROM "KpiSuggestionRun" WHERE id LIKE 'p4v-%'
+                                                         UNION ALL SELECT "resultId" FROM "KpiSuggestion" WHERE id LIKE 'p4v-%') x;
+DELETE FROM "IndicatorLibraryEntry" WHERE id = 'P4V-01';
+SELECT 'library entry deleted:' || coalesce("libraryId", '-') FROM "KpiSuggestion" WHERE id = 'p4v-s1';
+DELETE FROM "Indicator" WHERE id = 'p4v-ind';
+SELECT 'indicator deleted:' || coalesce((SELECT "sourceIndicatorId" FROM "KpiSuggestionRun" WHERE id = 'p4v-run'), '-') || ','
+       || coalesce((SELECT "alternativeOfIndicatorId" FROM "KpiSuggestion" WHERE id = 'p4v-s1'), '-') || ','
+       || (SELECT coalesce("indicatorId", '-') || ':' || status::text FROM "KpiSuggestion" WHERE id = 'p4v-s2');
+DELETE FROM "KpiSuggestion" WHERE id = 'p4v-s1';
+SELECT 'suggestion deleted:' || coalesce((SELECT "sourceSuggestionId" FROM "KpiSuggestionRun" WHERE id = 'p4v-run2'), '-') || ','
+       || coalesce((SELECT "alternativeOfSuggestionId" FROM "KpiSuggestion" WHERE id = 'p4v-s3'), '-');
+SELECT 'run with suggestions deleted:' || pg_temp.p4v_try($q$DELETE FROM "KpiSuggestionRun" WHERE id = 'p4v-run'$q$)
+       || ',' || (SELECT count(*) FROM "KpiSuggestionRun" WHERE id LIKE 'p4v-%') || ',' || (SELECT count(*) FROM "KpiSuggestion" WHERE id LIKE 'p4v-%');
+SELECT 'project with a framework deleted:' || pg_temp.p4v_try($q$DELETE FROM "Project" WHERE id = 'p4v-prj2'$q$);
+DELETE FROM "Framework" WHERE id = 'p4v-fw';
+SELECT 'framework deleted:' || (SELECT count(*) FROM "KpiSuggestionRun" WHERE id LIKE 'p4v-%') || ',' || (SELECT count(*) FROM "KpiSuggestion" WHERE id LIKE 'p4v-%')
+       || ',' || (SELECT count(*) FROM "ResultNode" WHERE id LIKE 'p4v-%');
+SELECT 'project deleted:' || pg_temp.p4v_try($q$DELETE FROM "Project" WHERE id = 'p4v-prj2'$q$);
+ROLLBACK;
+SQL
+FK4_OUT="$(psql "$S" -X -At -q -v ON_ERROR_STOP=1 -f "$WORK/fk4.sql" 2>&1 | tr '\n' ';')" || true
+FK4_EXPECTED="run defaults:running,context,[],0,0,0,0,0,true;suggestion defaults:pending,0,[],false;second accepted suggestion for one indicator:refused by KpiSuggestion_indicatorId_key;project renamed:p4v-prj2;result deleted:5/5;library entry deleted:-;indicator deleted:-,-,-:accepted;suggestion deleted:-,-;run with suggestions deleted:refused by KpiSuggestion_runId_fkey,2,2;project with a framework deleted:refused by Framework_projectId_fkey;framework deleted:0,0,0;project deleted:ran;"
+if [[ "$FK4_OUT" == "$FK4_EXPECTED" ]]; then
+  pass "KPI foreign keys behave: defaults, unique indicatorId, renames follow, SET NULL on result/library/indicator/suggestion deletes, a run with suggestions and a project with a framework cannot be deleted, a framework delete removes its runs and suggestions (rolled back)"
+else
+  fail "KPI foreign key behaviour (expected '$FK4_EXPECTED', got '$FK4_OUT')"
+fi
+
+check_no_drift "$S" "no drift between the database after the Phase 4 SQL and prisma/schema.prisma"
+run_quiet "the app's Prisma client writes, reads and deletes KPI runs and suggestions (seed copy)" \
+  in_dir "$ROOT" env DATABASE_URL="$SEED_URL" DIRECT_URL="$SEED_URL" "$TSX" "$WORK/kpi-check.ts"
+run_quiet "the app's Prisma client still creates and reads AiCall rows and reads the moved analyses after Phase 4" \
+  in_dir "$ROOT" env EXPECT_LEGACY_DOCS=1 DATABASE_URL="$SEED_URL" DIRECT_URL="$SEED_URL" "$TSX" "$WORK/aicall-check.ts"
+run_quiet "the app's Prisma client still reads indicators with results, projects with sectors, result nodes after Phase 4" \
+  in_dir "$ROOT" env DATABASE_URL="$SEED_URL" DIRECT_URL="$SEED_URL" "$TSX" "$WORK/read-check.ts"
+
+# Running the file a second time must be refused and change nothing (every column of every table, new ones included).
+SNAP4_ALL_SQL="$WORK/snapshot4-all.sql"
+build_snapshot_sql "$S" "$SNAP4_ALL_SQL"
+expect_refused "$S" "second Phase 4 run refused (\"already applied\") and nothing changed" \
+  "$PHASE4_SQL" "Phase 4 migration already applied" "$SNAP4_ALL_SQL"
+
+info "after the Phase 4 SQL: KpiSuggestionRun rows: $(q "$S" 'SELECT count(*) FROM "KpiSuggestionRun"'), KpiSuggestion rows: $(q "$S" 'SELECT count(*) FROM "KpiSuggestion"')"
+
 # --- 4. rollout order from today's shared schema ------------------------------------------------------------------
 
-section "4. Rollout order on the schema shared databases have today ($PRE_PHASE0_REV): Phase 0, Phase 2, Phase 3 SQL"
+section "4. Rollout order from the schema shared databases had before Phase 0 ($PRE_PHASE0_REV): Phase 0, Phase 2, Phase 3, Phase 4 SQL"
 create_db "$CHAIN_DB"
 info "created $CHAIN_DB"
 CHAIN="$WORK/chain"
@@ -1113,15 +1586,23 @@ expect_refused "$CHAIN_URL" "Phase 3 SQL refused before the Phase 0 SQL (\"needs
   "$PHASE3_SQL" "Phase 3 migration needs the Phase 0 SQL first" "$WORK/snapshot-chain.sql"
 run_quiet "Phase 0 SQL applied" psql "$CHAIN_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE0_SQL"
 run_quiet "Phase 2 SQL applied" psql "$CHAIN_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE2_SQL"
+build_snapshot_sql "$CHAIN_URL" "$WORK/snapshot-chain2.sql"
+expect_refused "$CHAIN_URL" "Phase 4 SQL refused after Phase 2 but before Phase 3 (\"needs the Phase 3 SQL first\"), nothing changed" \
+  "$PHASE4_SQL" "Phase 4 migration needs the Phase 3 SQL first" "$WORK/snapshot-chain2.sql"
 run_quiet "Phase 3 SQL applied" psql "$CHAIN_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE3_SQL"
 expect_eq "$CHAIN_URL" "row level security enabled on WebhookToken, ResultNode, IndicatorLibraryEntry and AiCall" "4" \
   "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace
      AND relname IN ('WebhookToken', 'ResultNode', 'IndicatorLibraryEntry', 'AiCall') AND relrowsecurity"
-check_no_drift "$CHAIN_URL" "no drift between the database after Phase 0, Phase 2 and Phase 3 SQL and prisma/schema.prisma"
+check_no_drift "$CHAIN_URL" "no drift between the database after Phase 0, Phase 2 and Phase 3 SQL and the Phase 3 schema ($PHASE3_REV)" "$PHASE3_SCHEMA"
+run_quiet "Phase 4 SQL applied" psql "$CHAIN_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE4_SQL"
+expect_eq "$CHAIN_URL" "row level security enabled on all six new tables (WebhookToken, ResultNode, IndicatorLibraryEntry, AiCall, KpiSuggestionRun, KpiSuggestion)" "6" \
+  "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace
+     AND relname IN ('WebhookToken', 'ResultNode', 'IndicatorLibraryEntry', 'AiCall', 'KpiSuggestionRun', 'KpiSuggestion') AND relrowsecurity"
+check_no_drift "$CHAIN_URL" "no drift between the database after Phase 0, Phase 2, Phase 3 and Phase 4 SQL and prisma/schema.prisma"
 
 # --- 5. Supabase layout: pgvector in the extensions schema ----------------------------------------------------------
 
-section "5. Supabase layout: pgvector in an \"extensions\" schema, rollout order from $PRE_PHASE0_REV"
+section "5. Supabase layout: pgvector in an \"extensions\" schema, rollout order from $PRE_PHASE0_REV (Phase 0, 2, 3, 4)"
 create_db "$EXT_DB"
 info "created $EXT_DB"
 # As on Supabase: the extension lives in its own schema, and the roles' search_path ("$user", public, extensions)
@@ -1134,12 +1615,15 @@ run_quiet "schema at $PRE_PHASE0_REV pushed (Prisma keeps the existing extension
 run_quiet "Phase 0 SQL applied" psql "$EXT_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE0_SQL"
 run_quiet "Phase 2 SQL applied (vector(1024) resolved through the search_path)" psql "$EXT_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE2_SQL"
 run_quiet "Phase 3 SQL applied" psql "$EXT_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE3_SQL"
+run_quiet "Phase 4 SQL applied" psql "$EXT_URL" -X -q -v ON_ERROR_STOP=1 -f "$PHASE4_SQL"
 expect_eq "$EXT_URL" "pgvector still lives only in the extensions schema (no vector type created in public)" "extensions|0" \
   "SELECT e.extnamespace::regnamespace::text || '|' || (SELECT count(*) FROM pg_type WHERE typname = 'vector' AND typnamespace = 'public'::regnamespace)
    FROM pg_extension e WHERE e.extname = 'vector'"
 check_no_drift "$EXT_URL" "no drift between the database with pgvector in extensions and prisma/schema.prisma"
 run_quiet "the app's Prisma client creates, reads and deletes AiCall rows (pgvector in extensions)" \
   in_dir "$ROOT" env DATABASE_URL="$EXT_URL" DIRECT_URL="$EXT_URL" "$TSX" "$WORK/aicall-check.ts"
+run_quiet "the app's Prisma client writes, reads and deletes KPI runs and suggestions (pgvector in extensions)" \
+  in_dir "$ROOT" env DATABASE_URL="$EXT_URL" DIRECT_URL="$EXT_URL" "$TSX" "$WORK/kpi-check.ts"
 
 # What the app must cope with: a Prisma URL with ?schema=public sets search_path to public only. Then a bare ::vector
 # cast (and the bare <=> operator) cannot be found, while the column's own type, read from the catalogue
@@ -1168,11 +1652,14 @@ SET embedding = CAST('[' || array_to_string(array_fill(0.5::float4, ARRAY[1024])
 WHERE id = 'p3v-lib';
 SELECT 'stored:' || extensions.vector_dims(embedding) || ':' || "embeddingModel" || ':' || (embedding OPERATOR(extensions.<=>) embedding)
 FROM "IndicatorLibraryEntry" WHERE id = 'p3v-lib';
+-- Phase 4 retrieval (dbLibrarySource) reads the vectors as text and compares them in code: no type or operator name.
+SELECT 'as text:' || left("embedding"::text, 12) || ':' || (length("embedding"::text) - length(replace("embedding"::text, ',', '')) + 1)
+FROM "IndicatorLibraryEntry" WHERE id = 'p3v-lib' AND "embeddingModel" = 'verify-model';
 ROLLBACK;
 SQL
 EXT_OUT="$("${EXT_PUBLIC_ONLY[@]}" -f "$WORK/ext-vector.sql" 2>&1 | tr '\n' ';')" || true
-if [[ "$EXT_OUT" == "type:extensions.vector;stored:1024:verify-model:0;" ]]; then
-  pass "with search_path = public the column's own type (extensions.vector) stores a 1024-dimension vector and OPERATOR(extensions.<=>) compares it (rolled back)"
+if [[ "$EXT_OUT" == "type:extensions.vector;stored:1024:verify-model:0;as text:[0.5,0.5,0.5:1024;" ]]; then
+  pass "with search_path = public the column's own type (extensions.vector) stores a 1024-dimension vector, OPERATOR(extensions.<=>) compares it and \"embedding\"::text reads all 1024 values back (rolled back)"
 else
   fail "schema-qualified vector write with search_path = public (got '$EXT_OUT')"
 fi
